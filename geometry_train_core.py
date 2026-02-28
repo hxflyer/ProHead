@@ -235,6 +235,11 @@ def ensure_parameter_contiguity(module: nn.Module) -> int:
 
 
 def setup_distributed(rank: int, world_size: int, master_port: str, backend: str) -> None:
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+    if world_size <= 1:
+        return
+
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
     dist.init_process_group(
@@ -243,8 +248,6 @@ def setup_distributed(rank: int, world_size: int, master_port: str, backend: str
         world_size=world_size,
         timeout=datetime.timedelta(minutes=30),
     )
-    if torch.cuda.is_available():
-        torch.cuda.set_device(rank)
 
 
 def cleanup_distributed() -> None:
@@ -256,6 +259,10 @@ def cleanup_distributed() -> None:
             dist.destroy_process_group()
     except Exception:
         pass
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
 
 def worker_init_fn(_worker_id):
     import cv2
@@ -385,7 +392,7 @@ def prepare_data(rank: int, world_size: int, data_cfg: DataConfig):
     }
 
 
-def build_model_and_optim(rank: int, model_cfg: ModelConfig, train_cfg: TrainConfig, prepared):
+def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, train_cfg: TrainConfig, prepared):
     device = torch.device(f"cuda:{rank}")
 
     model = GeometryTransformer(
@@ -429,24 +436,25 @@ def build_model_and_optim(rank: int, model_cfg: ModelConfig, train_cfg: TrainCon
 
     ensure_parameter_contiguity(model)
 
-    # Keep DDP in strict mode for better performance. We ensure every branch
-    # touches its graph in train_one_epoch even when texture supervision is skipped.
-    if dist.get_backend() == "nccl":
-        model = DDP(
-            model,
-            device_ids=[rank],
-            find_unused_parameters=False,
-            gradient_as_bucket_view=False,
-        )
-    else:
-        model = DDP(
-            model,
-            find_unused_parameters=False,
-            gradient_as_bucket_view=False,
-        )
+    # Use DDP only when running real multi-process training.
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        if dist.get_backend() == "nccl":
+            model = DDP(
+                model,
+                device_ids=[rank],
+                find_unused_parameters=False,
+                gradient_as_bucket_view=False,
+            )
+        else:
+            model = DDP(
+                model,
+                find_unused_parameters=False,
+                gradient_as_bucket_view=False,
+            )
 
+    model_ref = _unwrap_model(model)
     backbone_params, knn_params, head_params = [], [], []
-    for name, param in model.module.named_parameters():
+    for name, param in model_ref.named_parameters():
         if not param.requires_grad:
             continue
         if "backbone" in name:
@@ -542,7 +550,7 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, mod
 
     train_sampler.set_epoch(epoch)
     model.train()
-    model_ref = model.module
+    model_ref = _unwrap_model(model)
 
     if model_cfg.model_type == "simdr" and hasattr(model_ref, "set_deformable_offset_scale"):
         if model_cfg.use_deformable_attention and train_cfg.deformable_offset_warmup_epochs > 0:
@@ -847,7 +855,7 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
 
             if mesh_texture_gt_batch is not None and mesh_texture_pred is not None:
                 mesh_texture_gt = mesh_texture_gt_batch.float()
-                expected_size = int(model.module.texture_output_size)
+                expected_size = int(_unwrap_model(model).texture_output_size)
                 if mesh_texture_gt.shape[-2] != expected_size or mesh_texture_gt.shape[-1] != expected_size:
                     mesh_texture_gt = F.interpolate(mesh_texture_gt, size=(expected_size, expected_size), mode="bilinear", align_corners=False)
 
@@ -957,7 +965,7 @@ def log_and_checkpoint(epoch: int, rank: int, built, prepared, model_cfg: ModelC
         torch.save(
             {
                 "epoch": epoch,
-                "model_state_dict": model.module.state_dict(),
+                "model_state_dict": _unwrap_model(model).state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": val_out["avg_val_loss"],
                 "output_dim": model_cfg.output_dim,
@@ -968,7 +976,7 @@ def log_and_checkpoint(epoch: int, rank: int, built, prepared, model_cfg: ModelC
 
     if train_out["visualization_batch"] is not None and landmark_topology and mesh_topology:
         save_geometry_visualizations(
-            model.module,
+            _unwrap_model(model),
             train_out["visualization_batch"],
             epoch,
             torch.device("cuda:0"),
@@ -996,7 +1004,7 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
         mesh_topology = load_mesh_topology()
 
     prepared = prepare_data(rank, world_size, data_cfg)
-    built = build_model_and_optim(rank, model_cfg, train_cfg, prepared)
+    built = build_model_and_optim(rank, world_size, model_cfg, train_cfg, prepared)
 
     for epoch in range(train_cfg.epochs):
         if rank == 0:

@@ -59,7 +59,7 @@ class TexturePackHelper:
 
     def find_mats_file(self, data_root: str, sample_id: str) -> Optional[str]:
         search_dirs = [os.path.join(data_root, "mat"), data_root]
-        pattern = re.compile(rf"^Mats_{re.escape(sample_id)}\\.txt$")
+        pattern = re.compile(rf"^Mats_{re.escape(sample_id)}\.txt$")
         for base_dir in search_dirs:
             try:
                 for name in os.listdir(base_dir):

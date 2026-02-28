@@ -1,4 +1,4 @@
-import os
+﻿import os
 import random
 import torch
 import torch.nn.functional as F
@@ -640,29 +640,7 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
             texture_png_path = os.path.join(output_dir, texture_png_name)
             cv2.imwrite(texture_png_path, cv2.cvtColor(tex_u8, cv2.COLOR_RGB2BGR))
 
-            if combined_mesh_uv is not None and len(combined_mesh_uv) == len(mesh_verts):
-                tex_points = draw_uv_points_on_texture(
-                    texture_rgb=tex_u8,
-                    uv_coords=combined_mesh_uv,
-                    mesh_topology=mesh_topology,
-                    point_radius=2,
-                    point_step=1,
-                )
-                texture_points_name = f'epoch_{epoch+1:02d}_sample_{i}_pred_texture_uv_points.png'
-                texture_points_path = os.path.join(output_dir, texture_points_name)
-                cv2.imwrite(texture_points_path, cv2.cvtColor(tex_points, cv2.COLOR_RGB2BGR))
 
-                tex_points_map = np.full_like(tex_u8, 255, dtype=np.uint8)
-                tex_points_map = draw_uv_points_on_texture(
-                    texture_rgb=tex_points_map,
-                    uv_coords=combined_mesh_uv,
-                    mesh_topology=mesh_topology,
-                    point_radius=2,
-                    point_step=1,
-                )
-                texture_points_map_name = f'epoch_{epoch+1:02d}_sample_{i}_pred_texture_uv_points_map.png'
-                texture_points_map_path = os.path.join(output_dir, texture_points_map_name)
-                cv2.imwrite(texture_points_map_path, cv2.cvtColor(tex_points_map, cv2.COLOR_RGB2BGR))
 
         if combined_mesh_uv is not None and len(combined_mesh_uv) == len(mesh_verts):
             combined_obj_name = f'epoch_{epoch+1:02d}_sample_{i}_mesh_combined_uv.obj'
@@ -907,3 +885,4 @@ def save_random_landmark_training_samples(
         out_path = os.path.join(output_dir, f"train_landmark_gt_{idx:06d}.png")
         cv2.imwrite(out_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         print(f"Saved GT landmark overlay: {out_path}")
+
