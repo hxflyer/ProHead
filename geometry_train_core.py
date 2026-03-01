@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 import time
 from dataclasses import dataclass
 
@@ -46,7 +47,7 @@ class DataConfig:
     batch_size: int = 8
     num_workers: int = 4
     prefetch_factor: int = 1
-    persistent_workers: bool = False
+    persistent_workers: bool = True
     image_size: int = 512
     train_ratio: float = 0.95
     texture_png_cache_max_items: int = FIXED_TEXTURE_PNG_CACHE_MAX_ITEMS
@@ -107,7 +108,7 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--max_train_samples", type=int, default=0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=1)
-    parser.add_argument("--persistent_workers", action="store_true")
+    parser.add_argument("--persistent_workers", type=_parse_bool_arg, nargs="?", const=True, default=True)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--load_model", type=str, default="")
@@ -720,6 +721,7 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, mod
             lm_pred = output["landmark"].float()
             mesh_pred = output["mesh"].float()
             mesh_texture_pred = output.get("mesh_texture", None)
+            mesh_feature_coverage = output.get("mesh_feature_coverage", None)
 
             # Track 2D and 3D losses for final layer
             if layer_idx == (model_cfg.num_layers - 1):
@@ -760,13 +762,24 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, mod
 
             if mesh_texture_pred is not None:
                 if mesh_texture_gt is not None:
+                    tex_weights = mesh_texture_loss_weights
+                    if mesh_feature_coverage is not None:
+                        cov = mesh_feature_coverage.float()
+                        if cov.shape[-2] != mesh_texture_gt.shape[-2] or cov.shape[-1] != mesh_texture_gt.shape[-1]:
+                            cov = F.interpolate(cov, size=mesh_texture_gt.shape[-2:], mode="nearest")
+                        cov = cov.to(device=mesh_texture_gt.device, dtype=mesh_texture_gt.dtype)
+                        if tex_weights is None:
+                            tex_weights = cov.expand_as(mesh_texture_gt)
+                        else:
+                            tex_weights = tex_weights * cov.expand_as(mesh_texture_gt)
+
                     skip_tex = False
-                    if mesh_texture_loss_weights is not None and mesh_texture_loss_weights.sum().detach().item() <= 0:
+                    if tex_weights is not None and tex_weights.sum().detach().item() <= 0:
                         skip_tex = True
                     if mesh_texture_valid_count is not None and mesh_texture_valid_count <= 0:
                         skip_tex = True
                     if not skip_tex:
-                        mesh_texture_l1 = compute_weighted_l1(mesh_texture_pred.float(), mesh_texture_gt, mesh_texture_loss_weights)
+                        mesh_texture_l1 = compute_weighted_l1(mesh_texture_pred.float(), mesh_texture_gt, tex_weights)
                         layer_total = layer_total + train_cfg.mesh_texture_l1_lambda * mesh_texture_l1
                         if layer_idx == (model_cfg.num_layers - 1):
                             train_metrics.update_sum_count("mesh_texture_l1", mesh_texture_l1, 1.0)
@@ -904,6 +917,7 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
             lm_pred = final_output["landmark"]
             mesh_pred = final_output["mesh"]
             mesh_texture_pred = final_output.get("mesh_texture", None)
+            mesh_feature_coverage = final_output.get("mesh_feature_coverage", None)
 
             lm_batch_weights = _build_batch_weights(batch, "landmark_weights", model_cfg.output_dim, model_cfg.model_type, device)
             mesh_batch_weights = _build_batch_weights(batch, "mesh_weights", model_cfg.output_dim, model_cfg.model_type, device)
@@ -937,6 +951,12 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
                 mesh_texture_l1_raw = criterion_val(mesh_texture_pred, mesh_texture_gt)
                 if mesh_texture_valid is not None:
                     w = mesh_texture_valid.view(-1, 1, 1, 1).to(device=mesh_texture_l1_raw.device, dtype=mesh_texture_l1_raw.dtype)
+                    if mesh_feature_coverage is not None:
+                        cov = mesh_feature_coverage.float()
+                        if cov.shape[-2] != mesh_texture_l1_raw.shape[-2] or cov.shape[-1] != mesh_texture_l1_raw.shape[-1]:
+                            cov = F.interpolate(cov, size=mesh_texture_l1_raw.shape[-2:], mode="nearest")
+                        cov = cov.to(device=mesh_texture_l1_raw.device, dtype=mesh_texture_l1_raw.dtype)
+                        w = w * cov
                     w = w.expand_as(mesh_texture_l1_raw)
                     denom = w.sum()
                     if denom.detach().item() > 0:

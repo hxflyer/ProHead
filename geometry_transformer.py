@@ -934,14 +934,15 @@ class GeometryTransformer(nn.Module):
                     use_simdr_head=use_simdr_head,
                 )
                 if bool(decode_texture_mask[i]):
-                    mesh_feature_map = self.rasterize_mesh_vertex_attributes(
+                    mesh_feature_map, mesh_feature_coverage = self.rasterize_mesh_vertex_attributes(
                         mesh_vertex_features,
                         out_size=self.texture_feature_map_size,
-                        return_coverage=False,
+                        return_coverage=True,
                     )
                     mesh_texture = self.mesh_texture_decoder(mesh_feature_map)
                 else:
                     mesh_feature_map = None
+                    mesh_feature_coverage = None
                     mesh_texture = None
             else:
                 lm_coords = None
@@ -950,6 +951,7 @@ class GeometryTransformer(nn.Module):
                 mesh_logits = None
                 mesh_vertex_features = None
                 mesh_feature_map = None
+                mesh_feature_coverage = None
                 mesh_texture = None
 
             if (not self.is_simdr_model) and lm_coords is not None and self.flatten_regression_outputs:
@@ -964,6 +966,7 @@ class GeometryTransformer(nn.Module):
                     'mesh_logits': mesh_logits,
                     'mesh_vertex_features': mesh_vertex_features,
                     'mesh_feature_map': mesh_feature_map,
+                    'mesh_feature_coverage': mesh_feature_coverage,
                     'mesh_texture': mesh_texture,
                 })
             else:
@@ -972,6 +975,7 @@ class GeometryTransformer(nn.Module):
                     'mesh': mesh_coords,
                     'mesh_vertex_features': mesh_vertex_features,
                     'mesh_feature_map': mesh_feature_map,
+                    'mesh_feature_coverage': mesh_feature_coverage,
                     'mesh_texture': mesh_texture,
                 })
 
