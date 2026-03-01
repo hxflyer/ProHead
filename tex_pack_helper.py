@@ -18,13 +18,14 @@ class TexturePackHelper:
         combined_texture_cache_max_items: int = 0,
         mesh_texture_size: int = 1024,
         eye_box_size: float = 0.20,
-        eye_l_u_start: float = 0.01,
-        eye_r_u_start: float = 0.79,
-        bottom_margin: float = 0.01,
+        eye_l_u_start: float = 0.005,
+        eye_r_u_start: float = 0.795,
+        bottom_margin: float = 0.005,
         mouth_split_v: float = 0.61,
         mouth_box_size: float = 0.25,
         mouth_v_gt_u_start: float = 0.50,
         mouth_v_le_u_start: float = 0.22,
+        combined_uv_layout_mask_path: str = "model/combined_uv_layout_mask.png",
     ):
         self.texture_root = texture_root
 
@@ -37,6 +38,7 @@ class TexturePackHelper:
         self.mouth_box_size = float(mouth_box_size)
         self.mouth_v_gt_u_start = float(mouth_v_gt_u_start)
         self.mouth_v_le_u_start = float(mouth_v_le_u_start)
+        self.combined_uv_layout_mask_path = str(combined_uv_layout_mask_path)
 
         self._mats_cache = {}
         self._texture_path_cache = {}
@@ -45,6 +47,7 @@ class TexturePackHelper:
         self._texture_png_cache_max_items = int(max(0, texture_png_cache_max_items))
         self._combined_texture_cache_max_items = int(max(0, combined_texture_cache_max_items))
         self._texture_root_cache = None
+        self._combined_uv_layout_mask_cache = {}
 
     def get_texture_root(self, data_root: str) -> Optional[str]:
         if self._texture_root_cache is not None:
@@ -56,6 +59,35 @@ class TexturePackHelper:
                 return self._texture_root_cache
             return None
         return None
+
+    def _load_combined_uv_layout_mask(self, tex_size: int) -> Optional[np.ndarray]:
+        mask_path = self.combined_uv_layout_mask_path
+        if not mask_path or (not os.path.exists(mask_path)):
+            return None
+
+        cache_key = (mask_path, int(tex_size))
+        if cache_key in self._combined_uv_layout_mask_cache:
+            return self._combined_uv_layout_mask_cache[cache_key].copy()
+
+        mask_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if mask_img is None:
+            return None
+
+        if mask_img.ndim == 3:
+            if mask_img.shape[2] == 4:
+                mask_gray = mask_img[:, :, 3]
+            else:
+                mask_gray = cv2.cvtColor(mask_img, cv2.COLOR_BGR2GRAY)
+        else:
+            mask_gray = mask_img
+
+        if mask_gray.shape[0] != tex_size or mask_gray.shape[1] != tex_size:
+            mask_gray = cv2.resize(mask_gray, (tex_size, tex_size), interpolation=cv2.INTER_NEAREST)
+
+        mask = (mask_gray.astype(np.float32) / 255.0)[..., None]
+        mask = np.clip(mask, 0.0, 1.0)
+        self._combined_uv_layout_mask_cache[cache_key] = mask
+        return mask.copy()
 
     def find_mats_file(self, data_root: str, sample_id: str) -> Optional[str]:
         search_dirs = [os.path.join(data_root, "mat"), data_root]
@@ -345,6 +377,9 @@ class TexturePackHelper:
                 return None
             resolved_paths[part] = path
 
+        mask_path = self.combined_uv_layout_mask_path
+        mask_mtime = os.path.getmtime(mask_path) if (mask_path and os.path.exists(mask_path)) else -1.0
+
         cache_key = (
             self.mesh_texture_size,
             self.eye_box_size,
@@ -355,6 +390,8 @@ class TexturePackHelper:
             self.mouth_box_size,
             self.mouth_v_gt_u_start,
             self.mouth_v_le_u_start,
+            mask_path,
+            mask_mtime,
             resolved_paths["head"],
             resolved_paths["eye_l"],
             resolved_paths["eye_r"],
@@ -376,13 +413,16 @@ class TexturePackHelper:
         eye_r_alpha = np.ones((eye_r_rgb.shape[0], eye_r_rgb.shape[1], 1), dtype=np.float32)
 
         tex_size = int(self.mesh_texture_size)
-        canvas = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+
+        head_canvas = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+        overlay_canvas = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+        overlay_mask_canvas = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
 
         head_rgb_r, head_alpha_r = self._resize_rgba(head_rgb, head_alpha, tex_size, tex_size)
-        canvas = canvas * (1.0 - head_alpha_r) + head_rgb_r * head_alpha_r
+        head_canvas = head_canvas * (1.0 - head_alpha_r) + head_rgb_r * head_alpha_r
 
         self._paste_texture_into_uv_box(
-            canvas_rgb=canvas,
+            canvas_rgb=overlay_canvas,
             src_rgb=eye_l_rgb,
             src_alpha=eye_l_alpha,
             u0=self.eye_l_u_start,
@@ -391,8 +431,27 @@ class TexturePackHelper:
             align_bottom=False,
         )
         self._paste_texture_into_uv_box(
-            canvas_rgb=canvas,
+            canvas_rgb=overlay_mask_canvas,
+            src_rgb=np.ones_like(eye_l_rgb, dtype=np.float32),
+            src_alpha=eye_l_alpha,
+            u0=self.eye_l_u_start,
+            v0=self.bottom_margin,
+            box_size=self.eye_box_size,
+            align_bottom=False,
+        )
+
+        self._paste_texture_into_uv_box(
+            canvas_rgb=overlay_canvas,
             src_rgb=eye_r_rgb,
+            src_alpha=eye_r_alpha,
+            u0=self.eye_r_u_start,
+            v0=self.bottom_margin,
+            box_size=self.eye_box_size,
+            align_bottom=False,
+        )
+        self._paste_texture_into_uv_box(
+            canvas_rgb=overlay_mask_canvas,
+            src_rgb=np.ones_like(eye_r_rgb, dtype=np.float32),
             src_alpha=eye_r_alpha,
             u0=self.eye_r_u_start,
             v0=self.bottom_margin,
@@ -405,8 +464,9 @@ class TexturePackHelper:
             mouth_alpha,
             v_threshold=self.mouth_split_v,
         )
+
         self._paste_texture_into_uv_box(
-            canvas_rgb=canvas,
+            canvas_rgb=overlay_canvas,
             src_rgb=mouth_high_rgb,
             src_alpha=mouth_high_alpha,
             u0=self.mouth_v_gt_u_start,
@@ -415,7 +475,17 @@ class TexturePackHelper:
             align_bottom=True,
         )
         self._paste_texture_into_uv_box(
-            canvas_rgb=canvas,
+            canvas_rgb=overlay_mask_canvas,
+            src_rgb=np.ones_like(mouth_high_rgb, dtype=np.float32) if mouth_high_rgb is not None else None,
+            src_alpha=mouth_high_alpha,
+            u0=self.mouth_v_gt_u_start,
+            v0=self.bottom_margin,
+            box_size=self.mouth_box_size,
+            align_bottom=True,
+        )
+
+        self._paste_texture_into_uv_box(
+            canvas_rgb=overlay_canvas,
             src_rgb=mouth_low_rgb,
             src_alpha=mouth_low_alpha,
             u0=self.mouth_v_le_u_start,
@@ -423,6 +493,21 @@ class TexturePackHelper:
             box_size=self.mouth_box_size,
             align_bottom=True,
         )
+        self._paste_texture_into_uv_box(
+            canvas_rgb=overlay_mask_canvas,
+            src_rgb=np.ones_like(mouth_low_rgb, dtype=np.float32) if mouth_low_rgb is not None else None,
+            src_alpha=mouth_low_alpha,
+            u0=self.mouth_v_le_u_start,
+            v0=self.bottom_margin,
+            box_size=self.mouth_box_size,
+            align_bottom=True,
+        )
+
+        uv_mask = self._load_combined_uv_layout_mask(tex_size=tex_size)
+        if uv_mask is None:
+            uv_mask = np.clip(overlay_mask_canvas[..., :1], 0.0, 1.0)
+
+        canvas = overlay_canvas * uv_mask + head_canvas * (1.0 - uv_mask)
 
         canvas = np.clip(canvas, 0.0, 1.0).astype(np.float32)
         if self._combined_texture_cache_max_items > 0:

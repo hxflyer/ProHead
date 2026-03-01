@@ -6,6 +6,13 @@ from torchvision.models.feature_extraction import create_feature_extractor
 import numpy as np
 import math
 
+try:
+    import nvdiffrast.torch as dr
+    _NVDIFFRAST_AVAILABLE = True
+except Exception:
+    dr = None
+    _NVDIFFRAST_AVAILABLE = False
+
 
 class PositionalEncoding2D(nn.Module):
     """
@@ -480,6 +487,7 @@ class GeometryTransformer(nn.Module):
         texture_output_size: int = 1024,
         flip_uv_v: bool = True,
         template_mesh_uv: np.ndarray | None = None,
+        template_mesh_faces: np.ndarray | None = None,
     ):
         super().__init__()
         model_type = str(model_type).strip().lower()
@@ -518,6 +526,20 @@ class GeometryTransformer(nn.Module):
             )
         template_mesh_uv = np.clip(template_mesh_uv, 0.0, 1.0)
         self.register_buffer("template_mesh_uv", torch.from_numpy(template_mesh_uv).float())
+
+        if template_mesh_faces is None:
+            raise ValueError("template_mesh_faces is required for nvdiffrast texture rasterization.")
+        template_mesh_faces = np.asarray(template_mesh_faces, dtype=np.int32)
+        if template_mesh_faces.ndim != 2 or template_mesh_faces.shape[1] != 3:
+            raise ValueError(
+                f"template_mesh_faces must have shape [F, 3], got {template_mesh_faces.shape}."
+            )
+        if template_mesh_faces.size > 0:
+            if template_mesh_faces.min() < 0 or template_mesh_faces.max() >= num_mesh:
+                raise ValueError(
+                    f"template_mesh_faces index out of range [0, {num_mesh - 1}]."
+                )
+        self.register_buffer("template_mesh_faces", torch.from_numpy(template_mesh_faces).to(torch.int32))
 
         self.register_buffer(
             "landmark2keypoint_knn_indices",
@@ -641,6 +663,7 @@ class GeometryTransformer(nn.Module):
             in_channels=self.mesh_vertex_feature_dim,
             output_size=self.texture_output_size,
         )
+        self._dr_context_cache: dict[str, object] = {}
 
     def set_deformable_offset_scale(self, scale: float) -> None:
         if not self.use_deformable_attention:
@@ -649,20 +672,15 @@ class GeometryTransformer(nn.Module):
             if hasattr(layer, "set_deformable_offset_scale"):
                 layer.set_deformable_offset_scale(scale)
 
-    def _uv_to_pixel_coords(
-        self,
-        out_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        uv = self.template_mesh_uv.to(device=device, dtype=dtype)
-        u = uv[:, 0].clamp(0.0, 1.0)
-        v = uv[:, 1].clamp(0.0, 1.0)
-        if self.flip_uv_v:
-            v = 1.0 - v
-        x = u * float(max(out_size - 1, 1))
-        y = v * float(max(out_size - 1, 1))
-        return x, y
+    def _get_raster_context(self, device: torch.device):
+        if not _NVDIFFRAST_AVAILABLE:
+            raise RuntimeError("nvdiffrast is not available. Install nvdiffrast to enable mesh texture rasterization.")
+        if device.type != "cuda":
+            raise RuntimeError(f"nvdiffrast texture rasterization requires CUDA device, got {device}.")
+        key = str(device)
+        if key not in self._dr_context_cache:
+            self._dr_context_cache[key] = dr.RasterizeCudaContext(device=device)
+        return self._dr_context_cache[key]
 
     def rasterize_mesh_vertex_attributes(
         self,
@@ -671,7 +689,7 @@ class GeometryTransformer(nn.Module):
         return_coverage: bool = False,
     ):
         """
-        Splat per-vertex attributes to UV map using bilinear weights.
+        Rasterize per-vertex attributes to UV map with nvdiffrast barycentric interpolation.
         Args:
             vertex_attrs: [B, M, C]
             out_size: map size (H=W)
@@ -681,60 +699,50 @@ class GeometryTransformer(nn.Module):
         """
         if vertex_attrs.ndim != 3:
             raise ValueError(f"vertex_attrs must be [B, M, C], got {tuple(vertex_attrs.shape)}")
-        B, M, C = vertex_attrs.shape
+        B, M, _ = vertex_attrs.shape
         if M != self.num_mesh:
             raise ValueError(f"vertex_attrs second dim {M} != num_mesh {self.num_mesh}.")
 
         H = int(self.texture_feature_map_size if out_size is None else out_size)
-        W = H
-        x, y = self._uv_to_pixel_coords(H, vertex_attrs.device, vertex_attrs.dtype)
+        device = vertex_attrs.device
+        ctx = self._get_raster_context(device)
 
-        x0 = torch.floor(x).long().clamp(0, W - 1)
-        y0 = torch.floor(y).long().clamp(0, H - 1)
-        x1 = (x0 + 1).clamp(0, W - 1)
-        y1 = (y0 + 1).clamp(0, H - 1)
+        uv = self.template_mesh_uv.to(device=device, dtype=torch.float32)
+        u = uv[:, 0].clamp(0.0, 1.0)
+        v = uv[:, 1].clamp(0.0, 1.0)
 
-        wx1 = x - x0.to(dtype=vertex_attrs.dtype)
-        wy1 = y - y0.to(dtype=vertex_attrs.dtype)
-        wx0 = 1.0 - wx1
-        wy0 = 1.0 - wy1
+        x_clip = u * 2.0 - 1.0
+        if self.flip_uv_v:
+            # Match dataset texture convention: image y = (1 - v)
+            y_clip = 1.0 - (v * 2.0)
+        else:
+            y_clip = v * 2.0 - 1.0
 
-        w00 = wx0 * wy0
-        w01 = wx1 * wy0
-        w10 = wx0 * wy1
-        w11 = wx1 * wy1
+        clip_pos = torch.stack(
+            [
+                x_clip,
+                y_clip,
+                torch.zeros_like(x_clip),
+                torch.ones_like(x_clip),
+            ],
+            dim=-1,
+        )
+        clip_pos = clip_pos.unsqueeze(0).expand(B, -1, -1).contiguous()
+        tri = self.template_mesh_faces.to(device=device, dtype=torch.int32)
 
-        idx00 = y0 * W + x0
-        idx01 = y0 * W + x1
-        idx10 = y1 * W + x0
-        idx11 = y1 * W + x1
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            raster_out, _ = dr.rasterize(ctx, clip_pos, tri, resolution=[H, H])
+            attrs = vertex_attrs.float().contiguous()
+            uv_map, _ = dr.interpolate(attrs, raster_out, tri)
+            uv_map = dr.antialias(uv_map, raster_out, clip_pos, tri)
+            coverage = (raster_out[..., 3:4] > 0).to(dtype=uv_map.dtype)
+            uv_map = uv_map * coverage
 
-        uv_map = vertex_attrs.new_zeros((B, C, H * W))
-        uv_weight = vertex_attrs.new_zeros((B, 1, H * W))
-        attrs_t = vertex_attrs.transpose(1, 2).contiguous()  # [B, C, M]
-        ones = vertex_attrs.new_ones((B, 1, M))
-
-        def _splat(idx: torch.Tensor, w: torch.Tensor) -> None:
-            w_c = w.view(1, 1, M)
-            src_val = attrs_t * w_c
-            src_w = ones * w_c
-            uv_map.scatter_add_(2, idx.view(1, 1, M).expand(B, C, M), src_val)
-            uv_weight.scatter_add_(2, idx.view(1, 1, M).expand(B, 1, M), src_w)
-
-        _splat(idx00, w00)
-        _splat(idx01, w01)
-        _splat(idx10, w10)
-        _splat(idx11, w11)
-
-        uv_map = uv_map / uv_weight.clamp(min=1e-6)
-        coverage = (uv_weight > 1e-6).to(dtype=uv_map.dtype)
-        uv_map = uv_map * coverage
-        uv_map = uv_map.view(B, C, H, W)
-        coverage = coverage.view(B, 1, H, W)
+        uv_map = uv_map.permute(0, 3, 1, 2).contiguous().to(dtype=vertex_attrs.dtype)
+        coverage = coverage.permute(0, 3, 1, 2).contiguous().to(dtype=vertex_attrs.dtype)
         if return_coverage:
             return uv_map, coverage
         return uv_map
-
     def forward_landmark_head(
         self,
         keypoint_feats: torch.Tensor,
@@ -1009,6 +1017,7 @@ def create_geometry_transformer(
     texture_output_size: int = 1024,
     flip_uv_v: bool = True,
     template_mesh_uv: np.ndarray | None = None,
+    template_mesh_faces: np.ndarray | None = None,
 ) -> GeometryTransformer:
     return GeometryTransformer(
         num_landmarks=num_landmarks,
@@ -1039,6 +1048,7 @@ def create_geometry_transformer(
         texture_output_size=texture_output_size,
         flip_uv_v=flip_uv_v,
         template_mesh_uv=template_mesh_uv,
+        template_mesh_faces=template_mesh_faces,
     )
 
 
@@ -1069,6 +1079,7 @@ def create_simdr_geometry_transformer(
     texture_output_size: int = 1024,
     flip_uv_v: bool = True,
     template_mesh_uv: np.ndarray | None = None,
+    template_mesh_faces: np.ndarray | None = None,
 ) -> SimDRGeometryTransformer:
     return SimDRGeometryTransformer(
         num_landmarks=num_landmarks,
@@ -1098,4 +1109,5 @@ def create_simdr_geometry_transformer(
         texture_output_size=texture_output_size,
         flip_uv_v=flip_uv_v,
         template_mesh_uv=template_mesh_uv,
+        template_mesh_faces=template_mesh_faces,
     )

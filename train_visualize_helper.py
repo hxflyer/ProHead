@@ -9,9 +9,9 @@ from obj_load_helper import load_uv_obj_file
 
 # Static combined UV layout (same as test_combine_uv_layout.py and dataset compose).
 EYE_BOX_SIZE = 0.20
-EYE_L_U_START = 0.01
-EYE_R_U_START = 0.79
-BOTTOM_MARGIN = 0.01
+EYE_L_U_START = 0.005
+EYE_R_U_START = 0.795
+BOTTOM_MARGIN = 0.005
 
 MOUTH_SPLIT_V = 0.61
 MOUTH_BOX_SIZE = 0.25
@@ -885,4 +885,5 @@ def save_random_landmark_training_samples(
         out_path = os.path.join(output_dir, f"train_landmark_gt_{idx:06d}.png")
         cv2.imwrite(out_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
         print(f"Saved GT landmark overlay: {out_path}")
+
 

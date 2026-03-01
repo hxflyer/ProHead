@@ -6,3 +6,5 @@ runs/
 best_geometry_transformer_dim5.pth
 models/
 bak/
+visualization/
+test_script/

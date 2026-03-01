@@ -1,4 +1,4 @@
-﻿"""
+"""
 Inference Script for Geometry Transformer (Landmark + Mesh)
 Loads a trained model and predicts landmarks and mesh for a given image.
 Uses RetinaFace for 5-point face alignment before inference.
@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 # Import model and helpers
 from geometry_transformer import GeometryTransformer
+from obj_load_helper import load_uv_obj_file
 from train_visualize_helper import (
     load_landmark_topology,
     load_mesh_topology,
@@ -74,28 +75,79 @@ def _init_dlib_detector():
         print(f"鈿狅笍 dlib detector init failed: {e}")
         return False
 
+def load_combined_mesh_triangle_faces(model_dir: str = "model") -> np.ndarray:
+    part_files = [
+        "mesh_head.obj",
+        "mesh_eye_l.obj",
+        "mesh_eye_r.obj",
+        "mesh_mouth.obj",
+    ]
+    tris = []
+    offset = 0
+    for file_name in part_files:
+        obj_path = os.path.join(model_dir, file_name)
+        if not os.path.exists(obj_path):
+            raise FileNotFoundError(f"Missing mesh OBJ for face loading: {obj_path}")
+        verts, uvs, _, v_faces, _, _ = load_uv_obj_file(obj_path, triangulate=True)
+        if verts is None or uvs is None or v_faces is None:
+            raise ValueError(f"Failed to load verts/uv/faces from {obj_path}")
+        if len(verts) != len(uvs):
+            raise ValueError(
+                f"Vertex/UV count mismatch in {obj_path}: verts={len(verts)}, uvs={len(uvs)}"
+            )
+        tris.append(np.asarray(v_faces, dtype=np.int32) + int(offset))
+        offset += int(len(verts))
+
+    if not tris:
+        return np.zeros((0, 3), dtype=np.int32)
+    return np.concatenate(tris, axis=0).astype(np.int32, copy=False)
+
+
+def remap_triangle_faces_after_vertex_filter(
+    triangle_faces: np.ndarray,
+    kept_vertex_indices: np.ndarray,
+    original_vertex_count: int,
+) -> np.ndarray:
+    tri = np.asarray(triangle_faces, dtype=np.int64)
+    if tri.size == 0:
+        return np.zeros((0, 3), dtype=np.int32)
+
+    kept = np.asarray(kept_vertex_indices, dtype=np.int64)
+    remap = np.full((int(original_vertex_count),), -1, dtype=np.int64)
+    remap[kept] = np.arange(kept.shape[0], dtype=np.int64)
+
+    tri_new = remap[tri]
+    valid = np.all(tri_new >= 0, axis=1)
+    tri_new = tri_new[valid]
+    return tri_new.astype(np.int32, copy=False)
+
+
 def load_aux_data(device):
     """Load auxiliary data needed for model initialization."""
     try:
         # --- Landmark Data ---
         template_landmark = np.load("model/landmark_template.npy")
         landmark_restore_indices = None
-        
+
         landmark_indices_path = os.path.join("model", "landmark_indices.npy")
         if os.path.exists(landmark_indices_path):
             landmark_indices = np.load(landmark_indices_path)
-            
+
             landmark_inverse_path = os.path.join("model", "landmark_inverse.npy")
             if os.path.exists(landmark_inverse_path):
-                print(f"馃搷 Loading landmark restoration map from {landmark_inverse_path}...")
+                print(f"[Info] Loading landmark restoration map from {landmark_inverse_path}...")
                 landmark_restore_indices = np.load(landmark_inverse_path)
-            
+
             if landmark_indices.max() < template_landmark.shape[0]:
                 template_landmark = template_landmark[landmark_indices]
-                print(f"馃搷 Filtered template landmarks: {len(landmark_indices)} points kept.")
+                print(f"[Info] Filtered template landmarks: {len(landmark_indices)} points kept.")
+
         # --- Mesh Data ---
         template_mesh = np.load("model/mesh_template.npy")
+        template_mesh_full_count = int(template_mesh.shape[0])
         template_mesh_uv = load_combined_mesh_uv(model_dir="model", copy=True).astype(np.float32, copy=False)
+        template_mesh_faces = load_combined_mesh_triangle_faces(model_dir="model")
+
         mesh_restore_indices = None
         mesh_indices_path = os.path.join("model", "mesh_indices.npy")
         if os.path.exists(mesh_indices_path):
@@ -109,15 +161,22 @@ def load_aux_data(device):
                 print(f"[Info] Filtered template mesh: {len(mesh_indices)} points kept.")
                 if mesh_indices.max() < template_mesh_uv.shape[0]:
                     template_mesh_uv = template_mesh_uv[mesh_indices]
+                template_mesh_faces = remap_triangle_faces_after_vertex_filter(
+                    template_mesh_faces,
+                    mesh_indices,
+                    original_vertex_count=template_mesh_full_count,
+                )
+
         # --- KNN Mappings ---
         landmark2keypoint_idx = np.load("model/landmark2keypoint_knn_indices.npy")
         landmark2keypoint_w = np.load("model/landmark2keypoint_knn_weights.npy")
         n_keypoint = int(landmark2keypoint_idx.max()) + 1
-        
+
         mesh2landmark_idx = np.load("model/mesh2landmark_knn_indices.npy")
         mesh2landmark_w = np.load("model/mesh2landmark_knn_weights.npy")
         num_landmarks = template_landmark.shape[0]
         num_mesh = template_mesh.shape[0]
+
         if template_mesh_uv.shape[0] != num_mesh:
             print(
                 f"[Warn] template_mesh_uv length mismatch ({template_mesh_uv.shape[0]} vs {num_mesh}). "
@@ -127,13 +186,32 @@ def load_aux_data(device):
                 template_mesh_uv = template_mesh[:, 3:5].astype(np.float32, copy=True)
             else:
                 template_mesh_uv = np.zeros((num_mesh, 2), dtype=np.float32)
-        return (num_landmarks, num_mesh, template_landmark, template_mesh,
-                landmark2keypoint_idx, landmark2keypoint_w,
-                mesh2landmark_idx, mesh2landmark_w,
-                n_keypoint, landmark_restore_indices, mesh_restore_indices, template_mesh_uv)
-        
+
+        if template_mesh_faces.shape[0] == 0:
+            raise ValueError("template_mesh_faces is empty after filtering.")
+        if template_mesh_faces.max() >= num_mesh or template_mesh_faces.min() < 0:
+            raise ValueError(
+                f"template_mesh_faces index range invalid for current mesh size {num_mesh}"
+            )
+
+        return (
+            num_landmarks,
+            num_mesh,
+            template_landmark,
+            template_mesh,
+            landmark2keypoint_idx,
+            landmark2keypoint_w,
+            mesh2landmark_idx,
+            mesh2landmark_w,
+            n_keypoint,
+            landmark_restore_indices,
+            mesh_restore_indices,
+            template_mesh_uv,
+            template_mesh_faces,
+        )
+
     except Exception as e:
-        print(f"鉂?Failed to load geometry auxiliary data: {e}")
+        print(f"[Error] Failed to load geometry auxiliary data: {e}")
         raise e
 
 def detect_face_keypoints_dlib(img_path):
@@ -356,7 +434,7 @@ def run_inference(args):
     (num_landmarks, num_mesh, template_landmark, template_mesh,
      landmark2keypoint_idx, landmark2keypoint_w,
      mesh2landmark_idx, mesh2landmark_w,
-     n_keypoint, landmark_restore_indices, mesh_restore_indices, template_mesh_uv) = load_aux_data(device)
+     n_keypoint, landmark_restore_indices, mesh_restore_indices, template_mesh_uv, template_mesh_faces) = load_aux_data(device)
     
     landmark_topology = load_landmark_topology()
     mesh_topology = load_mesh_topology()
@@ -389,6 +467,7 @@ def run_inference(args):
         use_deformable_attention=(args.use_deformable_attention if args.model_type == 'simdr' else False),
         num_deformable_points=args.num_deformable_points,
         template_mesh_uv=template_mesh_uv,
+        template_mesh_faces=template_mesh_faces,
     ).to(device)
     
     # Load Weights
@@ -665,4 +744,3 @@ if __name__ == "__main__":
     print("鉁?Using dlib for accurate facial landmark detection (no TensorFlow dependency)")
     
     run_inference(args)
-

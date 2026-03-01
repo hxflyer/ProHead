@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import datetime
 import os
 import time
@@ -12,13 +12,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Subset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from geometry_transformer import GeometryTransformer
+from obj_load_helper import load_uv_obj_file
 from metahuman_geometry_dataset import FastGeometryDataset, fast_collate_fn
-from train_loss_helper import MetricAccumulator, SimDRLoss, WingLoss, compute_weighted_l1
+from train_loss_helper import MetricAccumulator, SimDRLoss, compute_weighted_l1
 from train_visualize_helper import (
     load_combined_mesh_uv,
     load_landmark_topology,
@@ -49,6 +51,7 @@ class DataConfig:
     train_ratio: float = 0.95
     texture_png_cache_max_items: int = FIXED_TEXTURE_PNG_CACHE_MAX_ITEMS
     combined_texture_cache_max_items: int = FIXED_COMBINED_TEXTURE_CACHE_MAX_ITEMS
+    max_train_samples: int = 0
 
 
 @dataclass
@@ -101,6 +104,7 @@ def _parse_bool_arg(v):
 def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--max_train_samples", type=int, default=0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=1)
     parser.add_argument("--persistent_workers", action="store_true")
@@ -162,6 +166,7 @@ def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, Model
         data_roots=data_roots,
         texture_root=texture_root,
         batch_size=int(args.batch_size),
+        max_train_samples=int(args.max_train_samples),
         num_workers=int(args.num_workers),
         prefetch_factor=int(args.prefetch_factor),
         persistent_workers=bool(args.persistent_workers),
@@ -198,6 +203,52 @@ def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, Model
 def load_template_mesh_uv(model_dir: str = "model") -> np.ndarray:
     return load_combined_mesh_uv(model_dir=model_dir, copy=True).astype(np.float32, copy=False)
 
+
+def load_combined_mesh_triangle_faces(model_dir: str = "model") -> np.ndarray:
+    part_files = [
+        "mesh_head.obj",
+        "mesh_eye_l.obj",
+        "mesh_eye_r.obj",
+        "mesh_mouth.obj",
+    ]
+    tris = []
+    offset = 0
+    for file_name in part_files:
+        obj_path = os.path.join(model_dir, file_name)
+        if not os.path.exists(obj_path):
+            raise FileNotFoundError(f"Missing mesh OBJ for face loading: {obj_path}")
+        verts, uvs, _, v_faces, _, _ = load_uv_obj_file(obj_path, triangulate=True)
+        if verts is None or uvs is None or v_faces is None:
+            raise ValueError(f"Failed to load verts/uv/faces from {obj_path}")
+        if len(verts) != len(uvs):
+            raise ValueError(
+                f"Vertex/UV count mismatch in {obj_path}: verts={len(verts)}, uvs={len(uvs)}"
+            )
+        tris.append(np.asarray(v_faces, dtype=np.int32) + int(offset))
+        offset += int(len(verts))
+
+    if not tris:
+        return np.zeros((0, 3), dtype=np.int32)
+    return np.concatenate(tris, axis=0).astype(np.int32, copy=False)
+
+
+def remap_triangle_faces_after_vertex_filter(
+    triangle_faces: np.ndarray,
+    kept_vertex_indices: np.ndarray,
+    original_vertex_count: int,
+) -> np.ndarray:
+    tri = np.asarray(triangle_faces, dtype=np.int64)
+    if tri.size == 0:
+        return np.zeros((0, 3), dtype=np.int32)
+
+    kept = np.asarray(kept_vertex_indices, dtype=np.int64)
+    remap = np.full((int(original_vertex_count),), -1, dtype=np.int64)
+    remap[kept] = np.arange(kept.shape[0], dtype=np.int64)
+
+    tri_new = remap[tri]
+    valid = np.all(tri_new >= 0, axis=1)
+    tri_new = tri_new[valid]
+    return tri_new.astype(np.int32, copy=False)
 
 def build_deep_supervision_weights(num_layers: int, custom_weights: str = "", progressive: bool = False) -> list[float]:
     if custom_weights:
@@ -295,6 +346,11 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
         combined_texture_cache_max_items=data_cfg.combined_texture_cache_max_items,
     )
 
+    if int(data_cfg.max_train_samples) > 0 and len(train_dataset) > int(data_cfg.max_train_samples):
+        if rank == 0:
+            print(f"[Info] Limiting train dataset for test run: {int(data_cfg.max_train_samples)} samples")
+        train_dataset = Subset(train_dataset, list(range(int(data_cfg.max_train_samples))))
+
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
@@ -340,7 +396,10 @@ def _load_auxiliary_geometry(rank: int):
             template_landmark = template_landmark[landmark_indices]
 
     template_mesh = np.load("model/mesh_template.npy")
+    template_mesh_full_count = int(template_mesh.shape[0])
     template_mesh_uv = load_template_mesh_uv(model_dir="model")
+    template_mesh_faces = load_combined_mesh_triangle_faces(model_dir="model")
+
     mesh_indices_path = os.path.join("model", "mesh_indices.npy")
     if os.path.exists(mesh_indices_path):
         mesh_indices = np.load(mesh_indices_path)
@@ -351,12 +410,24 @@ def _load_auxiliary_geometry(rank: int):
             template_mesh = template_mesh[mesh_indices]
             if mesh_indices.max() < template_mesh_uv.shape[0]:
                 template_mesh_uv = template_mesh_uv[mesh_indices]
+            template_mesh_faces = remap_triangle_faces_after_vertex_filter(
+                template_mesh_faces,
+                mesh_indices,
+                original_vertex_count=template_mesh_full_count,
+            )
 
     if template_mesh_uv.shape[0] != template_mesh.shape[0]:
         if template_mesh.shape[1] >= 5:
             template_mesh_uv = template_mesh[:, 3:5].astype(np.float32, copy=True)
         else:
             template_mesh_uv = np.zeros((template_mesh.shape[0], 2), dtype=np.float32)
+
+    if template_mesh_faces.shape[0] == 0:
+        raise ValueError("template_mesh_faces is empty after filtering.")
+    if template_mesh_faces.max() >= template_mesh.shape[0] or template_mesh_faces.min() < 0:
+        raise ValueError(
+            f"template_mesh_faces index range invalid for current mesh size {template_mesh.shape[0]}"
+        )
 
     landmark2keypoint_idx = np.load("model/landmark2keypoint_knn_indices.npy")
     landmark2keypoint_w = np.load("model/landmark2keypoint_knn_weights.npy")
@@ -371,6 +442,7 @@ def _load_auxiliary_geometry(rank: int):
         "template_landmark": template_landmark,
         "template_mesh": template_mesh,
         "template_mesh_uv": template_mesh_uv,
+        "template_mesh_faces": template_mesh_faces,
         "landmark2keypoint_idx": landmark2keypoint_idx,
         "landmark2keypoint_w": landmark2keypoint_w,
         "mesh2landmark_idx": mesh2landmark_idx,
@@ -379,7 +451,6 @@ def _load_auxiliary_geometry(rank: int):
         "landmark_restore_indices": landmark_restore_indices,
         "mesh_restore_indices": mesh_restore_indices,
     }
-
 
 def prepare_data(rank: int, world_size: int, data_cfg: DataConfig):
     train_loader, val_loader, train_sampler = create_distributed_dataloaders(data_cfg, rank, world_size)
@@ -401,6 +472,7 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
         template_landmark=prepared["template_landmark"],
         template_mesh=prepared["template_mesh"],
         template_mesh_uv=prepared["template_mesh_uv"],
+        template_mesh_faces=prepared["template_mesh_faces"],
         landmark2keypoint_knn_indices=prepared["landmark2keypoint_idx"],
         landmark2keypoint_knn_weights=prepared["landmark2keypoint_w"],
         mesh2landmark_knn_indices=prepared["mesh2landmark_idx"],
@@ -484,7 +556,8 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
             max_2d=model_cfg.simdr_max_2d,
         ).to(device)
     else:
-        criterion_train = WingLoss(w=7.0, epsilon=2.0).to(device)
+        # Regression mode uses robust weighted L1 directly in train loop.
+        criterion_train = None
 
     criterion_val = nn.L1Loss(reduction="none").to(device)
 
@@ -681,7 +754,9 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, mod
                 else:
                     layer_total = lm_l1 + mesh_l1
             else:
-                layer_total = criterion_train(lm_pred, lm_gt, weights=lm_batch_weights) + criterion_train(mesh_pred, mesh_gt, weights=mesh_batch_weights)
+                lm_l1 = compute_weighted_l1(lm_pred, lm_gt, lm_batch_weights)
+                mesh_l1 = compute_weighted_l1(mesh_pred, mesh_gt, mesh_batch_weights)
+                layer_total = lm_l1 + mesh_l1
 
             if mesh_texture_pred is not None:
                 if mesh_texture_gt is not None:
@@ -1034,4 +1109,3 @@ def launch_windows(args):
         raise RuntimeError("No CUDA devices found")
     print("Launching single-process training (windows/gloo)")
     train_worker(0, 1, data_cfg, model_cfg, train_cfg, "gloo")
-
