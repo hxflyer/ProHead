@@ -99,6 +99,7 @@ class TrainConfig:
     deformable_offset_warmup_epochs: int = 0
     mesh_texture_l1_lambda: float = FIXED_MESH_TEXTURE_L1_LAMBDA
     basecolor_render_l1_lambda: float = FIXED_BASECOLOR_RENDER_L1_LAMBDA
+    real_data_start_epoch: int = 10
 
 
 def _parse_bool_arg(v):
@@ -142,6 +143,7 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--num_deformable_points", type=int, default=16)
     parser.add_argument("--deformable_offset_warmup_epochs", type=int, default=0)
+    parser.add_argument("--real_data_start_epoch", type=int, default=10)
     parser.add_argument("--use_deformable_attention", type=_parse_bool_arg, nargs="?", const=True, default=True)
 
     parser.add_argument("--data_roots", nargs="*", default=None)
@@ -211,6 +213,7 @@ def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, Model
         simdr_kl_layers=str(args.simdr_kl_layers),
         amp_dtype=str(args.amp_dtype),
         deformable_offset_warmup_epochs=int(args.deformable_offset_warmup_epochs),
+        real_data_start_epoch=int(args.real_data_start_epoch),
     )
     return data_cfg, model_cfg, train_cfg
 
@@ -525,17 +528,20 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
 
     # Use DDP only when running real multi-process training.
     if world_size > 1 and dist.is_available() and dist.is_initialized():
+        # This model has conditional branches (e.g., texture/render losses can be
+        # disabled per-rank by sample composition and warmup settings), so some
+        # parameters may be unused in a given iteration.
         if dist.get_backend() == "nccl":
             model = DDP(
                 model,
                 device_ids=[rank],
-                find_unused_parameters=False,
+                find_unused_parameters=True,
                 gradient_as_bucket_view=False,
             )
         else:
             model = DDP(
                 model,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
                 gradient_as_bucket_view=False,
             )
 
@@ -648,7 +654,8 @@ def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_textur
     if int(n_verts) != int(model_ref.num_mesh):
         return None, None
 
-    xy = mesh_pred[..., 3:5].float()
+    # Rendering is only for supervision; clamp to normalized image range for stability.
+    xy = mesh_pred[..., 3:5].float().clamp(0.0, 1.0)
     x_clip = xy[..., 0] * 2.0 - 1.0
     y_clip = 1.0 - (xy[..., 1] * 2.0)
     
@@ -658,6 +665,9 @@ def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_textur
         z_clip = -mesh_pred[..., 5].float()
     else:
         z_clip = torch.zeros_like(x_clip)
+    z_clip = torch.nan_to_num(z_clip, nan=0.0, posinf=0.0, neginf=0.0)
+    x_clip = torch.nan_to_num(x_clip, nan=0.0, posinf=0.0, neginf=0.0)
+    y_clip = torch.nan_to_num(y_clip, nan=0.0, posinf=0.0, neginf=0.0)
     
     clip_pos = torch.stack([x_clip, y_clip, z_clip, torch.ones_like(x_clip)], dim=-1).contiguous()
 
@@ -680,6 +690,8 @@ def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_textur
         color = dr.antialias(color, rast, clip_pos, tri)
         cov = (rast[..., 3:4] > 0).to(dtype=color.dtype)
         color = color * cov
+        color = torch.nan_to_num(color, nan=0.0, posinf=0.0, neginf=0.0)
+        cov = torch.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
 
     color = color.permute(0, 3, 1, 2).contiguous().to(dtype=mesh_texture.dtype)
     cov = cov.permute(0, 3, 1, 2).contiguous().to(dtype=mesh_texture.dtype)
@@ -794,18 +806,36 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                 print(f"[WARNING] All mesh weights are zero at batch {num_batches}")
 
         # Check if samples are from synthetic data folders (for conditional supervision)
+        real_sample_mask = None
         if "image_path" in batch and hasattr(data_cfg, 'synthetic_data_roots') and data_cfg.synthetic_data_roots:
             synthetic_roots = set(os.path.normpath(r) for r in data_cfg.synthetic_data_roots)
+            real_sample_mask = torch.zeros((rgb.shape[0],), dtype=torch.bool, device=device)
             for i, path in enumerate(batch["image_path"]):
                 path_normalized = os.path.normpath(path)
                 is_synthetic = any(path_normalized.startswith(root) for root in synthetic_roots)
                 
                 # Real data: zero out GT geometry losses (keep only render loss)
                 if not is_synthetic:
+                    real_sample_mask[i] = True
                     if lm_batch_weights is not None:
                         lm_batch_weights[i] = 0.0
                     if mesh_batch_weights is not None:
                         mesh_batch_weights[i] = 0.0
+
+        # Delay real-data training (render/texture supervision) until configured epoch.
+        # Uses 1-based epoch semantics: with start=10, real data starts at epoch 11.
+        if (
+            real_sample_mask is not None
+            and bool(real_sample_mask.any().item())
+            and int(train_cfg.real_data_start_epoch) > 0
+            and int(epoch + 1) <= int(train_cfg.real_data_start_epoch)
+        ):
+            if mesh_texture_valid is not None:
+                mesh_texture_valid = mesh_texture_valid.clone()
+                mesh_texture_valid[real_sample_mask] = 0.0
+            if basecolor_valid is not None:
+                basecolor_valid = basecolor_valid.clone()
+                basecolor_valid[real_sample_mask] = 0.0
 
         if landmark_mask_weights_tensor is not None and "image_path" in batch:
             if lm_batch_weights is None:
@@ -917,13 +947,14 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                         skip_tex = True
                     if not skip_tex:
                         mesh_texture_l1 = compute_weighted_l1(mesh_texture_pred.float(), mesh_texture_gt, tex_weights)
-                        layer_total = layer_total + train_cfg.mesh_texture_l1_lambda * mesh_texture_l1
-                        if layer_idx == (model_cfg.num_layers - 1):
-                            train_metrics.update_sum_count("mesh_texture_l1", mesh_texture_l1, 1.0)
+                        if torch.isfinite(mesh_texture_l1):
+                            layer_total = layer_total + train_cfg.mesh_texture_l1_lambda * mesh_texture_l1
+                            if layer_idx == (model_cfg.num_layers - 1):
+                                train_metrics.update_sum_count("mesh_texture_l1", mesh_texture_l1, 1.0)
                     else:
-                        layer_total = layer_total + (mesh_texture_pred.sum() * 0.0)
+                        layer_total = layer_total + torch.zeros((), device=layer_total.device, dtype=layer_total.dtype)
                 else:
-                    layer_total = layer_total + (mesh_texture_pred.sum() * 0.0)
+                    layer_total = layer_total + torch.zeros((), device=layer_total.device, dtype=layer_total.dtype)
 
                 if basecolor_gt is not None:
                     # Use predicted depth from model (6th dimension)
@@ -942,11 +973,12 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                         if bc_weights.sum().detach().item() > 0:
                             bc_weights_3 = bc_weights.expand_as(render_pred)
                             bc_l1 = compute_weighted_l1(render_pred.float(), basecolor_gt.float(), bc_weights_3)
-                            layer_total = layer_total + train_cfg.basecolor_render_l1_lambda * bc_l1
-                            if layer_idx == (model_cfg.num_layers - 1):
-                                train_metrics.update_sum_count("basecolor_render_l1", bc_l1, 1.0)
+                            if torch.isfinite(bc_l1):
+                                layer_total = layer_total + train_cfg.basecolor_render_l1_lambda * bc_l1
+                                if layer_idx == (model_cfg.num_layers - 1):
+                                    train_metrics.update_sum_count("basecolor_render_l1", bc_l1, 1.0)
                         else:
-                            layer_total = layer_total + (render_pred.sum() * 0.0)
+                            layer_total = layer_total + torch.zeros((), device=layer_total.device, dtype=layer_total.dtype)
 
             loss += float(layer_w) * layer_total
 
@@ -954,14 +986,28 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
             train_oob_sum += batch_oob_sum
             train_oob_count += float(batch_oob_count)
 
-        # Check for NaN before backward
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"[NaN DETECTED] Loss is NaN/inf at batch {num_batches}")
-            print(f"  Loss value: {loss.item()}")
-            if "image_path" in batch:
-                print(f"  Sample paths: {batch['image_path'][:2]}")
-            # Skip this batch
-            optimizer.zero_grad(set_to_none=True)
+        # Check for NaN/inf before backward.
+        # Important for DDP: if any rank sees non-finite loss, all ranks must follow
+        # the same control flow and still execute a backward pass to keep reducer state valid.
+        loss_finite_local = torch.isfinite(loss).to(device=device, dtype=torch.int32)
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_finite_local, op=dist.ReduceOp.MIN)
+        loss_finite_global = bool(loss_finite_local.item() > 0)
+
+        if not loss_finite_global:
+            if rank == 0:
+                print(f"[NaN DETECTED] Loss is NaN/inf at batch {num_batches}")
+                print(f"  Loss value: {loss.item()}")
+                if "image_path" in batch:
+                    print(f"  Sample paths: {batch['image_path'][:2]}")
+            safe_loss = torch.nan_to_num(loss.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            if scaler.is_enabled():
+                scaler.scale(safe_loss).backward()
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+            else:
+                safe_loss.backward()
+                optimizer.zero_grad(set_to_none=True)
             continue
 
         if scaler.is_enabled():
@@ -1136,8 +1182,9 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
                     if denom.detach().item() > 0:
                         masked = mesh_texture_l1_raw * w
                         mesh_texture_loss = masked.sum() / (denom + 1e-6)
-                        val_metrics.update_sum_count("val_mesh_texture_l1", masked.sum(), denom)
-                        loss = loss + train_cfg.mesh_texture_l1_lambda * mesh_texture_loss
+                        if torch.isfinite(mesh_texture_loss):
+                            val_metrics.update_sum_count("val_mesh_texture_l1", masked.sum(), denom)
+                            loss = loss + train_cfg.mesh_texture_l1_lambda * mesh_texture_loss
                 else:
                     mesh_texture_loss = mesh_texture_l1_raw.mean()
                     val_metrics.update_sum_count("val_mesh_texture_l1", mesh_texture_l1_raw.sum(), mesh_texture_l1_raw.new_tensor(float(mesh_texture_l1_raw.numel())))
@@ -1162,8 +1209,9 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
                     if denom.detach().item() > 0:
                         bc_weights_3 = bc_weights.expand_as(render_pred)
                         bc_l1 = compute_weighted_l1(render_pred.float(), basecolor_gt.float(), bc_weights_3)
-                        val_metrics.update_sum_count("val_basecolor_render_l1", bc_l1, 1.0)
-                        loss = loss + train_cfg.basecolor_render_l1_lambda * bc_l1
+                        if torch.isfinite(bc_l1):
+                            val_metrics.update_sum_count("val_basecolor_render_l1", bc_l1, 1.0)
+                            loss = loss + train_cfg.basecolor_render_l1_lambda * bc_l1
 
             def _acc(pred_m, gt_m, w_m):
                 l1 = (pred_m - gt_m).abs()

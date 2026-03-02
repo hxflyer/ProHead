@@ -1,4 +1,5 @@
-﻿import sys
+from multiprocessing import freeze_support
+
 from geometry_train_core import create_arg_parser, launch_linux
 
 # Dataset configuration: list of (path, type) tuples
@@ -13,18 +14,25 @@ DATA_FOLDERS = [
 
 TEXTURE_ROOT = "/hy-tmp/textures"
 
-parser = create_arg_parser("Train Geometry Transformer (Linux)")
-args = parser.parse_args()
 
-# Override data_roots and texture_root from config
-args.data_roots = [path for path, _ in DATA_FOLDERS]
-args.texture_root = TEXTURE_ROOT
-args.synthetic_data_roots = [path for path, dtype in DATA_FOLDERS if dtype == "synthetic"]
+def main() -> None:
+    parser = create_arg_parser("Train Geometry Transformer (Linux)")
+    args = parser.parse_args()
 
-if args.synthetic_data_roots:
-    print(f"Synthetic folders (full GT): {args.synthetic_data_roots}")
-    print(f"Real folders (render only): {[p for p, t in DATA_FOLDERS if t == 'real']}")
-else:
-    print("All folders will use full supervision (no synthetic/real separation)")
+    # Override data_roots and texture_root from config
+    args.data_roots = [path for path, _ in DATA_FOLDERS]
+    args.texture_root = TEXTURE_ROOT
+    args.synthetic_data_roots = [path for path, dtype in DATA_FOLDERS if dtype == "synthetic"]
 
-launch_linux(args)
+    if args.synthetic_data_roots:
+        print(f"Synthetic folders (full GT): {args.synthetic_data_roots}")
+        print(f"Real folders (render only): {[p for p, t in DATA_FOLDERS if t == 'real']}")
+    else:
+        print("All folders will use full supervision (no synthetic/real separation)")
+
+    launch_linux(args)
+
+
+if __name__ == "__main__":
+    freeze_support()
+    main()
