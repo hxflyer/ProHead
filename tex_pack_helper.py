@@ -186,12 +186,8 @@ class TexturePackHelper:
                 return path
             return None
 
-        recursive_pat = os.path.join(texture_root, "**", material_name, file_name)
-        matches = glob.glob(recursive_pat, recursive=True)
-        if matches:
-            path = sorted(set(matches))[0]
-            self._texture_path_cache[cache_key] = path
-            return path
+        # Avoid expensive recursive glob - return None if direct path not found
+        # If needed, user should provide correct texture_root with proper folder structure
         return None
 
     @staticmethod
@@ -355,6 +351,7 @@ class TexturePackHelper:
             return None
 
         mats_path = self.find_mats_file(data_root, sample_id)
+        
         texture_info = self._parse_mats_texture_info(mats_path)
         required_parts = {
             "head": {"texture_key": "face", "texture_file_name": "T_Head_BC.png"},

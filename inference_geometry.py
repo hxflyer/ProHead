@@ -21,6 +21,7 @@ from train_visualize_helper import (
     load_mesh_topology,
     create_combined_overlay,
     load_combined_mesh_uv,
+    render_mesh_texture_from_2d_pred,
 )
 
 # Face detection using dlib (no TensorFlow dependency!)
@@ -612,8 +613,11 @@ def run_inference(args):
                 lm_pred = final_output['landmark'].detach().cpu().numpy().reshape(rgb_tensor.shape[0], -1, args.output_dim)
                 mesh_pred = final_output['mesh'].detach().cpu().numpy().reshape(rgb_tensor.shape[0], -1, args.output_dim)
                 mesh_color_pred = final_output.get('mesh_color', None)
+                mesh_texture_pred = final_output.get('mesh_texture', None)
                 if mesh_color_pred is not None:
                     mesh_color_pred = mesh_color_pred.detach().cpu().numpy().reshape(rgb_tensor.shape[0], -1, 3)
+                if mesh_texture_pred is not None:
+                    mesh_texture_pred = mesh_texture_pred.detach().cpu().numpy()
             
             # 4. Transform predictions back to original image space
             # Process first (and only) batch element
@@ -621,6 +625,8 @@ def run_inference(args):
             mesh_pred = mesh_pred[0]  # [M, 5]
             if mesh_color_pred is not None:
                 mesh_color_pred = mesh_color_pred[0]  # [M, 3]
+            if mesh_texture_pred is not None:
+                mesh_texture_pred = mesh_texture_pred[0]  # [3, Ht, Wt]
             
             # Compute inverse transform
             M_inv = cv2.invertAffineTransform(M)
@@ -693,6 +699,33 @@ def run_inference(args):
             
             out_mesh_obj_path = os.path.join(args.output_dir, f"{basename}_mesh.obj")
             save_obj(out_mesh_obj_path, mesh_verts, mesh_topology, restore_indices=None, vertex_colors=mesh_vertex_colors)
+
+            if mesh_texture_pred is not None:
+                texture_img = np.transpose(mesh_texture_pred, (1, 2, 0)).astype(np.float32, copy=False)
+                texture_img = np.nan_to_num(texture_img, nan=0.0, posinf=1.0, neginf=0.0)
+                texture_img = np.clip(texture_img, 0.0, 1.0)
+                texture_u8 = (texture_img * 255.0).astype(np.uint8)
+                out_texture_path = os.path.join(args.output_dir, f"{basename}_pred_texture.png")
+                cv2.imwrite(out_texture_path, cv2.cvtColor(texture_u8, cv2.COLOR_RGB2BGR))
+
+                mesh_depth = mesh_pred_orig[:, 5] if mesh_pred_orig.shape[1] >= 6 else None
+                render_img, _ = render_mesh_texture_from_2d_pred(
+                    mesh_pred=mesh_pred_orig,
+                    mesh_texture=texture_img,
+                    template_mesh_uv=template_mesh_uv,
+                    template_mesh_faces=template_mesh_faces,
+                    out_h=h_orig,
+                    out_w=w_orig,
+                    mesh_depth=mesh_depth,
+                    device=device,
+                    flip_uv_v=True,
+                )
+                if render_img is not None:
+                    render_u8 = (np.clip(render_img, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    out_render_path = os.path.join(args.output_dir, f"{basename}_pred_render.png")
+                    cv2.imwrite(out_render_path, cv2.cvtColor(render_u8, cv2.COLOR_RGB2BGR))
+                else:
+                    print(f"[Warn] Skip render output for {basename} (nvdiffrast unavailable or render failed).")
             
             print(f"鉁?Processed {basename}")
             

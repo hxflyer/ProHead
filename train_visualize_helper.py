@@ -6,6 +6,12 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from obj_load_helper import load_uv_obj_file
+try:
+    import nvdiffrast.torch as dr
+    _NVDIFFRAST_AVAILABLE = True
+except Exception:
+    dr = None
+    _NVDIFFRAST_AVAILABLE = False
 
 # Static combined UV layout (same as test_combine_uv_layout.py and dataset compose).
 EYE_BOX_SIZE = 0.20
@@ -194,6 +200,106 @@ def draw_uv_points_on_texture(
 
     return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
 
+
+def render_mesh_texture_from_2d_pred(
+    mesh_pred: np.ndarray,
+    mesh_texture: np.ndarray,
+    template_mesh_uv: np.ndarray,
+    template_mesh_faces: np.ndarray,
+    out_h: int,
+    out_w: int,
+    mesh_depth: np.ndarray | None = None,
+    device: torch.device | str | None = None,
+    flip_uv_v: bool = True,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """
+    Render RGB image from predicted 2D mesh coordinates and predicted UV texture.
+    Returns (render_rgb, coverage), each in float32 [0,1], or (None, None) on failure.
+    """
+    if not _NVDIFFRAST_AVAILABLE:
+        return None, None
+
+    if mesh_pred is None or mesh_texture is None:
+        return None, None
+
+    mesh_pred = np.asarray(mesh_pred, dtype=np.float32)
+    if mesh_pred.ndim != 2 or mesh_pred.shape[1] < 5:
+        return None, None
+
+    uv = np.asarray(template_mesh_uv, dtype=np.float32)
+    tri = np.asarray(template_mesh_faces, dtype=np.int32)
+    if uv.ndim != 2 or uv.shape[1] != 2 or tri.ndim != 2 or tri.shape[1] != 3:
+        return None, None
+    if uv.shape[0] != mesh_pred.shape[0]:
+        return None, None
+
+    tex = np.asarray(mesh_texture, dtype=np.float32)
+    if tex.ndim != 3:
+        return None, None
+    if tex.shape[0] == 3 and tex.shape[2] != 3:
+        tex = np.transpose(tex, (1, 2, 0))
+    if tex.shape[2] != 3:
+        return None, None
+    tex = np.nan_to_num(tex, nan=0.0, posinf=1.0, neginf=0.0)
+    tex = np.clip(tex, 0.0, 1.0)
+
+    if device is None:
+        if not torch.cuda.is_available():
+            return None, None
+        dev = torch.device("cuda:0")
+    else:
+        dev = torch.device(device)
+    if dev.type != "cuda":
+        return None, None
+
+    xy = np.clip(mesh_pred[:, 3:5], 0.0, 1.0)
+    clip_pos = np.zeros((xy.shape[0], 4), dtype=np.float32)
+    clip_pos[:, 0] = xy[:, 0] * 2.0 - 1.0
+    clip_pos[:, 1] = 1.0 - (xy[:, 1] * 2.0)
+
+    if mesh_depth is None and mesh_pred.shape[1] >= 6:
+        mesh_depth = mesh_pred[:, 5]
+    if mesh_depth is not None and len(mesh_depth) == xy.shape[0]:
+        clip_pos[:, 2] = -np.asarray(mesh_depth, dtype=np.float32)
+    else:
+        clip_pos[:, 2] = 0.0
+    clip_pos[:, 3] = 1.0
+
+    pos_t = torch.from_numpy(clip_pos).to(dev)[None, ...].contiguous()
+    tri_t = torch.from_numpy(tri).to(device=dev, dtype=torch.int32).contiguous()
+    uv_t = torch.from_numpy(np.clip(uv, 0.0, 1.0)).to(dev)[None, ...].contiguous()
+    tex_t = torch.from_numpy(tex).to(dev)[None, ...].contiguous()
+
+    render_h = int(out_h) * 2
+    render_w = int(out_w) * 2
+
+    try:
+        ctx = dr.RasterizeCudaContext(device=dev)
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            rast, _ = dr.rasterize(ctx, pos_t, tri_t, resolution=[render_h, render_w])
+            uv_pix, _ = dr.interpolate(uv_t.float(), rast, tri_t)
+            if flip_uv_v:
+                uv_pix = torch.stack([uv_pix[..., 0], 1.0 - uv_pix[..., 1]], dim=-1)
+            uv_pix = uv_pix.clamp(0.0, 1.0)
+
+            color = dr.texture(tex_t.float(), uv_pix, filter_mode="linear", boundary_mode="clamp")
+            color = dr.antialias(color, rast, pos_t, tri_t)
+            cov = (rast[..., 3:4] > 0).to(dtype=color.dtype)
+            color = color * cov
+
+        color = color.permute(0, 3, 1, 2).contiguous()
+        cov = cov.permute(0, 3, 1, 2).contiguous()
+        color = F.interpolate(color, size=(int(out_h), int(out_w)), mode='bilinear', align_corners=False)
+        cov = F.interpolate(cov, size=(int(out_h), int(out_w)), mode='bilinear', align_corners=False)
+        color = torch.flip(color, dims=[2])
+        cov = torch.flip(cov, dims=[2])
+
+        render = color[0].permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)
+        coverage = cov[0, 0].detach().cpu().numpy().astype(np.float32)
+        return render, coverage
+    except Exception:
+        return None, None
+
 # --- Landmark Visualization Helpers ---
 
 def load_landmark_topology():
@@ -379,8 +485,8 @@ def save_landmark_visualizations(landmark_model, batch, epoch, device, output_di
         # Draw overlay
         current_lm = lm_pred[i].copy()
         
-        # If 5D (3D+2D), use the last 2 columns (2D image coords)
-        if output_dim == 5:
+        # If geometry includes UV (>=5D), use UV for 2D overlay.
+        if output_dim >= 5:
             current_lm = current_lm[:, 3:5]
         # If 3D (XYZ), slice X, Y (might not align if world space, but best effort)
         elif output_dim > 2:
@@ -499,7 +605,7 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
         H, W = img_np.shape[:2]
         
         current_lm = lm_pred[i].copy()
-        if output_dim == 5:
+        if output_dim >= 5:
             current_lm = current_lm[:, 3:5]
         elif output_dim > 2:
             current_lm = current_lm[:, :2]
@@ -523,7 +629,7 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
         H, W = img_np.shape[:2]
         
         current_mesh = mesh_pred[i].copy()
-        if output_dim == 5:
+        if output_dim >= 5:
             current_mesh = current_mesh[:, 3:5]
         elif output_dim > 2:
             current_mesh = current_mesh[:, :2]
@@ -572,10 +678,17 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
     print(f"Saved mesh overlay: {mesh_path}")
 
     combined_mesh_uv = None
+    template_mesh_uv = None
+    template_mesh_faces = None
     try:
         combined_mesh_uv = _load_combined_mesh_uv(model_dir="model")
     except Exception as e:
         print(f"Warning: failed to load combined mesh UV layout for OBJ export: {e}")
+    try:
+        template_mesh_uv = geometry_model.template_mesh_uv.detach().cpu().numpy().astype(np.float32, copy=False)
+        template_mesh_faces = geometry_model.template_mesh_faces.detach().cpu().numpy().astype(np.int32, copy=False)
+    except Exception as e:
+        print(f"Warning: failed to load template mesh UV/faces for render export: {e}")
     
     # Save 3D OBJ files
     for i in range(num_samples):
@@ -639,6 +752,25 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
             texture_png_name = f'epoch_{epoch+1:02d}_sample_{i}_pred_texture.png'
             texture_png_path = os.path.join(output_dir, texture_png_name)
             cv2.imwrite(texture_png_path, cv2.cvtColor(tex_u8, cv2.COLOR_RGB2BGR))
+
+            if template_mesh_uv is not None and template_mesh_faces is not None:
+                mesh_depth = mesh_pred[i, :, 5] if mesh_pred[i].shape[1] >= 6 else None
+                render_img, _ = render_mesh_texture_from_2d_pred(
+                    mesh_pred=mesh_pred[i],
+                    mesh_texture=tex_img,
+                    template_mesh_uv=template_mesh_uv,
+                    template_mesh_faces=template_mesh_faces,
+                    out_h=1024,
+                    out_w=1024,
+                    mesh_depth=mesh_depth,
+                    device=device,
+                    flip_uv_v=True,
+                )
+                if render_img is not None:
+                    render_u8 = (np.clip(render_img, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    render_png_name = f'epoch_{epoch+1:02d}_sample_{i}_pred_render.png'
+                    render_png_path = os.path.join(output_dir, render_png_name)
+                    cv2.imwrite(render_png_path, cv2.cvtColor(render_u8, cv2.COLOR_RGB2BGR))
 
 
 

@@ -14,6 +14,7 @@ import cv2
 
 from align_5pt_helper import Align5PtHelper
 from tex_pack_helper import TexturePackHelper
+from mat_load_helper import load_matrix_data, compute_vertex_depth
 
 try:
     import albumentations as A
@@ -96,18 +97,22 @@ class FastGeometryDataset(Dataset):
             combined_texture_cache_max_items=combined_texture_cache_max_items,
         )
         self._mesh_texture_size = int(self.texture_packer.mesh_texture_size)
-        
+        self.landmark_indices = None
+        self.mesh_indices = None
+        self.default_landmarks = None
+        self.default_mesh = None
+        self._load_default_templates()
+
         # Find all samples
-        self.samples = []  # List of (data_root, color_path, landmark_path, mesh_path)
+        self.samples = []  # List of (data_root, color_path, landmark_path|None, mesh_path|None, basecolor_path|None)
         
         for data_root in self.data_roots:
             if not os.path.exists(data_root):
-                print(f"Warning: Data directory {data_root} does not exist, skipping...")
                 continue
             
-            # Find Color files
+            # Find Color files (exclude mask files)
             color_files = glob.glob(os.path.join(data_root, "Color_*"))
-            color_files = [f for f in color_files if os.path.basename(f).startswith("Color_")]
+            color_files = [f for f in color_files if os.path.basename(f).startswith("Color_") and not f.endswith("_mask.png")]
             
             for color_file in color_files:
                 filename = os.path.basename(color_file)
@@ -125,13 +130,13 @@ class FastGeometryDataset(Dataset):
                         base_id = full_id[:-len(s)]
                         break
                 
-                # Find corresponding files
-                landmark_path = self._find_file(data_root, "landmark", base_id)
-                mesh_path = self._find_file(data_root, "mesh", base_id)
+                # Construct paths directly (assume all files exist)
+                landmark_path = os.path.join(data_root, "landmark", f"landmark_{base_id}.txt")
+                mesh_path = os.path.join(data_root, "mesh", f"mesh_{base_id}.txt")
+                basecolor_path = os.path.join(data_root, "basecolor", f"BaseColor_{base_id}.png")
                 
-                # Only include samples that have both landmark and mesh
-                if landmark_path and os.path.exists(landmark_path) and mesh_path and os.path.exists(mesh_path):
-                    self.samples.append((data_root, color_file, landmark_path, mesh_path))
+                # Add all samples (existence checked later in __getitem__)
+                self.samples.append((data_root, color_file, landmark_path, mesh_path, basecolor_path))
         
         # Remove duplicates and sort deterministically.
         self.samples = list(set(self.samples))
@@ -157,8 +162,6 @@ class FastGeometryDataset(Dataset):
                 split_samples.extend(root_samples[:val_count])
 
         self.samples = split_samples
-        
-        print(f"FastGeometryDataset [{split}]: {len(self.samples)} samples")
         
         # Augmentation transforms (image-only; geometric augment is disabled).
         self.image_only_augment = None
@@ -203,12 +206,6 @@ class FastGeometryDataset(Dataset):
                 transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.3),
             ])
 
-        print(
-            f"FastGeometryDataset [{split}]: fixed 5-point alignment "
-            f"(jitter_std={self.align_5pt_jitter_std}, output_scale={self.align_5pt_output_scale}, "
-            f"direction_shift={self.align_5pt_direction_shift}). Geometric aug disabled."
-        )
-
     def _get_texture_root(self, data_root: str) -> Optional[str]:
         return self.texture_packer.get_texture_root(data_root)
 
@@ -217,6 +214,40 @@ class FastGeometryDataset(Dataset):
 
     def _load_mesh_texture_map(self, data_root: str, sample_id: str) -> Optional[np.ndarray]:
         return self.texture_packer.load_mesh_texture_map(data_root, sample_id)
+
+
+    def _load_default_templates(self) -> None:
+        landmark_path = "model/landmark_template.npy"
+        mesh_path = "model/mesh_template.npy"
+        if os.path.exists("model/landmark_indices.npy"):
+            self.landmark_indices = np.load("model/landmark_indices.npy")
+        if os.path.exists("model/mesh_indices.npy"):
+            self.mesh_indices = np.load("model/mesh_indices.npy")
+
+        landmark_template = np.load(landmark_path).astype(np.float32) if os.path.exists(landmark_path) else None
+        mesh_template = np.load(mesh_path).astype(np.float32) if os.path.exists(mesh_path) else None
+
+        if landmark_template is None or mesh_template is None:
+            raise FileNotFoundError("Missing model templates for default geometry fallback.")
+
+        if self.landmark_indices is not None and self.landmark_indices.max() < landmark_template.shape[0]:
+            landmark_template = landmark_template[self.landmark_indices]
+        if self.mesh_indices is not None and self.mesh_indices.max() < mesh_template.shape[0]:
+            mesh_template = mesh_template[self.mesh_indices]
+
+        if landmark_template.shape[1] < 5 or mesh_template.shape[1] < 5:
+            raise ValueError("Template geometry must contain at least 5 dims (x,y,z,u,v).")
+
+        self.default_landmarks = landmark_template[:, :5].astype(np.float32, copy=True)
+        self.default_mesh = mesh_template[:, :5].astype(np.float32, copy=True)
+
+    def _find_basecolor_file(self, data_root: str, color_path: str, sample_id: str) -> Optional[str]:
+        # Color: Color_id1_id2_suffix.png -> BaseColor: basecolor/BaseColor_id1_id2.png
+        # sample_id is id1_id2 (suffix already removed)
+        basecolor_path = os.path.join(data_root, "basecolor", f"BaseColor_{sample_id}.png")
+        if os.path.exists(basecolor_path):
+            return basecolor_path
+        return None
 
     def _find_file(self, data_root: str, pattern: str, sample_id: str) -> Optional[str]:
         """Find file matching pattern."""
@@ -241,7 +272,7 @@ class FastGeometryDataset(Dataset):
                     return filepath
         return None
     
-    def _load_geometry(self, filepath: str) -> Optional[np.ndarray]:
+    def _load_geometry(self, filepath: str, return_raw_xyz: bool = False):
         """Load geometry from txt file (5 cols: x3d y3d z3d x2d y2d)."""
         try:
             geom = []
@@ -262,10 +293,11 @@ class FastGeometryDataset(Dataset):
             geom = np.array(geom, dtype=np.float32)
             
             if geom.shape[0] == 0:
-                return None
+                return (None, None) if return_raw_xyz else None
 
             # Instance Normalization (aligned via build_template)
             xyz = geom[:, 0:3]
+            raw_xyz = xyz.copy()
             min_xyz = np.min(xyz, axis=0)
             max_xyz = np.max(xyz, axis=0)
             center = (min_xyz + max_xyz) / 2
@@ -277,10 +309,11 @@ class FastGeometryDataset(Dataset):
             # Normalize 2D coords
             geom[:, 3:5] = geom[:, 3:5] / 1024.0
             
+            if return_raw_xyz:
+                return geom, raw_xyz
             return geom
-        except Exception as e:
-            print(f"Error loading geometry {filepath}: {e}")
-            return None
+        except Exception:
+            return (None, None) if return_raw_xyz else None
     
     def __len__(self):
         return len(self.samples)
@@ -325,16 +358,7 @@ class FastGeometryDataset(Dataset):
         return self.align_helper.apply_alignment_to_geometry(geom=geom, m=M, src_w=src_w, src_h=src_h)
 
     def __getitem__(self, idx: int):
-        data_root, color_path, landmark_path, mesh_path = self.samples[idx]
-        
-        # Load indices if not already loaded
-        if not hasattr(self, 'landmark_indices'):
-            path = "model/landmark_indices.npy"
-            self.landmark_indices = np.load(path) if os.path.exists(path) else None
-        
-        if not hasattr(self, 'mesh_indices'):
-            path = "model/mesh_indices.npy"
-            self.mesh_indices = np.load(path) if os.path.exists(path) else None
+        data_root, color_path, landmark_path, mesh_path, basecolor_path = self.samples[idx]
 
         # Load RGB
         try:
@@ -342,15 +366,36 @@ class FastGeometryDataset(Dataset):
             if image_np is None:
                 raise ValueError(f"Could not read {color_path}")
             image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-        except Exception as e:
-            print(f"Error loading {color_path}: {e}")
+        except Exception:
             image_np = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
-        
+
         h, w = image_np.shape[:2]
-        
-        # Load geometry
-        landmarks = self._load_geometry(landmark_path)
-        mesh = self._load_geometry(mesh_path)
+
+        basecolor_np = None
+        basecolor_valid = 0.0
+        if basecolor_path is not None and os.path.exists(basecolor_path):
+            try:
+                bc = cv2.imread(basecolor_path)
+                if bc is not None:
+                    basecolor_np = cv2.cvtColor(bc, cv2.COLOR_BGR2RGB)
+                    basecolor_valid = 1.0
+            except Exception:
+                basecolor_np = None
+                basecolor_valid = 0.0
+        if basecolor_np is None:
+            basecolor_np = np.zeros_like(image_np, dtype=np.uint8)
+
+        # Load geometry (fallback to template defaults for real-only samples).
+        has_geometry_gt = bool(landmark_path and mesh_path)
+        landmarks_raw_xyz = None
+        mesh_raw_xyz = None
+        if has_geometry_gt:
+            landmarks, landmarks_raw_xyz = self._load_geometry(landmark_path, return_raw_xyz=True)
+            mesh, mesh_raw_xyz = self._load_geometry(mesh_path, return_raw_xyz=True)
+        else:
+            landmarks = None
+            mesh = None
+
         mesh_texture = None
         mesh_texture_valid = None
         five_points_px = None
@@ -359,34 +404,37 @@ class FastGeometryDataset(Dataset):
         is_extreme_pose = False
         face_direction = None
         align_applied = False
-        five_points_px, five_points_valid = self._extract_five_points_px(landmarks, w=w, h=h)
-        head_center_px = self._compute_head_center_px(landmarks, w=w, h=h)
-        is_extreme_pose = self._is_extreme_pose(five_points_px, five_points_valid)
-        face_direction = self._estimate_face_direction(five_points_px, five_points_valid)
 
-        # Mask-based weights
-        landmark_weights = None
-        mesh_weights = None
-        
-        if landmarks is not None:
+        if landmarks is None or mesh is None:
+            has_geometry_gt = False
+            landmarks = self.default_landmarks.copy()
+            mesh = self.default_mesh.copy()
+            landmarks_raw_xyz = None
+            mesh_raw_xyz = None
+            landmark_weights = np.zeros((landmarks.shape[0],), dtype=np.float32)
+            mesh_weights = np.zeros((mesh.shape[0],), dtype=np.float32)
+        else:
             landmark_weights = np.ones((landmarks.shape[0],), dtype=np.float32)
-        if mesh is not None:
             mesh_weights = np.ones((mesh.shape[0],), dtype=np.float32)
-        
-        # Load mask
+            five_points_px, five_points_valid = self._extract_five_points_px(landmarks, w=w, h=h)
+            head_center_px = self._compute_head_center_px(landmarks, w=w, h=h)
+            is_extreme_pose = self._is_extreme_pose(five_points_px, five_points_valid)
+            face_direction = self._estimate_face_direction(five_points_px, five_points_valid)
+
+        # Load mask (if present) to down-weight occluded landmarks/mesh vertices.
         dir_name = os.path.dirname(color_path)
         filename = os.path.basename(color_path)
         name_no_ext, ext = os.path.splitext(filename)
         if name_no_ext.startswith("Color_"):
             name_no_ext = name_no_ext[len("Color_"):]
-        
+
         for suffix in ['_gemini', '_flux', '_seedream']:
             if name_no_ext.endswith(suffix):
                 name_no_ext = name_no_ext[:-len(suffix)]
                 break
         sample_id = name_no_ext
 
-        if mesh is not None:
+        if has_geometry_gt:
             mesh_texture_valid = 1.0
             try:
                 mesh_texture = self._load_mesh_texture_map(
@@ -395,18 +443,17 @@ class FastGeometryDataset(Dataset):
                 )
                 if mesh_texture is None:
                     mesh_texture_valid = 0.0
-            except Exception as e:
-                print(
-                    f"[MeshTextureDebug] EXCEPTION sample_id={sample_id} "
-                    f"data_root={data_root} during mesh texture load: {e}"
-                )
+            except Exception:
                 mesh_texture = None
                 mesh_texture_valid = 0.0
-        
+        else:
+            mesh_texture = None
+            mesh_texture_valid = 0.0
+
         mask_path = os.path.join(dir_name, f"{name_no_ext}_mask{ext}")
         if not os.path.exists(mask_path) and ext.lower() != '.png':
             mask_path = os.path.join(dir_name, f"{name_no_ext}_mask.png")
-        
+
         if os.path.exists(mask_path):
             try:
                 mask_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
@@ -417,43 +464,37 @@ class FastGeometryDataset(Dataset):
                         mask_alpha = mask_img
                     else:
                         mask_alpha = mask_img[:, :, 0]
-                    
+
                     mh, mw = mask_alpha.shape[:2]
                     if mh != h or mw != w:
                         mask_alpha = cv2.resize(mask_alpha, (w, h), interpolation=cv2.INTER_NEAREST)
-                    
+
                     mask_bin = (mask_alpha > 0).astype(np.uint8)
                     kernel = np.ones((3, 3), np.uint8)
                     mask_dilated = cv2.dilate(mask_bin, kernel, iterations=1)
-                    
-                    # Apply to landmarks
+
                     if landmarks is not None and landmark_weights is not None:
                         pts_norm = landmarks[:, 3:5]
                         pts_x = (pts_norm[:, 0] * w).astype(np.int32)
                         pts_y = (pts_norm[:, 1] * h).astype(np.int32)
-                        
                         for i in range(len(landmarks)):
                             px, py = pts_x[i], pts_y[i]
-                            if 0 <= px < w and 0 <= py < h:
-                                if mask_dilated[py, px] > 0:
-                                    landmark_weights[i] = 0.0
-                    
-                    # Apply to mesh
+                            if 0 <= px < w and 0 <= py < h and mask_dilated[py, px] > 0:
+                                landmark_weights[i] = 0.0
+
                     if mesh is not None and mesh_weights is not None:
                         pts_norm = mesh[:, 3:5]
                         pts_x = (pts_norm[:, 0] * w).astype(np.int32)
                         pts_y = (pts_norm[:, 1] * h).astype(np.int32)
-                        
                         for i in range(len(mesh)):
                             px, py = pts_x[i], pts_y[i]
-                            if 0 <= px < w and 0 <= py < h:
-                                if mask_dilated[py, px] > 0:
-                                    mesh_weights[i] = 0.0
-            except Exception as e:
-                print(f"Error processing mask {mask_path}: {e}")
+                            if 0 <= px < w and 0 <= py < h and mask_dilated[py, px] > 0:
+                                mesh_weights[i] = 0.0
+            except Exception:
+                pass
 
         # 5-point alignment before filtering/augmentation so all geometry stays coherent.
-        if landmarks is not None and five_points_px is not None:
+        if has_geometry_gt and landmarks is not None and five_points_px is not None:
             M = self._estimate_alignment_matrix(
                 five_points_px,
                 five_points_valid,
@@ -471,25 +512,50 @@ class FastGeometryDataset(Dataset):
                     flags=cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_REFLECT_101,
                 )
+                if basecolor_np is not None:
+                    basecolor_np = cv2.warpAffine(
+                        basecolor_np,
+                        M,
+                        (self.image_size, self.image_size),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REFLECT_101,
+                    )
                 landmarks = self._apply_alignment_to_geometry(landmarks, M=M, src_w=w, src_h=h)
                 mesh = self._apply_alignment_to_geometry(mesh, M=M, src_w=w, src_h=h)
                 five_points_px = self._transform_points_px(five_points_px, M)
                 h = self.image_size
                 w = self.image_size
                 align_applied = True
-        
+
         # Filter using indices
         if landmarks is not None and self.landmark_indices is not None:
             if self.landmark_indices.max() < len(landmarks):
                 landmarks = landmarks[self.landmark_indices]
+                if landmarks_raw_xyz is not None and self.landmark_indices.max() < len(landmarks_raw_xyz):
+                    landmarks_raw_xyz = landmarks_raw_xyz[self.landmark_indices]
                 if landmark_weights is not None:
                     landmark_weights = landmark_weights[self.landmark_indices]
-        
+
         if mesh is not None and self.mesh_indices is not None:
             if self.mesh_indices.max() < len(mesh):
                 mesh = mesh[self.mesh_indices]
+                if mesh_raw_xyz is not None and self.mesh_indices.max() < len(mesh_raw_xyz):
+                    mesh_raw_xyz = mesh_raw_xyz[self.mesh_indices]
                 if mesh_weights is not None:
                     mesh_weights = mesh_weights[self.mesh_indices]
+
+        # Guard against malformed per-sample geometry lengths.
+        if landmarks is None or landmarks.shape[0] != self.default_landmarks.shape[0]:
+            landmarks = self.default_landmarks.copy()
+            landmarks_raw_xyz = None
+            landmark_weights = np.zeros((landmarks.shape[0],), dtype=np.float32)
+            has_geometry_gt = False
+        if mesh is None or mesh.shape[0] != self.default_mesh.shape[0]:
+            mesh = self.default_mesh.copy()
+            mesh_raw_xyz = None
+            mesh_weights = np.zeros((mesh.shape[0],), dtype=np.float32)
+            has_geometry_gt = False
+
         # Image-only augmentation path (used with fixed 5-point alignment).
         if self.image_only_augment is not None and ALBUMENTATIONS_AVAILABLE:
             image_np = self.image_only_augment(image=image_np)['image']
@@ -497,36 +563,156 @@ class FastGeometryDataset(Dataset):
             img_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
             img_tensor = self.image_only_augment_tv(img_tensor)
             image_np = (img_tensor.permute(1, 2, 0).clamp(0, 1).numpy() * 255.0).astype(np.uint8)
-        
+
         # Resize image if no augmentation was applied (val split)
         if image_np.shape[0] != self.image_size or image_np.shape[1] != self.image_size:
             image_np = cv2.resize(image_np, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
-                    
+        if basecolor_np is None:
+            basecolor_np = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
+        elif basecolor_np.shape[0] != self.image_size or basecolor_np.shape[1] != self.image_size:
+            basecolor_np = cv2.resize(basecolor_np, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+
         rgb_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+        basecolor_tensor = torch.from_numpy(basecolor_np).permute(2, 0, 1).float() / 255.0
+
+        # Load matrix data and compute z-depth for mesh
+        mesh_depth = None
+        landmark_depth = None
+        if has_geometry_gt:
+            mat_path = os.path.join(data_root, "mat", f"Mats_{sample_id}.txt")
+            if os.path.exists(mat_path):
+                try:
+                    matrix_data = load_matrix_data(mat_path)
+                    
+                    # Compute depth for landmarks
+                    if landmarks is not None:
+                        if landmarks_raw_xyz is not None and landmarks_raw_xyz.shape[0] == landmarks.shape[0]:
+                            landmark_xyz_original = landmarks_raw_xyz.copy()
+                        else:
+                            landmark_xyz_original = landmarks[:, 0:3].copy()
+                        landmark_depth_raw = compute_vertex_depth(landmark_xyz_original, matrix_data)
+                        
+                        # Validate raw depth values
+                        if np.any(~np.isfinite(landmark_depth_raw)):
+                            print(f"[DEPTH WARNING] {sample_id}: landmark_depth_raw contains NaN/inf")
+                            print(f"  Path: {color_path}")
+                            print(f"  min={np.nanmin(landmark_depth_raw):.4f}, max={np.nanmax(landmark_depth_raw):.4f}")
+                            landmark_depth = np.zeros_like(landmark_depth_raw)
+                        else:
+                            depth_min = landmark_depth_raw.min()
+                            depth_max = landmark_depth_raw.max()
+                            depth_range = depth_max - depth_min
+                            
+                            # Log if depth values are behind camera or range is too small
+                            if depth_min < 0:
+                                print(f"[DEPTH WARNING] {sample_id}: landmark depth_min={depth_min:.4f} < 0 (behind camera)")
+                                print(f"  Path: {color_path}")
+                            if depth_range < 1e-6:
+                                print(f"[DEPTH WARNING] {sample_id}: landmark depth_range={depth_range:.8f} (too small, using zeros)")
+                                print(f"  Path: {color_path}")
+                                landmark_depth = np.zeros_like(landmark_depth_raw)
+                            else:
+                                # Normalize to [0, 1] per sample with epsilon for safety
+                                landmark_depth = (landmark_depth_raw - depth_min) / (depth_range + 1e-8)
+                                landmark_depth = np.clip(landmark_depth, 0.0, 1.0)
+                                
+                                # Final validation
+                                if np.any(~np.isfinite(landmark_depth)):
+                                    print(f"[DEPTH ERROR] {sample_id}: landmark_depth contains NaN/inf after normalization!")
+                                    landmark_depth = np.zeros_like(landmark_depth_raw)
+                        
+                        # Add depth as 6th column to landmarks
+                        landmarks = np.concatenate([landmarks, landmark_depth[:, None]], axis=1)
+                    
+                    # Compute depth for mesh
+                    if mesh is not None:
+                        if mesh_raw_xyz is not None and mesh_raw_xyz.shape[0] == mesh.shape[0]:
+                            mesh_xyz_original = mesh_raw_xyz.copy()
+                        else:
+                            mesh_xyz_original = mesh[:, 0:3].copy()
+                        mesh_depth_raw = compute_vertex_depth(mesh_xyz_original, matrix_data)
+                        
+                        # Validate raw depth values
+                        if np.any(~np.isfinite(mesh_depth_raw)):
+                            print(f"[DEPTH WARNING] {sample_id}: mesh_depth_raw contains NaN/inf")
+                            print(f"  Path: {color_path}")
+                            print(f"  min={np.nanmin(mesh_depth_raw):.4f}, max={np.nanmax(mesh_depth_raw):.4f}")
+                            mesh_depth_normalized = np.zeros_like(mesh_depth_raw)
+                            mesh_depth = None
+                        else:
+                            depth_min = mesh_depth_raw.min()
+                            depth_max = mesh_depth_raw.max()
+                            depth_range = depth_max - depth_min
+                            
+                            # Log if depth values are behind camera or range is too small
+                            if depth_min < 0:
+                                print(f"[DEPTH WARNING] {sample_id}: mesh depth_min={depth_min:.4f} < 0 (behind camera)")
+                                print(f"  Path: {color_path}")
+                            if depth_range < 1e-6:
+                                print(f"[DEPTH WARNING] {sample_id}: mesh depth_range={depth_range:.8f} (too small, using zeros)")
+                                print(f"  Path: {color_path}")
+                                mesh_depth_normalized = np.zeros_like(mesh_depth_raw)
+                                mesh_depth = None
+                            else:
+                                # Normalize to [0, 1] per sample with epsilon for safety
+                                mesh_depth_normalized = (mesh_depth_raw - depth_min) / (depth_range + 1e-8)
+                                mesh_depth_normalized = np.clip(mesh_depth_normalized, 0.0, 1.0)
+                                
+                                # Final validation
+                                if np.any(~np.isfinite(mesh_depth_normalized)):
+                                    print(f"[DEPTH ERROR] {sample_id}: mesh_depth contains NaN/inf after normalization!")
+                                    mesh_depth_normalized = np.zeros_like(mesh_depth_raw)
+                                    mesh_depth = None
+                                else:
+                                    # Keep raw depth for rendering
+                                    mesh_depth = mesh_depth_raw
+                        
+                        # Add depth as 6th column to mesh
+                        mesh = np.concatenate([mesh, mesh_depth_normalized[:, None]], axis=1)
+                except Exception:
+                    # If depth computation fails, pad with zeros
+                    if landmarks is not None:
+                        landmarks = np.concatenate([landmarks, np.zeros((landmarks.shape[0], 1), dtype=np.float32)], axis=1)
+                    if mesh is not None:
+                        mesh = np.concatenate([mesh, np.zeros((mesh.shape[0], 1), dtype=np.float32)], axis=1)
+                    mesh_depth = None
+            else:
+                # No matrix file, pad with zeros
+                if landmarks is not None:
+                    landmarks = np.concatenate([landmarks, np.zeros((landmarks.shape[0], 1), dtype=np.float32)], axis=1)
+                if mesh is not None:
+                    mesh = np.concatenate([mesh, np.zeros((mesh.shape[0], 1), dtype=np.float32)], axis=1)
+        else:
+            # No geometry GT, ensure 6D format
+            if landmarks is not None and landmarks.shape[1] < 6:
+                landmarks = np.concatenate([landmarks, np.zeros((landmarks.shape[0], 1), dtype=np.float32)], axis=1)
+            if mesh is not None and mesh.shape[1] < 6:
+                mesh = np.concatenate([mesh, np.zeros((mesh.shape[0], 1), dtype=np.float32)], axis=1)
 
         result = {
             'rgb': rgb_tensor,
+            'basecolor': basecolor_tensor,
+            'basecolor_valid': torch.tensor(1.0 if float(basecolor_valid) > 0.5 else 0.0, dtype=torch.float32),
             'image_path': color_path,
+            'has_geometry_gt': torch.tensor(1.0 if has_geometry_gt else 0.0, dtype=torch.float32),
+            'landmarks': torch.from_numpy(landmarks).float(),
+            'landmark_weights': torch.from_numpy(landmark_weights).float(),
+            'mesh': torch.from_numpy(mesh).float(),
+            'mesh_weights': torch.from_numpy(mesh_weights).float(),
         }
-        
-        if landmarks is not None:
-            result['landmarks'] = torch.from_numpy(landmarks).float()
-            if landmark_weights is not None:
-                result['landmark_weights'] = torch.from_numpy(landmark_weights).float()
-        
-        if mesh is not None:
-            result['mesh'] = torch.from_numpy(mesh).float()
-            if mesh_weights is not None:
-                result['mesh_weights'] = torch.from_numpy(mesh_weights).float()
-            if mesh_texture is None:
-                mesh_texture = np.zeros((int(self._mesh_texture_size), int(self._mesh_texture_size), 3), dtype=np.float32)
-                if mesh_texture_valid is None:
-                    mesh_texture_valid = 0.0
-            result['mesh_texture'] = torch.from_numpy(mesh_texture).permute(2, 0, 1).float()
-            result['mesh_texture_valid'] = torch.tensor(
-                1.0 if float(mesh_texture_valid or 0.0) > 0.5 else 0.0,
-                dtype=torch.float32,
-            )
+
+        if mesh_depth is not None:
+            result['mesh_depth'] = torch.from_numpy(mesh_depth.astype(np.float32))
+
+        if mesh_texture is None:
+            mesh_texture = np.zeros((int(self._mesh_texture_size), int(self._mesh_texture_size), 3), dtype=np.float32)
+            if mesh_texture_valid is None:
+                mesh_texture_valid = 0.0
+        result['mesh_texture'] = torch.from_numpy(mesh_texture).permute(2, 0, 1).float()
+        result['mesh_texture_valid'] = torch.tensor(
+            1.0 if float(mesh_texture_valid or 0.0) > 0.5 else 0.0,
+            dtype=torch.float32,
+        )
 
         if five_points_px is not None and five_points_valid is not None:
             if align_applied:
@@ -538,28 +724,27 @@ class FastGeometryDataset(Dataset):
             result['align5pts_valid'] = torch.from_numpy(five_points_valid.astype(np.float32))
             result['align_applied'] = torch.tensor(1.0 if align_applied else 0.0, dtype=torch.float32)
             result['align_is_extreme'] = torch.tensor(1.0 if is_extreme_pose else 0.0, dtype=torch.float32)
-        
+
         return result
 
 
 def fast_collate_fn(batch):
     """Custom collate function."""
-    collated = {'rgb': torch.stack([item['rgb'] for item in batch])}
-    
-    if all('landmarks' in item for item in batch):
-        collated['landmarks'] = torch.stack([item['landmarks'] for item in batch])
-    if all('landmark_weights' in item for item in batch):
-        collated['landmark_weights'] = torch.stack([item['landmark_weights'] for item in batch])
-    
-    if all('mesh' in item for item in batch):
-        collated['mesh'] = torch.stack([item['mesh'] for item in batch])
-    if all('mesh_weights' in item for item in batch):
-        collated['mesh_weights'] = torch.stack([item['mesh_weights'] for item in batch])
-    if all('mesh_texture' in item for item in batch):
-        collated['mesh_texture'] = torch.stack([item['mesh_texture'] for item in batch])
-    if all('mesh_texture_valid' in item for item in batch):
-        collated['mesh_texture_valid'] = torch.stack([item['mesh_texture_valid'] for item in batch])
+    collated = {
+        'rgb': torch.stack([item['rgb'] for item in batch]),
+        'basecolor': torch.stack([item['basecolor'] for item in batch]),
+        'basecolor_valid': torch.stack([item['basecolor_valid'] for item in batch]),
+        'landmarks': torch.stack([item['landmarks'] for item in batch]),
+        'landmark_weights': torch.stack([item['landmark_weights'] for item in batch]),
+        'mesh': torch.stack([item['mesh'] for item in batch]),
+        'mesh_weights': torch.stack([item['mesh_weights'] for item in batch]),
+        'mesh_texture': torch.stack([item['mesh_texture'] for item in batch]),
+        'mesh_texture_valid': torch.stack([item['mesh_texture_valid'] for item in batch]),
+        'has_geometry_gt': torch.stack([item['has_geometry_gt'] for item in batch]),
+    }
 
+    if all('mesh_depth' in item for item in batch):
+        collated['mesh_depth'] = torch.stack([item['mesh_depth'] for item in batch])
     if all('align5pts' in item for item in batch):
         collated['align5pts'] = torch.stack([item['align5pts'] for item in batch])
     if all('align5pts_valid' in item for item in batch):
@@ -568,10 +753,10 @@ def fast_collate_fn(batch):
         collated['align_applied'] = torch.stack([item['align_applied'] for item in batch])
     if all('align_is_extreme' in item for item in batch):
         collated['align_is_extreme'] = torch.stack([item['align_is_extreme'] for item in batch])
-    
+
     if 'image_path' in batch[0]:
         collated['image_path'] = [item['image_path'] for item in batch]
-    
+
     return collated
 
 

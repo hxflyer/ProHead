@@ -3,7 +3,7 @@ __pycache__/
 data/
 training_samples/
 runs/
-best_geometry_transformer_dim5.pth
+*.pth
 models/
 bak/
 visualization/
