@@ -257,10 +257,15 @@ def render_mesh_texture_from_2d_pred(
     clip_pos[:, 0] = xy[:, 0] * 2.0 - 1.0
     clip_pos[:, 1] = 1.0 - (xy[:, 1] * 2.0)
 
+    depth_scale = 0.8
+    depth_bias = 0.1
     if mesh_depth is None and mesh_pred.shape[1] >= 6:
         mesh_depth = mesh_pred[:, 5]
     if mesh_depth is not None and len(mesh_depth) == xy.shape[0]:
-        clip_pos[:, 2] = -np.asarray(mesh_depth, dtype=np.float32)
+        depth_norm = np.asarray(mesh_depth, dtype=np.float32)
+        depth_norm = np.clip(depth_norm, 0.0, 1.0)
+        depth_norm = depth_norm * float(depth_scale) + float(depth_bias)
+        clip_pos[:, 2] = -depth_norm
     else:
         clip_pos[:, 2] = 0.0
     clip_pos[:, 3] = 1.0

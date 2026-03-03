@@ -8,3 +8,4 @@ models/
 bak/
 visualization/
 test_script/
+training_samples_dense/

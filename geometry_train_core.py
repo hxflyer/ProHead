@@ -659,10 +659,15 @@ def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_textur
     x_clip = xy[..., 0] * 2.0 - 1.0
     y_clip = 1.0 - (xy[..., 1] * 2.0)
     
-    # Use predicted depth (6th dimension) if available for proper z-ordering
+    # Use predicted depth (6th dimension) for z-sorting only in rasterization.
+    # Keep depth safely in clip-space by mapping [0,1] -> [0.1,0.9].
+    depth_scale = 0.8
+    depth_bias = 0.1
     if use_pred_depth and mesh_pred.shape[-1] >= 6:
-        # Use predicted normalized depth [0,1], negate for correct order
-        z_clip = -mesh_pred[..., 5].float()
+        depth_norm = mesh_pred[..., 5].float().clamp(0.0, 1.0)
+        depth_norm = depth_norm * depth_scale + depth_bias
+        # Pred depth is normalized [0,1]; negate for current clip-space convention.
+        z_clip = -depth_norm
     else:
         z_clip = torch.zeros_like(x_clip)
     z_clip = torch.nan_to_num(z_clip, nan=0.0, posinf=0.0, neginf=0.0)
