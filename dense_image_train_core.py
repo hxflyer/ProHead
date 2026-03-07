@@ -1,27 +1,34 @@
 import argparse
+import datetime
+import gc
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
 import time
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dense_image_dataset import DenseImageDataset, dense_image_collate_fn
-from dense_image_transformer import DenseImageTransformer
+from dense_image_transformer import DenseImageTransformer, compute_dense_output_channels
 
 
 @dataclass
 class DataConfig:
     data_roots: list[str]
     batch_size: int = 2
-    num_workers: int = 4
-    prefetch_factor: int = 1
+    num_workers: int = 2
+    prefetch_factor: int = 2
     persistent_workers: bool = True
     image_size: int = 512
     train_ratio: float = 0.95
@@ -33,7 +40,10 @@ class ModelConfig:
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 4
-    output_channels: int = 3
+    predict_basecolor: bool = True
+    predict_geo: bool = True
+    predict_normal: bool = True
+    output_channels: int = 10
     transformer_map_size: int = 32
     backbone_weights: str = "imagenet"
 
@@ -44,10 +54,72 @@ class TrainConfig:
     epochs: int = 50
     amp_dtype: str = "fp16"
     load_model: str = ""
-    save_path: str = "best_dense_image_transformer_ch3.pth"
+    save_path: str = "best_dense_image_transformer_ch10.pth"
     save_preview_every: int = 1
     basecolor_fg_weight: float = 8.0
     basecolor_fg_threshold: float = 0.02
+    basecolor_bg_weight: float = 0.1
+    mask_bce_lambda: float = 1.0
+    mask_dice_lambda: float = 1.0
+    debug_print_every: int = 200
+    master_port: str = "12356"
+
+
+def setup_distributed(rank: int, world_size: int, master_port: str, backend: str) -> None:
+    """Initialize distributed process group."""
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank)
+    if world_size <= 1:
+        return
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(master_port)
+    dist.init_process_group(
+        backend,
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(minutes=30),
+    )
+
+
+def cleanup_distributed() -> None:
+    """Clean up distributed process group."""
+    try:
+        if dist.is_available() and dist.is_initialized():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dist.barrier()
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
+
+def _unwrap_model(model):
+    """Unwrap DDP model to get underlying model."""
+    return model.module if isinstance(model, DDP) else model
+
+
+def _load_matching_state_dict(model, state_dict: dict[str, torch.Tensor]) -> tuple[list[str], list[str]]:
+    model_state = model.state_dict()
+    filtered_state = {}
+    skipped_keys: list[str] = []
+    for key, value in state_dict.items():
+        if key not in model_state or model_state[key].shape != value.shape:
+            skipped_keys.append(key)
+            continue
+        filtered_state[key] = value
+
+    missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
+    return skipped_keys, list(missing_keys) + list(unexpected_keys)
+
+
+def worker_init_fn(_worker_id):
+    """Initialize DataLoader workers - disable OpenCV threading."""
+    import cv2
+    try:
+        cv2.setNumThreads(0)
+    except Exception:
+        pass
 
 
 def _parse_bool_arg(v):
@@ -65,8 +137,8 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--max_train_samples", type=int, default=0)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--prefetch_factor", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument(
         "--persistent_workers",
         type=_parse_bool_arg,
@@ -81,15 +153,22 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--load_model", type=str, default="")
-    parser.add_argument("--save_path", type=str, default="best_dense_image_transformer_ch3.pth")
+    parser.add_argument("--save_path", type=str, default="best_dense_image_transformer_ch10.pth")
     parser.add_argument("--save_preview_every", type=int, default=1)
     parser.add_argument("--basecolor_fg_weight", type=float, default=8.0)
     parser.add_argument("--basecolor_fg_threshold", type=float, default=0.02)
+    parser.add_argument("--basecolor_bg_weight", type=float, default=0.1)
+    parser.add_argument("--mask_bce_lambda", type=float, default=1.0)
+    parser.add_argument("--mask_dice_lambda", type=float, default=1.0)
+    parser.add_argument("--debug_print_every", type=int, default=200)
+    parser.add_argument("--master_port", type=str, default="12356")
 
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--output_channels", type=int, default=3)
+    parser.add_argument("--basecolor", action="store_true")
+    parser.add_argument("--geo", action="store_true")
+    parser.add_argument("--normal", action="store_true")
     parser.add_argument("--transformer_map_size", type=int, default=32)
     parser.add_argument(
         "--backbone_weights", type=str, default="imagenet", choices=["imagenet", "dinov3"]
@@ -115,8 +194,35 @@ def _default_data_roots(platform_name: str) -> list[str]:
     ]
 
 
+def _resolve_prediction_targets(args) -> tuple[bool, bool, bool]:
+    predict_basecolor = bool(getattr(args, "basecolor", False))
+    predict_geo = bool(getattr(args, "geo", False))
+    predict_normal = bool(getattr(args, "normal", False))
+    if not (predict_basecolor or predict_geo or predict_normal):
+        return True, True, True
+    return predict_basecolor, predict_geo, predict_normal
+
+
+def _target_summary(predict_basecolor: bool, predict_geo: bool, predict_normal: bool) -> str:
+    names = []
+    if predict_basecolor:
+        names.append("basecolor")
+    if predict_geo:
+        names.append("geo")
+    if predict_normal:
+        names.append("normal")
+    names.append("mask")
+    return "+".join(names)
+
+
 def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, ModelConfig, TrainConfig]:
     data_roots = list(args.data_roots) if args.data_roots else _default_data_roots(platform_name)
+    predict_basecolor, predict_geo, predict_normal = _resolve_prediction_targets(args)
+    output_channels = compute_dense_output_channels(
+        predict_basecolor=predict_basecolor,
+        predict_geo=predict_geo,
+        predict_normal=predict_normal,
+    )
     data_cfg = DataConfig(
         data_roots=data_roots,
         batch_size=int(args.batch_size),
@@ -131,7 +237,10 @@ def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, Model
         d_model=int(args.d_model),
         nhead=int(args.nhead),
         num_layers=int(args.num_layers),
-        output_channels=int(args.output_channels),
+        predict_basecolor=bool(predict_basecolor),
+        predict_geo=bool(predict_geo),
+        predict_normal=bool(predict_normal),
+        output_channels=int(output_channels),
         transformer_map_size=int(args.transformer_map_size),
         backbone_weights=str(args.backbone_weights),
     )
@@ -144,11 +253,95 @@ def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, Model
         save_preview_every=max(1, int(args.save_preview_every)),
         basecolor_fg_weight=float(args.basecolor_fg_weight),
         basecolor_fg_threshold=float(args.basecolor_fg_threshold),
+        basecolor_bg_weight=float(args.basecolor_bg_weight),
+        mask_bce_lambda=float(args.mask_bce_lambda),
+        mask_dice_lambda=float(args.mask_dice_lambda),
+        debug_print_every=max(1, int(args.debug_print_every)),
+        master_port=str(args.master_port),
     )
     return data_cfg, model_cfg, train_cfg
 
 
+def _dataset_basecolor_valid_stats(dataset) -> tuple[int, int]:
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+        indices = list(dataset.indices)
+        if hasattr(base_dataset, "samples"):
+            valid_count = sum(
+                1
+                for idx in indices
+                if idx < len(base_dataset.samples)
+                and len(base_dataset.samples[idx]) >= 3
+                and base_dataset.samples[idx][2] is not None
+            )
+            return len(indices), int(valid_count)
+        return len(indices), -1
+
+    if hasattr(dataset, "samples"):
+        total = len(dataset.samples)
+        valid = sum(
+            1
+            for sample in dataset.samples
+            if len(sample) >= 3 and sample[2] is not None
+        )
+        return int(total), int(valid)
+
+    try:
+        return int(len(dataset)), -1
+    except Exception:
+        return -1, -1
+
+
+def _print_dataset_debug(prefix: str, dataset, rank: int = 0) -> None:
+    if rank != 0:
+        return
+
+    total, valid = _dataset_basecolor_valid_stats(dataset)
+    if total >= 0 and valid >= 0:
+        ratio = float(valid / max(total, 1))
+        print(f"[Data] {prefix} basecolor_valid: {valid}/{total} ({ratio:.2%})")
+    elif total >= 0:
+        print(f"[Data] {prefix} samples: {total} (valid basecolor count unavailable)")
+
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    if hasattr(base_dataset, "get_debug_summary"):
+        try:
+            summary = base_dataset.get_debug_summary()
+            missing_examples = list(summary.get("missing_examples", []))
+            if missing_examples:
+                print("[Data] Example missing basecolor mappings:")
+                for ex in missing_examples[:5]:
+                    print(f"[Data]   {ex}")
+            for key in ("geo", "normal", "face_mask"):
+                valid_key = f"{key}_valid"
+                ratio_key = f"{key}_valid_ratio"
+                if valid_key in summary:
+                    total_count = int(summary.get("total", 0))
+                    print(
+                        f"[Data] {prefix} {valid_key}: {int(summary.get(valid_key, 0))}/{total_count} "
+                        f"({float(summary.get(ratio_key, 0.0)):.2%})"
+                    )
+            missing_geo_examples = list(summary.get("missing_geo_examples", []))
+            if missing_geo_examples:
+                print("[Data] Example missing geo mappings:")
+                for ex in missing_geo_examples[:5]:
+                    print(f"[Data]   {ex}")
+            missing_normal_examples = list(summary.get("missing_normal_examples", []))
+            if missing_normal_examples:
+                print("[Data] Example missing normal mappings:")
+                for ex in missing_normal_examples[:5]:
+                    print(f"[Data]   {ex}")
+            missing_face_mask_examples = list(summary.get("missing_face_mask_examples", []))
+            if missing_face_mask_examples:
+                print("[Data] Example missing face-mask mappings:")
+                for ex in missing_face_mask_examples[:5]:
+                    print(f"[Data]   {ex}")
+        except Exception:
+            pass
+
+
 def create_dataloaders(data_cfg: DataConfig):
+    """Create non-distributed dataloaders (for single GPU/CPU)."""
     train_dataset = DenseImageDataset(
         data_roots=data_cfg.data_roots,
         split="train",
@@ -164,8 +357,13 @@ def create_dataloaders(data_cfg: DataConfig):
         augment=False,
     )
 
+    _print_dataset_debug("Train(full)", train_dataset, rank=0)
+    _print_dataset_debug("Val", val_dataset, rank=0)
     if int(data_cfg.max_train_samples) > 0 and len(train_dataset) > int(data_cfg.max_train_samples):
         train_dataset = Subset(train_dataset, list(range(int(data_cfg.max_train_samples))))
+        _print_dataset_debug("Train(used)", train_dataset, rank=0)
+    else:
+        _print_dataset_debug("Train(used)", train_dataset, rank=0)
 
     train_loader = DataLoader(
         train_dataset,
@@ -182,7 +380,7 @@ def create_dataloaders(data_cfg: DataConfig):
         val_dataset,
         batch_size=data_cfg.batch_size,
         shuffle=False,
-        num_workers=data_cfg.num_workers,
+        num_workers=0,
         pin_memory=True,
         drop_last=False,
         prefetch_factor=data_cfg.prefetch_factor if data_cfg.num_workers > 0 else None,
@@ -192,60 +390,390 @@ def create_dataloaders(data_cfg: DataConfig):
     return train_loader, val_loader
 
 
+def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: int):
+    """Create distributed dataloaders with DistributedSampler for multi-GPU training."""
+    train_dataset = DenseImageDataset(
+        data_roots=data_cfg.data_roots,
+        split="train",
+        image_size=data_cfg.image_size,
+        train_ratio=data_cfg.train_ratio,
+        augment=True,
+    )
+    val_dataset = DenseImageDataset(
+        data_roots=data_cfg.data_roots,
+        split="val",
+        image_size=data_cfg.image_size,
+        train_ratio=data_cfg.train_ratio,
+        augment=False,
+    )
+
+    _print_dataset_debug("Train(full)", train_dataset, rank=rank)
+    _print_dataset_debug("Val", val_dataset, rank=rank)
+    if int(data_cfg.max_train_samples) > 0 and len(train_dataset) > int(data_cfg.max_train_samples):
+        if rank == 0:
+            print(f"[Info] Limiting train dataset for test run: {int(data_cfg.max_train_samples)} samples")
+        train_dataset = Subset(train_dataset, list(range(int(data_cfg.max_train_samples))))
+        _print_dataset_debug("Train(used)", train_dataset, rank=rank)
+    else:
+        _print_dataset_debug("Train(used)", train_dataset, rank=rank)
+
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=data_cfg.batch_size,
+        sampler=train_sampler,
+        num_workers=data_cfg.num_workers,
+        pin_memory=True,
+        drop_last=True,
+        prefetch_factor=data_cfg.prefetch_factor if data_cfg.num_workers > 0 else None,
+        persistent_workers=bool(data_cfg.persistent_workers) if data_cfg.num_workers > 0 else False,
+        collate_fn=dense_image_collate_fn,
+        worker_init_fn=worker_init_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=data_cfg.batch_size,
+        sampler=val_sampler,
+        num_workers=0,  # Use 0 workers for validation to reduce RAM usage
+        pin_memory=True,
+        drop_last=False,
+        prefetch_factor=None,
+        persistent_workers=False,
+        collate_fn=dense_image_collate_fn,
+        worker_init_fn=worker_init_fn,
+    )
+    return train_loader, val_loader, train_sampler
+
+
 def _normalize_imagenet(rgb: torch.Tensor) -> torch.Tensor:
     mean = torch.tensor([0.485, 0.456, 0.406], device=rgb.device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=rgb.device).view(1, 3, 1, 1)
     return (rgb - mean) / std
 
 
-def _basecolor_loss(
+def _zero_scalar_like(reference: torch.Tensor | None) -> torch.Tensor:
+    if reference is None:
+        return torch.tensor(0.0, dtype=torch.float32)
+    return torch.zeros((), device=reference.device, dtype=reference.dtype)
+
+
+def _model_prediction_targets(model) -> tuple[bool, bool, bool]:
+    base_model = _unwrap_model(model)
+    return (
+        bool(getattr(base_model, "predict_basecolor", True)),
+        bool(getattr(base_model, "predict_geo", True)),
+        bool(getattr(base_model, "predict_normal", True)),
+    )
+
+
+def _split_dense_prediction(
     pred: torch.Tensor,
-    gt: torch.Tensor,
-    valid: torch.Tensor | None,
-    fg_weight: float = 8.0,
-    fg_threshold: float = 0.02,
+    predict_basecolor: bool = True,
+    predict_geo: bool = True,
+    predict_normal: bool = True,
+) -> dict[str, torch.Tensor | None]:
+    if pred.ndim != 4:
+        raise ValueError(f"Expected dense prediction [B, C, H, W], got {tuple(pred.shape)}")
+
+    expected_channels = compute_dense_output_channels(
+        predict_basecolor=predict_basecolor,
+        predict_geo=predict_geo,
+        predict_normal=predict_normal,
+    )
+    channels = int(pred.shape[1])
+    if channels != expected_channels:
+        raise ValueError(
+            f"Expected {expected_channels} output channels for "
+            f"{_target_summary(predict_basecolor, predict_geo, predict_normal)}, got {channels}"
+        )
+
+    channel_idx = 0
+    pred_rgb = None
+    pred_geo = None
+    pred_normal = None
+    if predict_basecolor:
+        pred_rgb = pred[:, channel_idx : channel_idx + 3]
+        channel_idx += 3
+    if predict_geo:
+        pred_geo = pred[:, channel_idx : channel_idx + 3]
+        channel_idx += 3
+    if predict_normal:
+        pred_normal = pred[:, channel_idx : channel_idx + 3]
+        channel_idx += 3
+
+    return {
+        "rgb": pred_rgb,
+        "geo": pred_geo,
+        "normal": pred_normal,
+        "mask_logits": pred[:, channel_idx : channel_idx + 1],
+    }
+
+
+def _prepare_face_mask(
+    face_mask: torch.Tensor | None,
+    reference: torch.Tensor,
+) -> torch.Tensor | None:
+    if face_mask is None:
+        return None
+    mask = face_mask.to(device=reference.device, dtype=reference.dtype).clamp(0.0, 1.0)
+    if mask.shape[-2:] != reference.shape[-2:]:
+        mask = F.interpolate(mask, size=reference.shape[-2:], mode="nearest")
+    return mask
+
+
+def _build_feature_loss_weight(
+    reference: torch.Tensor,
+    target_valid: torch.Tensor | None,
+    face_mask: torch.Tensor | None,
+    face_mask_valid: torch.Tensor | None,
 ) -> torch.Tensor:
-    """
-    Weighted basecolor L1:
-    - background pixels keep weight 1
-    - foreground (non-dark) pixels get higher weight
-    This avoids the trivial all-black solution on sparse basecolor targets.
-    """
-    l1 = (pred - gt).abs().mean(dim=1, keepdim=True)  # [B,1,H,W]
-    fg_mask = (gt.mean(dim=1, keepdim=True) > float(fg_threshold)).to(dtype=l1.dtype)
-    pix_w = 1.0 + (float(max(1.0, fg_weight)) - 1.0) * fg_mask
+    loss_weight = _prepare_face_mask(face_mask, reference)
+    if loss_weight is None:
+        loss_weight = torch.ones(
+            (reference.shape[0], 1, reference.shape[-2], reference.shape[-1]),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
 
-    if valid is None:
-        denom = pix_w.sum()
-        if denom.detach().item() <= 0:
-            return torch.zeros((), device=pred.device, dtype=pred.dtype)
-        return (l1 * pix_w).sum() / (denom + 1e-6)
+    if face_mask_valid is not None:
+        mask_valid = face_mask_valid.view(-1, 1, 1, 1).to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        loss_weight = loss_weight * mask_valid + (1.0 - mask_valid)
 
-    sample_w = valid.float().view(-1, 1, 1, 1).to(dtype=l1.dtype, device=l1.device)
-    pix_w = pix_w * sample_w
-    denom = pix_w.sum()
+    if target_valid is not None:
+        sample_valid = target_valid.view(-1, 1, 1, 1).to(
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        loss_weight = loss_weight * sample_valid
+
+    return loss_weight
+
+
+def _masked_feature_loss(
+    pred_feat: torch.Tensor | None,
+    gt_feat: torch.Tensor | None,
+    target_valid: torch.Tensor | None,
+    face_mask: torch.Tensor | None,
+    face_mask_valid: torch.Tensor | None,
+) -> torch.Tensor:
+    if pred_feat is None or gt_feat is None:
+        reference = pred_feat if pred_feat is not None else gt_feat
+        return _zero_scalar_like(reference)
+
+    loss_weight = _build_feature_loss_weight(
+        reference=pred_feat,
+        target_valid=target_valid,
+        face_mask=face_mask,
+        face_mask_valid=face_mask_valid,
+    )
+    loss_weight = loss_weight.expand_as(pred_feat)
+    denom = loss_weight.sum()
     if denom.detach().item() <= 0:
-        return torch.zeros((), device=pred.device, dtype=pred.dtype)
-    return (l1 * pix_w).sum() / (denom + 1e-6)
+        return torch.zeros((), device=pred_feat.device, dtype=pred_feat.dtype)
+    return ((pred_feat - gt_feat).abs() * loss_weight).sum() / (denom + 1e-6)
 
 
-def _save_preview(epoch: int, batch, pred: torch.Tensor, output_dir: str = "training_samples_dense"):
+def _masked_normal_cosine_loss(
+    pred_normal: torch.Tensor | None,
+    gt_normal: torch.Tensor | None,
+    target_valid: torch.Tensor | None,
+    face_mask: torch.Tensor | None,
+    face_mask_valid: torch.Tensor | None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if pred_normal is None or gt_normal is None:
+        reference = pred_normal if pred_normal is not None else gt_normal
+        return _zero_scalar_like(reference)
+
+    loss_weight = _build_feature_loss_weight(
+        reference=pred_normal,
+        target_valid=target_valid,
+        face_mask=face_mask,
+        face_mask_valid=face_mask_valid,
+    )
+    denom = loss_weight.sum()
+    if denom.detach().item() <= 0:
+        return torch.zeros((), device=pred_normal.device, dtype=pred_normal.dtype)
+
+    pred_vec = F.normalize(pred_normal * 2.0 - 1.0, dim=1, eps=eps)
+    gt_vec = F.normalize(gt_normal * 2.0 - 1.0, dim=1, eps=eps)
+    cosine = (pred_vec * gt_vec).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)
+    loss_map = 1.0 - cosine
+    return (loss_map * loss_weight).sum() / (denom + 1e-6)
+
+
+def _mask_bce_loss(
+    mask_logits: torch.Tensor | None,
+    gt_mask: torch.Tensor | None,
+    mask_valid: torch.Tensor | None,
+) -> torch.Tensor:
+    if mask_logits is None or gt_mask is None:
+        reference = mask_logits if mask_logits is not None else gt_mask
+        return _zero_scalar_like(reference)
+
+    target = _prepare_face_mask(gt_mask, mask_logits)
+    valid_weight = torch.ones_like(mask_logits, dtype=mask_logits.dtype, device=mask_logits.device)
+    if mask_valid is not None:
+        valid_weight = valid_weight * mask_valid.view(-1, 1, 1, 1).to(
+            device=mask_logits.device,
+            dtype=mask_logits.dtype,
+        )
+
+    denom = valid_weight.sum()
+    if denom.detach().item() <= 0:
+        return torch.zeros((), device=mask_logits.device, dtype=mask_logits.dtype)
+
+    raw = F.binary_cross_entropy_with_logits(mask_logits, target, reduction="none")
+    return (raw * valid_weight).sum() / (denom + 1e-6)
+
+
+def _mask_dice_loss(
+    mask_logits: torch.Tensor | None,
+    gt_mask: torch.Tensor | None,
+    mask_valid: torch.Tensor | None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if mask_logits is None or gt_mask is None:
+        reference = mask_logits if mask_logits is not None else gt_mask
+        return _zero_scalar_like(reference)
+
+    target = _prepare_face_mask(gt_mask, mask_logits)
+    probs = torch.sigmoid(mask_logits)
+
+    if mask_valid is not None:
+        valid_mask = mask_valid > 0.5
+        if not bool(valid_mask.any().item()):
+            return torch.zeros((), device=mask_logits.device, dtype=mask_logits.dtype)
+        probs = probs[valid_mask]
+        target = target[valid_mask]
+
+    intersection = (probs * target).sum(dim=(1, 2, 3))
+    union = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+    dice = (2.0 * intersection + eps) / (union + eps)
+    return 1.0 - dice.mean()
+
+
+def _combined_mask_loss(
+    mask_logits: torch.Tensor | None,
+    gt_mask: torch.Tensor | None,
+    mask_valid: torch.Tensor | None,
+    bce_lambda: float,
+    dice_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if mask_logits is None:
+        zero = _zero_scalar_like(gt_mask)
+        return zero, zero, zero
+
+    mask_bce = _mask_bce_loss(mask_logits, gt_mask, mask_valid)
+    mask_dice = _mask_dice_loss(mask_logits, gt_mask, mask_valid)
+    mask_total = float(bce_lambda) * mask_bce + float(dice_lambda) * mask_dice
+    return mask_total, mask_bce, mask_dice
+
+
+def _to_vis_map(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    if arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    arr = arr[:, :, :3]
+    return np.clip(arr, 0.0, 1.0)
+
+
+def _save_preview(
+    epoch: int,
+    batch,
+    pred: torch.Tensor,
+    output_dir: str = "training_samples_dense",
+    predict_basecolor: bool = True,
+    predict_geo: bool = True,
+    predict_normal: bool = True,
+):
     os.makedirs(output_dir, exist_ok=True)
     rgb = batch["rgb"][:4].detach().cpu().numpy()
-    gt = batch["basecolor"][:4].detach().cpu().numpy()
-    pred_np = pred[:4].detach().cpu().numpy()
-    valid = batch["basecolor_valid"][:4].detach().cpu().numpy()
+    gt_rgb = batch["basecolor"][:4].detach().cpu().numpy()
+    gt_geo = batch["geo"][:4].detach().cpu().numpy()
+    gt_normal = batch["normal"][:4].detach().cpu().numpy()
+    rgb_valid = batch["basecolor_valid"][:4].detach().cpu().numpy()
+    geo_valid = batch["geo_valid"][:4].detach().cpu().numpy()
+    normal_valid = batch["normal_valid"][:4].detach().cpu().numpy()
+    gt_mask = batch["face_mask"][:4].detach().cpu().numpy()
+    mask_valid = batch["face_mask_valid"][:4].detach().cpu().numpy()
+
+    pred_parts = _split_dense_prediction(
+        pred[:4],
+        predict_basecolor=predict_basecolor,
+        predict_geo=predict_geo,
+        predict_normal=predict_normal,
+    )
+    pred_rgb_np = pred_parts["rgb"].detach().cpu().numpy()
+    pred_geo_np = (
+        pred_parts["geo"].detach().cpu().numpy()
+        if pred_parts["geo"] is not None
+        else np.zeros_like(gt_geo, dtype=np.float32)
+    )
+    pred_normal_np = (
+        pred_parts["normal"].detach().cpu().numpy()
+        if pred_parts["normal"] is not None
+        else np.zeros_like(gt_normal, dtype=np.float32)
+    )
+    if pred_parts["mask_logits"] is not None:
+        pred_mask_np = torch.sigmoid(pred_parts["mask_logits"]).detach().cpu().numpy()
+    else:
+        pred_mask_np = np.zeros_like(gt_mask, dtype=np.float32)
 
     rows = []
     for i in range(rgb.shape[0]):
         rgb_i = np.clip(np.transpose(rgb[i], (1, 2, 0)), 0.0, 1.0)
-        gt_i = np.clip(np.transpose(gt[i], (1, 2, 0)), 0.0, 1.0)
-        pred_i = np.clip(np.transpose(pred_np[i], (1, 2, 0)), 0.0, 1.0)
-        diff_i = np.abs(pred_i - gt_i)
-        if float(valid[i]) <= 0.5:
-            gt_i = np.zeros_like(gt_i)
-            diff_i = np.zeros_like(diff_i)
-        row = np.concatenate([rgb_i, gt_i, pred_i, diff_i], axis=1)
+        gt_rgb_i = np.clip(np.transpose(gt_rgb[i], (1, 2, 0)), 0.0, 1.0)
+        gt_geo_i = np.clip(np.transpose(gt_geo[i], (1, 2, 0)), 0.0, 1.0)
+        gt_normal_i = np.clip(np.transpose(gt_normal[i], (1, 2, 0)), 0.0, 1.0)
+        pred_rgb_i = np.clip(np.transpose(pred_rgb_np[i], (1, 2, 0)), 0.0, 1.0)
+        pred_geo_i = np.clip(np.transpose(pred_geo_np[i], (1, 2, 0)), 0.0, 1.0)
+        pred_normal_i = np.clip(np.transpose(pred_normal_np[i], (1, 2, 0)), 0.0, 1.0)
+        gt_mask_i = np.clip(gt_mask[i, 0], 0.0, 1.0)
+        pred_mask_i = np.clip(pred_mask_np[i, 0], 0.0, 1.0)
+        pred_masked_i = pred_rgb_i * pred_mask_i[..., None]
+        effective_mask = gt_mask_i if float(mask_valid[i]) > 0.5 else np.ones_like(gt_mask_i)
+        rgb_diff_i = np.abs(pred_rgb_i - gt_rgb_i) * effective_mask[..., None]
+        geo_diff_i = np.abs(pred_geo_i - gt_geo_i) * effective_mask[..., None]
+        normal_diff_i = np.abs(pred_normal_i - gt_normal_i) * effective_mask[..., None]
+        if float(rgb_valid[i]) <= 0.5:
+            gt_rgb_i = np.zeros_like(gt_rgb_i)
+            rgb_diff_i = np.zeros_like(rgb_diff_i)
+        if float(geo_valid[i]) <= 0.5:
+            gt_geo_i = np.zeros_like(gt_geo_i)
+            geo_diff_i = np.zeros_like(geo_diff_i)
+        if float(normal_valid[i]) <= 0.5:
+            gt_normal_i = np.zeros_like(gt_normal_i)
+            normal_diff_i = np.zeros_like(normal_diff_i)
+        if float(mask_valid[i]) <= 0.5:
+            gt_mask_i = np.zeros_like(gt_mask_i)
+        gt_mask_vis = np.repeat(gt_mask_i[..., None], 3, axis=2)
+        pred_mask_vis = np.repeat(pred_mask_i[..., None], 3, axis=2)
+        row = np.concatenate(
+            [
+                _to_vis_map(rgb_i),
+                _to_vis_map(gt_rgb_i),
+                _to_vis_map(pred_rgb_i),
+                _to_vis_map(rgb_diff_i),
+                _to_vis_map(pred_masked_i),
+                _to_vis_map(gt_geo_i),
+                _to_vis_map(pred_geo_i),
+                _to_vis_map(geo_diff_i),
+                _to_vis_map(gt_normal_i),
+                _to_vis_map(pred_normal_i),
+                _to_vis_map(normal_diff_i),
+                _to_vis_map(gt_mask_vis),
+                _to_vis_map(pred_mask_vis),
+            ],
+            axis=1,
+        )
         rows.append((row * 255.0).astype(np.uint8))
 
     if rows:
@@ -255,25 +783,107 @@ def _save_preview(epoch: int, batch, pred: torch.Tensor, output_dir: str = "trai
 
 
 def train_one_epoch(
-    model: DenseImageTransformer,
+    model,
     loader: DataLoader,
     optimizer: optim.Optimizer,
     scaler: torch.amp.GradScaler,
     amp_dtype,
     device: torch.device,
     train_cfg: TrainConfig,
+    rank: int = 0,
+    world_size: int = 1,
+    train_sampler: DistributedSampler = None,
+    epoch: int = 0,
 ):
     model.train()
     total_loss = 0.0
+    total_rgb_loss = 0.0
+    total_geo_loss = 0.0
+    total_normal_loss = 0.0
+    total_mask_loss = 0.0
+    total_mask_bce = 0.0
+    total_mask_dice = 0.0
     n = 0
-    preview_batch = None
-    preview_pred = None
+    visualization_batch = None
 
-    pbar = tqdm(loader, desc="Training")
-    for batch in pbar:
+    # Set epoch for distributed sampler to ensure proper shuffling
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch)
+
+    pbar = tqdm(loader, desc="Training") if rank == 0 else loader
+    running_rgb_valid_ratio = 0.0
+    running_geo_valid_ratio = 0.0
+    running_normal_valid_ratio = 0.0
+    running_mask_valid_ratio = 0.0
+    running_mask_fg_ratio = 0.0
+    zero_valid_batches = 0
+    step_count = 0
+    predict_basecolor, predict_geo, predict_normal = _model_prediction_targets(model)
+    for step, batch in enumerate(pbar):
+        # Capture first batch for visualization (only rank 0, move to CPU immediately)
+        if rank == 0 and visualization_batch is None:
+            visualization_batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
         rgb = batch["rgb"].to(device, non_blocking=True)
-        gt = batch["basecolor"].to(device, non_blocking=True)
-        valid = batch["basecolor_valid"].to(device, non_blocking=True)
+        gt_rgb = batch["basecolor"].to(device, non_blocking=True)
+        rgb_valid = batch["basecolor_valid"].to(device, non_blocking=True)
+        gt_geo = batch["geo"].to(device, non_blocking=True)
+        geo_valid = batch["geo_valid"].to(device, non_blocking=True)
+        gt_normal = batch["normal"].to(device, non_blocking=True)
+        normal_valid = batch["normal_valid"].to(device, non_blocking=True)
+        face_mask = batch["face_mask"].to(device, non_blocking=True)
+        face_mask_valid = batch["face_mask_valid"].to(device, non_blocking=True)
+
+        batch_rgb_valid_ratio = rgb_valid.float().mean().detach()
+        batch_geo_valid_ratio = geo_valid.float().mean().detach()
+        batch_normal_valid_ratio = normal_valid.float().mean().detach()
+        batch_mask_valid_ratio = face_mask_valid.float().mean().detach()
+        face_mask_area = face_mask.float().mean(dim=(1, 2, 3))
+        batch_mask_fg_ratio = (
+            (face_mask_area * face_mask_valid.float()).sum()
+            / (face_mask_valid.float().sum() + 1e-6)
+        ).detach()
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(batch_rgb_valid_ratio, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_geo_valid_ratio, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_normal_valid_ratio, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_mask_valid_ratio, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_mask_fg_ratio, op=dist.ReduceOp.SUM)
+            batch_rgb_valid_ratio = batch_rgb_valid_ratio / float(world_size)
+            batch_geo_valid_ratio = batch_geo_valid_ratio / float(world_size)
+            batch_normal_valid_ratio = batch_normal_valid_ratio / float(world_size)
+            batch_mask_valid_ratio = batch_mask_valid_ratio / float(world_size)
+            batch_mask_fg_ratio = batch_mask_fg_ratio / float(world_size)
+
+        batch_rgb_valid_ratio_value = float(batch_rgb_valid_ratio.item())
+        batch_geo_valid_ratio_value = float(batch_geo_valid_ratio.item())
+        batch_normal_valid_ratio_value = float(batch_normal_valid_ratio.item())
+        batch_mask_valid_ratio_value = float(batch_mask_valid_ratio.item())
+        batch_mask_fg_ratio_value = float(batch_mask_fg_ratio.item())
+        running_rgb_valid_ratio += batch_rgb_valid_ratio_value
+        running_geo_valid_ratio += batch_geo_valid_ratio_value
+        running_normal_valid_ratio += batch_normal_valid_ratio_value
+        running_mask_valid_ratio += batch_mask_valid_ratio_value
+        running_mask_fg_ratio += batch_mask_fg_ratio_value
+        step_count += 1
+        if (
+            batch_rgb_valid_ratio_value <= 1e-6
+            and batch_geo_valid_ratio_value <= 1e-6
+            and batch_normal_valid_ratio_value <= 1e-6
+        ):
+            zero_valid_batches += 1
+
+        if rank == 0:
+            should_print = (step < 5) or ((step + 1) % int(train_cfg.debug_print_every) == 0)
+            if should_print:
+                print(
+                    f"[Debug][Epoch {epoch + 1}][Step {step + 1}] "
+                    f"rgb_valid_ratio={batch_rgb_valid_ratio_value:.4f} "
+                    f"geo_valid_ratio={batch_geo_valid_ratio_value:.4f} "
+                    f"normal_valid_ratio={batch_normal_valid_ratio_value:.4f} "
+                    f"face_mask_valid_ratio={batch_mask_valid_ratio_value:.4f} "
+                    f"face_mask_fg_ratio={batch_mask_fg_ratio_value:.4f}"
+                )
 
         rgb_in = F.interpolate(rgb, size=(512, 512), mode="bilinear", align_corners=True)
         rgb_in = _normalize_imagenet(rgb_in)
@@ -281,17 +891,52 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype):
             pred = model(rgb_in)
-            if pred.shape[-2:] != gt.shape[-2:]:
-                pred = F.interpolate(pred, size=gt.shape[-2:], mode="bilinear", align_corners=False)
-            loss = _basecolor_loss(
-                pred.float(),
-                gt.float(),
-                valid,
-                fg_weight=train_cfg.basecolor_fg_weight,
-                fg_threshold=train_cfg.basecolor_fg_threshold,
-            )
+            if pred.shape[-2:] != gt_rgb.shape[-2:]:
+                pred = F.interpolate(pred, size=gt_rgb.shape[-2:], mode="bilinear", align_corners=False)
+        pred_parts = _split_dense_prediction(
+            pred,
+            predict_basecolor=predict_basecolor,
+            predict_geo=predict_geo,
+            predict_normal=predict_normal,
+        )
+        rgb_loss = _masked_feature_loss(
+            pred_parts["rgb"].float() if pred_parts["rgb"] is not None else None,
+            gt_rgb.float(),
+            rgb_valid,
+            face_mask=face_mask.float(),
+            face_mask_valid=face_mask_valid,
+        )
+        geo_loss = _masked_feature_loss(
+            pred_parts["geo"].float() if pred_parts["geo"] is not None else None,
+            gt_geo.float(),
+            geo_valid,
+            face_mask=face_mask.float(),
+            face_mask_valid=face_mask_valid,
+        )
+        normal_loss = _masked_normal_cosine_loss(
+            pred_parts["normal"].float() if pred_parts["normal"] is not None else None,
+            gt_normal.float(),
+            normal_valid,
+            face_mask=face_mask.float(),
+            face_mask_valid=face_mask_valid,
+        )
+        mask_loss, mask_bce, mask_dice = _combined_mask_loss(
+            pred_parts["mask_logits"].float() if pred_parts["mask_logits"] is not None else None,
+            face_mask.float(),
+            face_mask_valid,
+            bce_lambda=train_cfg.mask_bce_lambda,
+            dice_lambda=train_cfg.mask_dice_lambda,
+        )
+        loss = rgb_loss + geo_loss + normal_loss + mask_loss
 
-        if not torch.isfinite(loss):
+        # Check for NaN/inf before backward - ALL RANKS must agree and follow same path
+        loss_finite_local = torch.isfinite(loss).to(device=device, dtype=torch.int32)
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(loss_finite_local, op=dist.ReduceOp.MIN)
+        loss_finite_global = bool(loss_finite_local.item() > 0)
+
+        if not loss_finite_global:
+            # All ranks skip this iteration together - just clear gradients and continue
             optimizer.zero_grad(set_to_none=True)
             continue
 
@@ -307,47 +952,195 @@ def train_one_epoch(
             optimizer.step()
 
         total_loss += float(loss.item())
+        total_rgb_loss += float(rgb_loss.item())
+        total_geo_loss += float(geo_loss.item())
+        total_normal_loss += float(normal_loss.item())
+        total_mask_loss += float(mask_loss.item())
+        total_mask_bce += float(mask_bce.item())
+        total_mask_dice += float(mask_dice.item())
         n += 1
-        pbar.set_postfix({"loss": f"{(total_loss / max(n, 1)):.4f}"})
+        
+        if rank == 0 and isinstance(pbar, tqdm):
+            pbar.set_postfix(
+                {
+                    "loss": f"{(total_loss / max(n, 1)):.4f}",
+                    "rgb": f"{(total_rgb_loss / max(n, 1)):.4f}",
+                    "geo": f"{(total_geo_loss / max(n, 1)):.4f}",
+                    "nrm": f"{(total_normal_loss / max(n, 1)):.4f}",
+                    "mask": f"{(total_mask_loss / max(n, 1)):.4f}",
+                }
+            )
 
-        if preview_batch is None:
-            preview_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            preview_pred = pred.detach().clone()
+    # Aggregate loss across all ranks for distributed training
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        loss_tensor = torch.tensor(
+            [
+                total_loss,
+                total_rgb_loss,
+                total_geo_loss,
+                total_normal_loss,
+                total_mask_loss,
+                total_mask_bce,
+                total_mask_dice,
+                n,
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss = loss_tensor[0].item()
+        total_rgb_loss = loss_tensor[1].item()
+        total_geo_loss = loss_tensor[2].item()
+        total_normal_loss = loss_tensor[3].item()
+        total_mask_loss = loss_tensor[4].item()
+        total_mask_bce = loss_tensor[5].item()
+        total_mask_dice = loss_tensor[6].item()
+        n = loss_tensor[7].item()
 
-    return total_loss / max(n, 1), preview_batch, preview_pred
+    if rank == 0 and step_count > 0:
+        avg_rgb_valid_ratio = running_rgb_valid_ratio / float(step_count)
+        avg_geo_valid_ratio = running_geo_valid_ratio / float(step_count)
+        avg_normal_valid_ratio = running_normal_valid_ratio / float(step_count)
+        avg_mask_valid_ratio = running_mask_valid_ratio / float(step_count)
+        avg_mask_fg_ratio = running_mask_fg_ratio / float(step_count)
+        print(
+            f"[Debug][Epoch {epoch + 1}] avg_rgb_valid_ratio={avg_rgb_valid_ratio:.4f} "
+            f"avg_geo_valid_ratio={avg_geo_valid_ratio:.4f} "
+            f"avg_normal_valid_ratio={avg_normal_valid_ratio:.4f} "
+            f"avg_face_mask_valid_ratio={avg_mask_valid_ratio:.4f} "
+            f"avg_face_mask_fg_ratio={avg_mask_fg_ratio:.4f} "
+            f"zero_valid_batches={zero_valid_batches}/{step_count}"
+        )
+
+    denom = max(n, 1)
+    return {
+        "avg_loss": total_loss / denom,
+        "avg_rgb_loss": total_rgb_loss / denom,
+        "avg_geo_loss": total_geo_loss / denom,
+        "avg_normal_loss": total_normal_loss / denom,
+        "avg_mask_loss": total_mask_loss / denom,
+        "avg_mask_bce": total_mask_bce / denom,
+        "avg_mask_dice": total_mask_dice / denom,
+        "visualization_batch": visualization_batch,
+    }
 
 
 @torch.no_grad()
 def validate_one_epoch(
-    model: DenseImageTransformer,
+    model,
     loader: DataLoader,
     device: torch.device,
     train_cfg: TrainConfig,
-) -> float:
+    rank: int = 0,
+    world_size: int = 1,
+) -> dict:
     model.eval()
+    predict_basecolor, predict_geo, predict_normal = _model_prediction_targets(model)
     total_loss = 0.0
+    total_rgb_loss = 0.0
+    total_geo_loss = 0.0
+    total_normal_loss = 0.0
+    total_mask_loss = 0.0
+    total_mask_bce = 0.0
+    total_mask_dice = 0.0
     n = 0
     for batch in loader:
         rgb = batch["rgb"].to(device, non_blocking=True)
-        gt = batch["basecolor"].to(device, non_blocking=True)
-        valid = batch["basecolor_valid"].to(device, non_blocking=True)
+        gt_rgb = batch["basecolor"].to(device, non_blocking=True)
+        rgb_valid = batch["basecolor_valid"].to(device, non_blocking=True)
+        gt_geo = batch["geo"].to(device, non_blocking=True)
+        geo_valid = batch["geo_valid"].to(device, non_blocking=True)
+        gt_normal = batch["normal"].to(device, non_blocking=True)
+        normal_valid = batch["normal_valid"].to(device, non_blocking=True)
+        face_mask = batch["face_mask"].to(device, non_blocking=True)
+        face_mask_valid = batch["face_mask_valid"].to(device, non_blocking=True)
 
         rgb_in = F.interpolate(rgb, size=(512, 512), mode="bilinear", align_corners=True)
         rgb_in = _normalize_imagenet(rgb_in)
         pred = model(rgb_in)
-        if pred.shape[-2:] != gt.shape[-2:]:
-            pred = F.interpolate(pred, size=gt.shape[-2:], mode="bilinear", align_corners=False)
-        loss = _basecolor_loss(
-            pred.float(),
-            gt.float(),
-            valid,
-            fg_weight=train_cfg.basecolor_fg_weight,
-            fg_threshold=train_cfg.basecolor_fg_threshold,
+        if pred.shape[-2:] != gt_rgb.shape[-2:]:
+            pred = F.interpolate(pred, size=gt_rgb.shape[-2:], mode="bilinear", align_corners=False)
+        pred_parts = _split_dense_prediction(
+            pred,
+            predict_basecolor=predict_basecolor,
+            predict_geo=predict_geo,
+            predict_normal=predict_normal,
         )
+        rgb_loss = _masked_feature_loss(
+            pred_parts["rgb"].float() if pred_parts["rgb"] is not None else None,
+            gt_rgb.float(),
+            rgb_valid,
+            face_mask=face_mask.float(),
+            face_mask_valid=face_mask_valid,
+        )
+        geo_loss = _masked_feature_loss(
+            pred_parts["geo"].float() if pred_parts["geo"] is not None else None,
+            gt_geo.float(),
+            geo_valid,
+            face_mask=face_mask.float(),
+            face_mask_valid=face_mask_valid,
+        )
+        normal_loss = _masked_normal_cosine_loss(
+            pred_parts["normal"].float() if pred_parts["normal"] is not None else None,
+            gt_normal.float(),
+            normal_valid,
+            face_mask=face_mask.float(),
+            face_mask_valid=face_mask_valid,
+        )
+        mask_loss, mask_bce, mask_dice = _combined_mask_loss(
+            pred_parts["mask_logits"].float() if pred_parts["mask_logits"] is not None else None,
+            face_mask.float(),
+            face_mask_valid,
+            bce_lambda=train_cfg.mask_bce_lambda,
+            dice_lambda=train_cfg.mask_dice_lambda,
+        )
+        loss = rgb_loss + geo_loss + normal_loss + mask_loss
         if torch.isfinite(loss):
             total_loss += float(loss.item())
+            total_rgb_loss += float(rgb_loss.item())
+            total_geo_loss += float(geo_loss.item())
+            total_normal_loss += float(normal_loss.item())
+            total_mask_loss += float(mask_loss.item())
+            total_mask_bce += float(mask_bce.item())
+            total_mask_dice += float(mask_dice.item())
             n += 1
-    return total_loss / max(n, 1)
+
+    # Aggregate loss across all ranks for distributed training
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        loss_tensor = torch.tensor(
+            [
+                total_loss,
+                total_rgb_loss,
+                total_geo_loss,
+                total_normal_loss,
+                total_mask_loss,
+                total_mask_bce,
+                total_mask_dice,
+                n,
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss = loss_tensor[0].item()
+        total_rgb_loss = loss_tensor[1].item()
+        total_geo_loss = loss_tensor[2].item()
+        total_normal_loss = loss_tensor[3].item()
+        total_mask_loss = loss_tensor[4].item()
+        total_mask_bce = loss_tensor[5].item()
+        total_mask_dice = loss_tensor[6].item()
+        n = loss_tensor[7].item()
+
+    denom = max(n, 1)
+    return {
+        "avg_loss": total_loss / denom,
+        "avg_rgb_loss": total_rgb_loss / denom,
+        "avg_geo_loss": total_geo_loss / denom,
+        "avg_normal_loss": total_normal_loss / denom,
+        "avg_mask_loss": total_mask_loss / denom,
+        "avg_mask_bce": total_mask_bce / denom,
+        "avg_mask_dice": total_mask_dice / denom,
+    }
 
 
 def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainConfig, device: torch.device):
@@ -359,7 +1152,9 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
         d_model=model_cfg.d_model,
         nhead=model_cfg.nhead,
         num_layers=model_cfg.num_layers,
-        output_channels=model_cfg.output_channels,
+        predict_basecolor=model_cfg.predict_basecolor,
+        predict_geo=model_cfg.predict_geo,
+        predict_normal=model_cfg.predict_normal,
         output_size=data_cfg.image_size,
         transformer_map_size=model_cfg.transformer_map_size,
         backbone_weights=model_cfg.backbone_weights,
@@ -369,8 +1164,12 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
         ckpt = torch.load(train_cfg.load_model, map_location="cpu")
         if "model_state_dict" in ckpt:
             ckpt = ckpt["model_state_dict"]
-        model.load_state_dict(ckpt, strict=False)
+        skipped_keys, load_notes = _load_matching_state_dict(model, ckpt)
         print(f"Loaded checkpoint: {train_cfg.load_model}")
+        if skipped_keys:
+            print(f"[Warn] Skipped incompatible checkpoint keys: {skipped_keys[:10]}")
+        if load_notes:
+            print(f"[Warn] Missing/unexpected checkpoint keys: {load_notes[:10]}")
 
     optimizer = optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -393,7 +1192,7 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device=device)
 
-        train_loss, preview_batch, preview_pred = train_one_epoch(
+        train_out = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -402,12 +1201,30 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
             device=device,
             train_cfg=train_cfg,
         )
-        val_loss = validate_one_epoch(model=model, loader=val_loader, device=device, train_cfg=train_cfg)
+        val_out = validate_one_epoch(model=model, loader=val_loader, device=device, train_cfg=train_cfg)
         scheduler.step()
 
-        print(f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-        writer.add_scalar("Loss/Train", train_loss, epoch)
-        writer.add_scalar("Loss/Val", val_loss, epoch)
+        print(
+            f"Train Loss: {train_out['avg_loss']:.6f} | Val Loss: {val_out['avg_loss']:.6f} "
+            f"| Train RGB: {train_out['avg_rgb_loss']:.6f} | Train Geo: {train_out['avg_geo_loss']:.6f} "
+            f"| Train Normal: {train_out['avg_normal_loss']:.6f} | Train Mask: {train_out['avg_mask_loss']:.6f} "
+            f"| Val RGB: {val_out['avg_rgb_loss']:.6f} | Val Geo: {val_out['avg_geo_loss']:.6f} "
+            f"| Val Normal: {val_out['avg_normal_loss']:.6f} | Val Mask: {val_out['avg_mask_loss']:.6f}"
+        )
+        writer.add_scalar("Loss/Train", train_out["avg_loss"], epoch)
+        writer.add_scalar("Loss/Val", val_out["avg_loss"], epoch)
+        writer.add_scalar("Loss/RGB_Train", train_out["avg_rgb_loss"], epoch)
+        writer.add_scalar("Loss/RGB_Val", val_out["avg_rgb_loss"], epoch)
+        writer.add_scalar("Loss/Geo_Train", train_out["avg_geo_loss"], epoch)
+        writer.add_scalar("Loss/Geo_Val", val_out["avg_geo_loss"], epoch)
+        writer.add_scalar("Loss/Normal_Train", train_out["avg_normal_loss"], epoch)
+        writer.add_scalar("Loss/Normal_Val", val_out["avg_normal_loss"], epoch)
+        writer.add_scalar("Loss/Mask_Train", train_out["avg_mask_loss"], epoch)
+        writer.add_scalar("Loss/Mask_Val", val_out["avg_mask_loss"], epoch)
+        writer.add_scalar("Loss/MaskBCE_Train", train_out["avg_mask_bce"], epoch)
+        writer.add_scalar("Loss/MaskBCE_Val", val_out["avg_mask_bce"], epoch)
+        writer.add_scalar("Loss/MaskDice_Train", train_out["avg_mask_dice"], epoch)
+        writer.add_scalar("Loss/MaskDice_Val", val_out["avg_mask_dice"], epoch)
         writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch)
 
         if device.type == "cuda":
@@ -415,18 +1232,43 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
             writer.add_scalar("GPU/PeakGB", peak_gb, epoch)
             print(f"Peak GPU memory: {peak_gb:.2f} GB")
 
-        if preview_batch is not None and preview_pred is not None and ((epoch + 1) % train_cfg.save_preview_every == 0):
-            _save_preview(epoch, preview_batch, preview_pred)
+        visualization_batch = train_out["visualization_batch"]
+        if visualization_batch is not None and ((epoch + 1) % train_cfg.save_preview_every == 0):
+            model.eval()
+            with torch.no_grad():
+                rgb = visualization_batch["rgb"].to(device, non_blocking=True)
+                rgb_in = F.interpolate(rgb, size=(512, 512), mode="bilinear", align_corners=True)
+                rgb_in = _normalize_imagenet(rgb_in)
+                preview_pred = model(rgb_in)
+                if preview_pred.shape[-2:] != visualization_batch["basecolor"].shape[-2:]:
+                    preview_pred = F.interpolate(
+                        preview_pred,
+                        size=visualization_batch["basecolor"].shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                _save_preview(
+                    epoch,
+                    visualization_batch,
+                    preview_pred,
+                    predict_basecolor=model_cfg.predict_basecolor,
+                    predict_geo=model_cfg.predict_geo,
+                    predict_normal=model_cfg.predict_normal,
+                )
+            model.train()
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if val_out["avg_loss"] < best_val:
+            best_val = val_out["avg_loss"]
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": val_loss,
+                    "val_loss": val_out["avg_loss"],
                     "output_channels": model_cfg.output_channels,
+                    "predict_basecolor": model_cfg.predict_basecolor,
+                    "predict_geo": model_cfg.predict_geo,
+                    "predict_normal": model_cfg.predict_normal,
                 },
                 train_cfg.save_path,
             )
@@ -435,19 +1277,182 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
     writer.close()
 
 
-def launch_windows(args):
-    data_cfg, model_cfg, train_cfg = build_configs_from_args(args, platform_name="windows")
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = bool(device.type == "cuda")
+def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainConfig, backend: str):
+    """Worker function for distributed training - one process per GPU."""
+    setup_distributed(rank, world_size, train_cfg.master_port, backend)
+    torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
-    print(f"Training device: {device}")
-    run_training(data_cfg, model_cfg, train_cfg, device=device)
+
+    device = torch.device(f"cuda:{rank}")
+
+    # Create distributed dataloaders
+    train_loader, val_loader, train_sampler = create_distributed_dataloaders(data_cfg, rank, world_size)
+
+    if rank == 0:
+        print(f"Train samples: {len(train_loader.dataset)}")
+        print(f"Val samples: {len(val_loader.dataset)}")
+
+    # Create model
+    model = DenseImageTransformer(
+        d_model=model_cfg.d_model,
+        nhead=model_cfg.nhead,
+        num_layers=model_cfg.num_layers,
+        predict_basecolor=model_cfg.predict_basecolor,
+        predict_geo=model_cfg.predict_geo,
+        predict_normal=model_cfg.predict_normal,
+        output_size=data_cfg.image_size,
+        transformer_map_size=model_cfg.transformer_map_size,
+        backbone_weights=model_cfg.backbone_weights,
+    ).to(device)
+
+    # Load checkpoint
+    if train_cfg.load_model and os.path.exists(train_cfg.load_model):
+        ckpt = torch.load(train_cfg.load_model, map_location="cpu")
+        if "model_state_dict" in ckpt:
+            ckpt = ckpt["model_state_dict"]
+        skipped_keys, load_notes = _load_matching_state_dict(model, ckpt)
+        if rank == 0:
+            print(f"Loaded checkpoint: {train_cfg.load_model}")
+            if skipped_keys:
+                print(f"[Warn] Skipped incompatible checkpoint keys: {skipped_keys[:10]}")
+            if load_notes:
+                print(f"[Warn] Missing/unexpected checkpoint keys: {load_notes[:10]}")
+
+    # Wrap with DDP for multi-GPU
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        model = DDP(model, device_ids=[rank])
+
+    optimizer = optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, train_cfg.epochs), eta_min=1e-6
+    )
+
+    amp_dtype = torch.float16 if train_cfg.amp_dtype == "fp16" else torch.bfloat16
+    if amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        amp_dtype = torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
+
+    # Tensorboard writer only on rank 0
+    writer = None
+    if rank == 0:
+        run_name = f"dense_img_{model_cfg.backbone_weights}_{int(time.time())}"
+        writer = SummaryWriter(os.path.join("runs", run_name))
+
+    best_val = float("inf")
+    for epoch in range(train_cfg.epochs):
+        if rank == 0:
+            print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
+
+        train_out = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            scaler=scaler,
+            amp_dtype=amp_dtype,
+            device=device,
+            train_cfg=train_cfg,
+            rank=rank,
+            world_size=world_size,
+            train_sampler=train_sampler,
+            epoch=epoch,
+        )
+
+        val_out = validate_one_epoch(
+            model=model,
+            loader=val_loader,
+            device=device,
+            train_cfg=train_cfg,
+            rank=rank,
+            world_size=world_size,
+        )
+        scheduler.step()
+
+        # Only rank 0 logs and saves
+        if rank == 0:
+            print(
+                f"Train Loss: {train_out['avg_loss']:.6f} | Val Loss: {val_out['avg_loss']:.6f} "
+                f"| Train RGB: {train_out['avg_rgb_loss']:.6f} | Train Geo: {train_out['avg_geo_loss']:.6f} "
+                f"| Train Normal: {train_out['avg_normal_loss']:.6f} | Train Mask: {train_out['avg_mask_loss']:.6f} "
+                f"| Val RGB: {val_out['avg_rgb_loss']:.6f} | Val Geo: {val_out['avg_geo_loss']:.6f} "
+                f"| Val Normal: {val_out['avg_normal_loss']:.6f} | Val Mask: {val_out['avg_mask_loss']:.6f}"
+            )
+            writer.add_scalar("Loss/Train", train_out["avg_loss"], epoch)
+            writer.add_scalar("Loss/Val", val_out["avg_loss"], epoch)
+            writer.add_scalar("Loss/RGB_Train", train_out["avg_rgb_loss"], epoch)
+            writer.add_scalar("Loss/RGB_Val", val_out["avg_rgb_loss"], epoch)
+            writer.add_scalar("Loss/Geo_Train", train_out["avg_geo_loss"], epoch)
+            writer.add_scalar("Loss/Geo_Val", val_out["avg_geo_loss"], epoch)
+            writer.add_scalar("Loss/Normal_Train", train_out["avg_normal_loss"], epoch)
+            writer.add_scalar("Loss/Normal_Val", val_out["avg_normal_loss"], epoch)
+            writer.add_scalar("Loss/Mask_Train", train_out["avg_mask_loss"], epoch)
+            writer.add_scalar("Loss/Mask_Val", val_out["avg_mask_loss"], epoch)
+            writer.add_scalar("Loss/MaskBCE_Train", train_out["avg_mask_bce"], epoch)
+            writer.add_scalar("Loss/MaskBCE_Val", val_out["avg_mask_bce"], epoch)
+            writer.add_scalar("Loss/MaskDice_Train", train_out["avg_mask_dice"], epoch)
+            writer.add_scalar("Loss/MaskDice_Val", val_out["avg_mask_dice"], epoch)
+            writer.add_scalar("LR", optimizer.param_groups[0]["lr"], epoch)
+
+            # Generate preview visualization if we have a batch
+            visualization_batch = train_out["visualization_batch"]
+            if visualization_batch is not None and ((epoch + 1) % train_cfg.save_preview_every == 0):
+                model.eval()
+                with torch.no_grad():
+                    # Move batch back to device for inference
+                    rgb = visualization_batch["rgb"].to(device, non_blocking=True)
+                    rgb_in = F.interpolate(rgb, size=(512, 512), mode="bilinear", align_corners=True)
+                    rgb_in = _normalize_imagenet(rgb_in)
+                    preview_pred = model(rgb_in)
+                    if preview_pred.shape[-2:] != visualization_batch["basecolor"].shape[-2:]:
+                        preview_pred = F.interpolate(
+                            preview_pred,
+                            size=visualization_batch["basecolor"].shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    _save_preview(
+                        epoch,
+                        visualization_batch,
+                        preview_pred,
+                        predict_basecolor=model_cfg.predict_basecolor,
+                        predict_geo=model_cfg.predict_geo,
+                        predict_normal=model_cfg.predict_normal,
+                    )
+                model.train()
+
+            if val_out["avg_loss"] < best_val:
+                best_val = val_out["avg_loss"]
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": _unwrap_model(model).state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "val_loss": val_out["avg_loss"],
+                        "output_channels": model_cfg.output_channels,
+                        "predict_basecolor": model_cfg.predict_basecolor,
+                        "predict_geo": model_cfg.predict_geo,
+                        "predict_normal": model_cfg.predict_normal,
+                    },
+                    train_cfg.save_path,
+                )
+                print(f"Saved best model: {train_cfg.save_path}")
+
+    if writer:
+        writer.close()
+    cleanup_distributed()
 
 
 def launch_linux(args):
     data_cfg, model_cfg, train_cfg = build_configs_from_args(args, platform_name="linux")
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = bool(device.type == "cuda")
-    torch.set_float32_matmul_precision("high")
-    print(f"Training device: {device}")
-    run_training(data_cfg, model_cfg, train_cfg, device=device)
+    world_size = torch.cuda.device_count()
+    if world_size <= 0:
+        raise RuntimeError("No CUDA devices found")
+    print(f"Spawning {world_size} processes (linux/nccl)")
+    mp.spawn(train_worker, args=(world_size, data_cfg, model_cfg, train_cfg, "nccl"), nprocs=world_size, join=True)
+
+
+def launch_windows(args):
+    data_cfg, model_cfg, train_cfg = build_configs_from_args(args, platform_name="windows")
+    if torch.cuda.device_count() <= 0:
+        raise RuntimeError("No CUDA devices found")
+    print("Launching single-process training (windows/gloo)")
+    train_worker(0, 1, data_cfg, model_cfg, train_cfg, "gloo")
