@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
@@ -23,6 +24,73 @@ from dense_image_dataset import DenseImageDataset, dense_image_collate_fn
 from dense_image_transformer import DenseImageTransformer, compute_dense_output_channels
 
 
+class UncertaintyWeightedLoss(nn.Module):
+    """
+    Learnable uncertainty-based task weighting for multi-task learning.
+    
+    Based on: "Multi-Task Learning Using Uncertainty to Weigh Losses for Scene Geometry and Semantics"
+    (Kendall et al., CVPR 2018)
+    
+    Each task's loss is weighted by learned uncertainty (log-variance):
+        weighted_loss = L / (2 * exp(log_sigma)) + log_sigma
+    
+    The network automatically learns optimal task weights through gradient descent.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        # Learnable log-variance parameters (initialized to 0, so sigma^2 = 1)
+        self.log_var_rgb = nn.Parameter(torch.zeros(1))
+        self.log_var_geo = nn.Parameter(torch.zeros(1))
+        self.log_var_normal = nn.Parameter(torch.zeros(1))
+        self.log_var_mask = nn.Parameter(torch.zeros(1))
+    
+    def forward(
+        self,
+        rgb_loss: torch.Tensor,
+        geo_loss: torch.Tensor,
+        normal_loss: torch.Tensor,
+        mask_loss: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply uncertainty weighting to combine multiple task losses.
+        
+        Args:
+            rgb_loss: Basecolor prediction loss
+            geo_loss: Geometry prediction loss
+            normal_loss: Normal prediction loss
+            mask_loss: Mask prediction loss
+            
+        Returns:
+            Combined weighted loss
+        """
+        # Apply uncertainty weighting: L / (2*sigma^2) + log(sigma^2)
+        weighted_rgb = rgb_loss / (2 * self.log_var_rgb.exp()) + self.log_var_rgb
+        weighted_geo = geo_loss / (2 * self.log_var_geo.exp()) + self.log_var_geo
+        weighted_normal = normal_loss / (2 * self.log_var_normal.exp()) + self.log_var_normal
+        weighted_mask = mask_loss / (2 * self.log_var_mask.exp()) + self.log_var_mask
+        
+        return weighted_rgb + weighted_geo + weighted_normal + weighted_mask
+    
+    def get_uncertainties(self) -> dict[str, float]:
+        """Get current learned uncertainties (sigma^2) for each task."""
+        return {
+            'rgb_sigma2': self.log_var_rgb.exp().item(),
+            'geo_sigma2': self.log_var_geo.exp().item(),
+            'normal_sigma2': self.log_var_normal.exp().item(),
+            'mask_sigma2': self.log_var_mask.exp().item(),
+        }
+    
+    def get_weights(self) -> dict[str, float]:
+        """Get effective task weights (1 / 2*sigma^2) for monitoring."""
+        return {
+            'rgb_weight': 1.0 / (2 * self.log_var_rgb.exp().item()),
+            'geo_weight': 1.0 / (2 * self.log_var_geo.exp().item()),
+            'normal_weight': 1.0 / (2 * self.log_var_normal.exp().item()),
+            'mask_weight': 1.0 / (2 * self.log_var_mask.exp().item()),
+        }
+
+
 @dataclass
 class DataConfig:
     data_roots: list[str]
@@ -30,7 +98,7 @@ class DataConfig:
     num_workers: int = 2
     prefetch_factor: int = 2
     persistent_workers: bool = True
-    image_size: int = 512
+    image_size: int = 1024
     train_ratio: float = 0.95
     max_train_samples: int = 0
 
@@ -146,7 +214,7 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
         const=True,
         default=True,
     )
-    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--image_size", type=int, default=1024)
     parser.add_argument("--train_ratio", type=float, default=0.95)
 
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -262,84 +330,6 @@ def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, Model
     return data_cfg, model_cfg, train_cfg
 
 
-def _dataset_basecolor_valid_stats(dataset) -> tuple[int, int]:
-    if isinstance(dataset, Subset):
-        base_dataset = dataset.dataset
-        indices = list(dataset.indices)
-        if hasattr(base_dataset, "samples"):
-            valid_count = sum(
-                1
-                for idx in indices
-                if idx < len(base_dataset.samples)
-                and len(base_dataset.samples[idx]) >= 3
-                and base_dataset.samples[idx][2] is not None
-            )
-            return len(indices), int(valid_count)
-        return len(indices), -1
-
-    if hasattr(dataset, "samples"):
-        total = len(dataset.samples)
-        valid = sum(
-            1
-            for sample in dataset.samples
-            if len(sample) >= 3 and sample[2] is not None
-        )
-        return int(total), int(valid)
-
-    try:
-        return int(len(dataset)), -1
-    except Exception:
-        return -1, -1
-
-
-def _print_dataset_debug(prefix: str, dataset, rank: int = 0) -> None:
-    if rank != 0:
-        return
-
-    total, valid = _dataset_basecolor_valid_stats(dataset)
-    if total >= 0 and valid >= 0:
-        ratio = float(valid / max(total, 1))
-        print(f"[Data] {prefix} basecolor_valid: {valid}/{total} ({ratio:.2%})")
-    elif total >= 0:
-        print(f"[Data] {prefix} samples: {total} (valid basecolor count unavailable)")
-
-    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
-    if hasattr(base_dataset, "get_debug_summary"):
-        try:
-            summary = base_dataset.get_debug_summary()
-            missing_examples = list(summary.get("missing_examples", []))
-            if missing_examples:
-                print("[Data] Example missing basecolor mappings:")
-                for ex in missing_examples[:5]:
-                    print(f"[Data]   {ex}")
-            for key in ("geo", "normal", "face_mask"):
-                valid_key = f"{key}_valid"
-                ratio_key = f"{key}_valid_ratio"
-                if valid_key in summary:
-                    total_count = int(summary.get("total", 0))
-                    print(
-                        f"[Data] {prefix} {valid_key}: {int(summary.get(valid_key, 0))}/{total_count} "
-                        f"({float(summary.get(ratio_key, 0.0)):.2%})"
-                    )
-            missing_geo_examples = list(summary.get("missing_geo_examples", []))
-            if missing_geo_examples:
-                print("[Data] Example missing geo mappings:")
-                for ex in missing_geo_examples[:5]:
-                    print(f"[Data]   {ex}")
-            missing_normal_examples = list(summary.get("missing_normal_examples", []))
-            if missing_normal_examples:
-                print("[Data] Example missing normal mappings:")
-                for ex in missing_normal_examples[:5]:
-                    print(f"[Data]   {ex}")
-            missing_face_mask_examples = list(summary.get("missing_face_mask_examples", []))
-            if missing_face_mask_examples:
-                print("[Data] Example missing face-mask mappings:")
-                for ex in missing_face_mask_examples[:5]:
-                    print(f"[Data]   {ex}")
-        except Exception:
-            pass
-
-
 def create_dataloaders(data_cfg: DataConfig):
     """Create non-distributed dataloaders (for single GPU/CPU)."""
     train_dataset = DenseImageDataset(
@@ -357,13 +347,8 @@ def create_dataloaders(data_cfg: DataConfig):
         augment=False,
     )
 
-    _print_dataset_debug("Train(full)", train_dataset, rank=0)
-    _print_dataset_debug("Val", val_dataset, rank=0)
     if int(data_cfg.max_train_samples) > 0 and len(train_dataset) > int(data_cfg.max_train_samples):
         train_dataset = Subset(train_dataset, list(range(int(data_cfg.max_train_samples))))
-        _print_dataset_debug("Train(used)", train_dataset, rank=0)
-    else:
-        _print_dataset_debug("Train(used)", train_dataset, rank=0)
 
     train_loader = DataLoader(
         train_dataset,
@@ -380,7 +365,7 @@ def create_dataloaders(data_cfg: DataConfig):
         val_dataset,
         batch_size=data_cfg.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=max(1, data_cfg.num_workers // 4),  # Use half the workers for validation
         pin_memory=True,
         drop_last=False,
         prefetch_factor=data_cfg.prefetch_factor if data_cfg.num_workers > 0 else None,
@@ -407,15 +392,10 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
         augment=False,
     )
 
-    _print_dataset_debug("Train(full)", train_dataset, rank=rank)
-    _print_dataset_debug("Val", val_dataset, rank=rank)
     if int(data_cfg.max_train_samples) > 0 and len(train_dataset) > int(data_cfg.max_train_samples):
         if rank == 0:
             print(f"[Info] Limiting train dataset for test run: {int(data_cfg.max_train_samples)} samples")
         train_dataset = Subset(train_dataset, list(range(int(data_cfg.max_train_samples))))
-        _print_dataset_debug("Train(used)", train_dataset, rank=rank)
-    else:
-        _print_dataset_debug("Train(used)", train_dataset, rank=rank)
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
@@ -436,11 +416,11 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
         val_dataset,
         batch_size=data_cfg.batch_size,
         sampler=val_sampler,
-        num_workers=0,  # Use 0 workers for validation to reduce RAM usage
+        num_workers=max(1, data_cfg.num_workers // 2),  # Use half the workers for validation
         pin_memory=True,
         drop_last=False,
-        prefetch_factor=None,
-        persistent_workers=False,
+        prefetch_factor=data_cfg.prefetch_factor if data_cfg.num_workers > 0 else None,
+        persistent_workers=bool(data_cfg.persistent_workers) if data_cfg.num_workers > 0 else False,
         collate_fn=dense_image_collate_fn,
         worker_init_fn=worker_init_fn,
     )
@@ -600,8 +580,13 @@ def _masked_normal_cosine_loss(
     if denom.detach().item() <= 0:
         return torch.zeros((), device=pred_normal.device, dtype=pred_normal.dtype)
 
-    pred_vec = F.normalize(pred_normal * 2.0 - 1.0, dim=1, eps=eps)
+    # Model output is already normalized (unit length) in [0,1] range
+    # Just transform to [-1, 1] - no need to normalize again
+    pred_vec = pred_normal * 2.0 - 1.0  # Already unit length from model
+    
+    # GT needs to be normalized
     gt_vec = F.normalize(gt_normal * 2.0 - 1.0, dim=1, eps=eps)
+    
     cosine = (pred_vec * gt_vec).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)
     loss_map = 1.0 - cosine
     return (loss_map * loss_weight).sum() / (denom + 1e-6)
@@ -811,13 +796,6 @@ def train_one_epoch(
         train_sampler.set_epoch(epoch)
 
     pbar = tqdm(loader, desc="Training") if rank == 0 else loader
-    running_rgb_valid_ratio = 0.0
-    running_geo_valid_ratio = 0.0
-    running_normal_valid_ratio = 0.0
-    running_mask_valid_ratio = 0.0
-    running_mask_fg_ratio = 0.0
-    zero_valid_batches = 0
-    step_count = 0
     predict_basecolor, predict_geo, predict_normal = _model_prediction_targets(model)
     for step, batch in enumerate(pbar):
         # Capture first batch for visualization (only rank 0, move to CPU immediately)
@@ -825,74 +803,27 @@ def train_one_epoch(
             visualization_batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         rgb = batch["rgb"].to(device, non_blocking=True)
-        gt_rgb = batch["basecolor"].to(device, non_blocking=True)
-        rgb_valid = batch["basecolor_valid"].to(device, non_blocking=True)
-        gt_geo = batch["geo"].to(device, non_blocking=True)
-        geo_valid = batch["geo_valid"].to(device, non_blocking=True)
-        gt_normal = batch["normal"].to(device, non_blocking=True)
-        normal_valid = batch["normal_valid"].to(device, non_blocking=True)
+        
+        # Only load ground truth data that will be used in loss calculation
+        gt_rgb = batch["basecolor"].to(device, non_blocking=True) if predict_basecolor else None
+        rgb_valid = batch["basecolor_valid"].to(device, non_blocking=True) if predict_basecolor else None
+        gt_geo = batch["geo"].to(device, non_blocking=True) if predict_geo else None
+        geo_valid = batch["geo_valid"].to(device, non_blocking=True) if predict_geo else None
+        gt_normal = batch["normal"].to(device, non_blocking=True) if predict_normal else None
+        normal_valid = batch["normal_valid"].to(device, non_blocking=True) if predict_normal else None
+        
         face_mask = batch["face_mask"].to(device, non_blocking=True)
         face_mask_valid = batch["face_mask_valid"].to(device, non_blocking=True)
 
-        batch_rgb_valid_ratio = rgb_valid.float().mean().detach()
-        batch_geo_valid_ratio = geo_valid.float().mean().detach()
-        batch_normal_valid_ratio = normal_valid.float().mean().detach()
-        batch_mask_valid_ratio = face_mask_valid.float().mean().detach()
-        face_mask_area = face_mask.float().mean(dim=(1, 2, 3))
-        batch_mask_fg_ratio = (
-            (face_mask_area * face_mask_valid.float()).sum()
-            / (face_mask_valid.float().sum() + 1e-6)
-        ).detach()
-        if world_size > 1 and dist.is_available() and dist.is_initialized():
-            dist.all_reduce(batch_rgb_valid_ratio, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_geo_valid_ratio, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_normal_valid_ratio, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_mask_valid_ratio, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_mask_fg_ratio, op=dist.ReduceOp.SUM)
-            batch_rgb_valid_ratio = batch_rgb_valid_ratio / float(world_size)
-            batch_geo_valid_ratio = batch_geo_valid_ratio / float(world_size)
-            batch_normal_valid_ratio = batch_normal_valid_ratio / float(world_size)
-            batch_mask_valid_ratio = batch_mask_valid_ratio / float(world_size)
-            batch_mask_fg_ratio = batch_mask_fg_ratio / float(world_size)
-
-        batch_rgb_valid_ratio_value = float(batch_rgb_valid_ratio.item())
-        batch_geo_valid_ratio_value = float(batch_geo_valid_ratio.item())
-        batch_normal_valid_ratio_value = float(batch_normal_valid_ratio.item())
-        batch_mask_valid_ratio_value = float(batch_mask_valid_ratio.item())
-        batch_mask_fg_ratio_value = float(batch_mask_fg_ratio.item())
-        running_rgb_valid_ratio += batch_rgb_valid_ratio_value
-        running_geo_valid_ratio += batch_geo_valid_ratio_value
-        running_normal_valid_ratio += batch_normal_valid_ratio_value
-        running_mask_valid_ratio += batch_mask_valid_ratio_value
-        running_mask_fg_ratio += batch_mask_fg_ratio_value
-        step_count += 1
-        if (
-            batch_rgb_valid_ratio_value <= 1e-6
-            and batch_geo_valid_ratio_value <= 1e-6
-            and batch_normal_valid_ratio_value <= 1e-6
-        ):
-            zero_valid_batches += 1
-
-        if rank == 0:
-            should_print = (step < 5) or ((step + 1) % int(train_cfg.debug_print_every) == 0)
-            if should_print:
-                print(
-                    f"[Debug][Epoch {epoch + 1}][Step {step + 1}] "
-                    f"rgb_valid_ratio={batch_rgb_valid_ratio_value:.4f} "
-                    f"geo_valid_ratio={batch_geo_valid_ratio_value:.4f} "
-                    f"normal_valid_ratio={batch_normal_valid_ratio_value:.4f} "
-                    f"face_mask_valid_ratio={batch_mask_valid_ratio_value:.4f} "
-                    f"face_mask_fg_ratio={batch_mask_fg_ratio_value:.4f}"
-                )
-
-        rgb_in = F.interpolate(rgb, size=(512, 512), mode="bilinear", align_corners=True)
-        rgb_in = _normalize_imagenet(rgb_in)
+        rgb_in = _normalize_imagenet(rgb)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype):
             pred = model(rgb_in)
-            if pred.shape[-2:] != gt_rgb.shape[-2:]:
-                pred = F.interpolate(pred, size=gt_rgb.shape[-2:], mode="bilinear", align_corners=False)
+            # Use face_mask as reference for output size (always available)
+            target_size = face_mask.shape[-2:]
+            if pred.shape[-2:] != target_size:
+                pred = F.interpolate(pred, size=target_size, mode="bilinear", align_corners=False)
         pred_parts = _split_dense_prediction(
             pred,
             predict_basecolor=predict_basecolor,
@@ -997,21 +928,6 @@ def train_one_epoch(
         total_mask_dice = loss_tensor[6].item()
         n = loss_tensor[7].item()
 
-    if rank == 0 and step_count > 0:
-        avg_rgb_valid_ratio = running_rgb_valid_ratio / float(step_count)
-        avg_geo_valid_ratio = running_geo_valid_ratio / float(step_count)
-        avg_normal_valid_ratio = running_normal_valid_ratio / float(step_count)
-        avg_mask_valid_ratio = running_mask_valid_ratio / float(step_count)
-        avg_mask_fg_ratio = running_mask_fg_ratio / float(step_count)
-        print(
-            f"[Debug][Epoch {epoch + 1}] avg_rgb_valid_ratio={avg_rgb_valid_ratio:.4f} "
-            f"avg_geo_valid_ratio={avg_geo_valid_ratio:.4f} "
-            f"avg_normal_valid_ratio={avg_normal_valid_ratio:.4f} "
-            f"avg_face_mask_valid_ratio={avg_mask_valid_ratio:.4f} "
-            f"avg_face_mask_fg_ratio={avg_mask_fg_ratio:.4f} "
-            f"zero_valid_batches={zero_valid_batches}/{step_count}"
-        )
-
     denom = max(n, 1)
     return {
         "avg_loss": total_loss / denom,
@@ -1046,20 +962,24 @@ def validate_one_epoch(
     n = 0
     for batch in loader:
         rgb = batch["rgb"].to(device, non_blocking=True)
-        gt_rgb = batch["basecolor"].to(device, non_blocking=True)
-        rgb_valid = batch["basecolor_valid"].to(device, non_blocking=True)
-        gt_geo = batch["geo"].to(device, non_blocking=True)
-        geo_valid = batch["geo_valid"].to(device, non_blocking=True)
-        gt_normal = batch["normal"].to(device, non_blocking=True)
-        normal_valid = batch["normal_valid"].to(device, non_blocking=True)
+        
+        # Only load ground truth data that will be used in loss calculation
+        gt_rgb = batch["basecolor"].to(device, non_blocking=True) if predict_basecolor else None
+        rgb_valid = batch["basecolor_valid"].to(device, non_blocking=True) if predict_basecolor else None
+        gt_geo = batch["geo"].to(device, non_blocking=True) if predict_geo else None
+        geo_valid = batch["geo_valid"].to(device, non_blocking=True) if predict_geo else None
+        gt_normal = batch["normal"].to(device, non_blocking=True) if predict_normal else None
+        normal_valid = batch["normal_valid"].to(device, non_blocking=True) if predict_normal else None
+        
         face_mask = batch["face_mask"].to(device, non_blocking=True)
         face_mask_valid = batch["face_mask_valid"].to(device, non_blocking=True)
 
-        rgb_in = F.interpolate(rgb, size=(512, 512), mode="bilinear", align_corners=True)
-        rgb_in = _normalize_imagenet(rgb_in)
+        rgb_in = _normalize_imagenet(rgb)
         pred = model(rgb_in)
-        if pred.shape[-2:] != gt_rgb.shape[-2:]:
-            pred = F.interpolate(pred, size=gt_rgb.shape[-2:], mode="bilinear", align_corners=False)
+        # Use face_mask as reference for output size (always available)
+        target_size = face_mask.shape[-2:]
+        if pred.shape[-2:] != target_size:
+            pred = F.interpolate(pred, size=target_size, mode="bilinear", align_corners=False)
         pred_parts = _split_dense_prediction(
             pred,
             predict_basecolor=predict_basecolor,
@@ -1237,8 +1157,7 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
             model.eval()
             with torch.no_grad():
                 rgb = visualization_batch["rgb"].to(device, non_blocking=True)
-                rgb_in = F.interpolate(rgb, size=(512, 512), mode="bilinear", align_corners=True)
-                rgb_in = _normalize_imagenet(rgb_in)
+                rgb_in = _normalize_imagenet(rgb)
                 preview_pred = model(rgb_in)
                 if preview_pred.shape[-2:] != visualization_batch["basecolor"].shape[-2:]:
                     preview_pred = F.interpolate(
@@ -1399,8 +1318,7 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
                 with torch.no_grad():
                     # Move batch back to device for inference
                     rgb = visualization_batch["rgb"].to(device, non_blocking=True)
-                    rgb_in = F.interpolate(rgb, size=(512, 512), mode="bilinear", align_corners=True)
-                    rgb_in = _normalize_imagenet(rgb_in)
+                    rgb_in = _normalize_imagenet(rgb)
                     preview_pred = model(rgb_in)
                     if preview_pred.shape[-2:] != visualization_batch["basecolor"].shape[-2:]:
                         preview_pred = F.interpolate(
