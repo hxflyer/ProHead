@@ -109,6 +109,8 @@ def remap_triangle_faces_after_vertex_filter(
     kept_vertex_indices: np.ndarray,
     original_vertex_count: int,
 ) -> np.ndarray:
+    """Remap face indices from original space to filtered (N_unique) space. Drops faces that
+    reference filtered-out vertices. Used only for compute_vertex_normals on N_unique vertices."""
     tri = np.asarray(triangle_faces, dtype=np.int64)
     if tri.size == 0:
         return np.zeros((0, 3), dtype=np.int32)
@@ -147,7 +149,10 @@ def load_aux_data(device):
         template_mesh = np.load("model/mesh_template.npy")
         template_mesh_full_count = int(template_mesh.shape[0])
         template_mesh_uv = load_combined_mesh_uv(model_dir="model", copy=True).astype(np.float32, copy=False)
-        template_mesh_faces = load_combined_mesh_triangle_faces(model_dir="model")
+        template_mesh_uv_full = template_mesh_uv.copy()
+        # Full (N_full indexed) faces — kept intact for seamless rendering via mesh_restore_indices expansion
+        template_mesh_faces_full = load_combined_mesh_triangle_faces(model_dir="model")
+        template_mesh_faces = template_mesh_faces_full.copy()  # will be remapped to N_unique
 
         mesh_restore_indices = None
         mesh_indices_path = os.path.join("model", "mesh_indices.npy")
@@ -163,7 +168,7 @@ def load_aux_data(device):
                 if mesh_indices.max() < template_mesh_uv.shape[0]:
                     template_mesh_uv = template_mesh_uv[mesh_indices]
                 template_mesh_faces = remap_triangle_faces_after_vertex_filter(
-                    template_mesh_faces,
+                    template_mesh_faces_full,
                     mesh_indices,
                     original_vertex_count=template_mesh_full_count,
                 )
@@ -208,7 +213,9 @@ def load_aux_data(device):
             landmark_restore_indices,
             mesh_restore_indices,
             template_mesh_uv,
+            template_mesh_uv_full,
             template_mesh_faces,
+            template_mesh_faces_full,
         )
 
     except Exception as e:
@@ -435,16 +442,14 @@ def run_inference(args):
     (num_landmarks, num_mesh, template_landmark, template_mesh,
      landmark2keypoint_idx, landmark2keypoint_w,
      mesh2landmark_idx, mesh2landmark_w,
-     n_keypoint, landmark_restore_indices, mesh_restore_indices, template_mesh_uv, template_mesh_faces) = load_aux_data(device)
+     n_keypoint, landmark_restore_indices, mesh_restore_indices,
+     template_mesh_uv, template_mesh_uv_full, template_mesh_faces, template_mesh_faces_full) = load_aux_data(device)
     
     landmark_topology = load_landmark_topology()
     mesh_topology = load_mesh_topology()
     
     # 2. Initialize Model
     print(f"馃 Loading model from {args.model_path}...")
-    if args.model_type == 'simdr' and args.output_dim != 5:
-        raise ValueError("SimDR inference currently requires --output_dim 5 (x, y, z, u, v).")
-
     model = GeometryTransformer(
         num_landmarks=num_landmarks,
         num_mesh=num_mesh,
@@ -458,17 +463,18 @@ def run_inference(args):
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,
-        output_dim=args.output_dim,
         backbone_weights=args.backbone_weights,
         model_type=args.model_type,
-        flatten_regression_outputs=(args.model_type != 'simdr'),
         k_bins=args.k_bins,
         simdr_range_3d=(args.simdr_min_3d, args.simdr_max_3d),
         simdr_range_2d=(args.simdr_min_2d, args.simdr_max_2d),
         use_deformable_attention=(args.use_deformable_attention if args.model_type == 'simdr' else False),
         num_deformable_points=args.num_deformable_points,
         template_mesh_uv=template_mesh_uv,
+        template_mesh_uv_full=template_mesh_uv_full,
         template_mesh_faces=template_mesh_faces,
+        template_mesh_faces_full=template_mesh_faces_full,
+        mesh_restore_indices=mesh_restore_indices,
     ).to(device)
     
     # Load Weights
@@ -609,9 +615,8 @@ def run_inference(args):
                     outputs = model(rgb_tensor)
                 final_output = outputs[-1]
                 
-                # Match training: reshape to [B, N, output_dim]
-                lm_pred = final_output['landmark'].detach().cpu().numpy().reshape(rgb_tensor.shape[0], -1, args.output_dim)
-                mesh_pred = final_output['mesh'].detach().cpu().numpy().reshape(rgb_tensor.shape[0], -1, args.output_dim)
+                lm_pred = final_output['landmark'].detach().cpu().numpy().reshape(rgb_tensor.shape[0], -1, 6)
+                mesh_pred = final_output['mesh'].detach().cpu().numpy().reshape(rgb_tensor.shape[0], -1, 6)
                 mesh_color_pred = final_output.get('mesh_color', None)
                 mesh_texture_pred = final_output.get('mesh_texture', None)
                 if mesh_color_pred is not None:
@@ -642,10 +647,7 @@ def run_inference(args):
             # Process 2D coordinates for visualization
             # For landmarks
             current_lm = lm_pred_orig.copy()
-            if args.output_dim == 5:
-                current_lm_2d = current_lm[:, 3:5]  # Use u, v for 2D
-            else:
-                current_lm_2d = current_lm[:, :2]
+            current_lm_2d = current_lm[:, 3:5]  # Use u, v for 2D
             current_lm_2d = np.clip(current_lm_2d, 0.0, 1.0)
             if landmark_restore_indices is not None:
                 current_lm_2d = current_lm_2d[landmark_restore_indices]
@@ -654,10 +656,7 @@ def run_inference(args):
             
             # For mesh
             current_mesh = mesh_pred_orig.copy()
-            if args.output_dim == 5:
-                current_mesh_2d = current_mesh[:, 3:5]  # Use u, v for 2D
-            else:
-                current_mesh_2d = current_mesh[:, :2]
+            current_mesh_2d = current_mesh[:, 3:5]  # Use u, v for 2D
             current_mesh_2d = np.clip(current_mesh_2d, 0.0, 1.0)
             if mesh_restore_indices is not None:
                 current_mesh_2d = current_mesh_2d[mesh_restore_indices]
@@ -746,7 +745,6 @@ if __name__ == "__main__":
     parser.add_argument('--d_model', type=int, default=512, help='Transformer d_model')
     parser.add_argument('--nhead', type=int, default=8, help='Number of attention heads')
     parser.add_argument('--num_layers', type=int, default=4, help='Number of decoder layers')
-    parser.add_argument('--output_dim', type=int, default=5, help='Output dimension')
     parser.add_argument('--backbone_weights', type=str, default='imagenet', help='Backbone weights type')
     parser.add_argument('--model_type', type=str, default='simdr', choices=['regression', 'simdr'], help='Model type: regression or simdr')
 

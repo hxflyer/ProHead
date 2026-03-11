@@ -58,24 +58,20 @@ class PositionalEncoding2D(nn.Module):
 
 class SimDRHead(nn.Module):
     """
-    SimDR head for 5D coordinate offsets (x, y, z, u, v).
+    SimDR head for 6D coordinate offsets (x, y, z, u, v, depth).
+    Depth uses a fixed [0, 1] grid; x/y/z use range_3d; u/v use range_2d.
     """
 
     def __init__(
         self,
         d_model: int,
         k_bins: int = 256,
-        output_dim: int = 5,
         trunk_hidden_dim: int = 256,
         range_3d: tuple[float, float] = (-1.0, 1.0),
         range_2d: tuple[float, float] = (-1.0, 1.0),
     ):
         super().__init__()
-        if output_dim != 5:
-            raise ValueError(f"SimDRHead currently supports output_dim=5, got {output_dim}.")
-
         self.k_bins = k_bins
-        self.output_dim = output_dim
 
         trunk_hidden_dim = int(max(32, trunk_hidden_dim))
         self.trunk = nn.Sequential(
@@ -90,6 +86,7 @@ class SimDRHead(nn.Module):
         self.fc_z = nn.Linear(trunk_hidden_dim, k_bins)
         self.fc_u = nn.Linear(trunk_hidden_dim, k_bins)
         self.fc_v = nn.Linear(trunk_hidden_dim, k_bins)
+        self.fc_depth = nn.Linear(trunk_hidden_dim, k_bins)
 
         grid_3d = torch.linspace(range_3d[0], range_3d[1], k_bins)
         self.register_buffer('grid_3d', grid_3d)
@@ -97,16 +94,18 @@ class SimDRHead(nn.Module):
         grid_2d = torch.linspace(range_2d[0], range_2d[1], k_bins)
         self.register_buffer('grid_2d', grid_2d)
 
+        grid_depth = torch.linspace(0.0, 1.0, k_bins)
+        self.register_buffer('grid_depth', grid_depth)
+
     def forward(self, x: torch.Tensor, return_logits: bool = True):
         """
         Args:
             x: [B, N, d_model]
         Returns:
-            offsets: [B, N, 5]
-            logits: [B, N, 5, K] or None
+            offsets: [B, N, 6]  — (x, y, z, u, v, depth)
+            logits:  [B, N, 6, K] or None
         """
         # Keep SimDR logits/softmax in fp32 to avoid fp16 overflow in long training.
-        # This block remains numerically stable even when outer forward runs under AMP.
         device_type = x.device.type if x.device.type in ("cuda", "cpu") else "cuda"
         with torch.amp.autocast(device_type=device_type, enabled=False):
             feat = self.trunk(x.float())
@@ -116,23 +115,26 @@ class SimDRHead(nn.Module):
             logits_z = self.fc_z(feat)
             logits_u = self.fc_u(feat)
             logits_v = self.fc_v(feat)
+            logits_depth = self.fc_depth(feat)
 
             prob_x = F.softmax(logits_x, dim=-1)
             prob_y = F.softmax(logits_y, dim=-1)
             prob_z = F.softmax(logits_z, dim=-1)
             prob_u = F.softmax(logits_u, dim=-1)
             prob_v = F.softmax(logits_v, dim=-1)
+            prob_depth = F.softmax(logits_depth, dim=-1)
 
             offset_x = (prob_x * self.grid_3d).sum(dim=-1)
             offset_y = (prob_y * self.grid_3d).sum(dim=-1)
             offset_z = (prob_z * self.grid_3d).sum(dim=-1)
             offset_u = (prob_u * self.grid_2d).sum(dim=-1)
             offset_v = (prob_v * self.grid_2d).sum(dim=-1)
+            offset_depth = (prob_depth * self.grid_depth).sum(dim=-1)
 
-        offsets = torch.stack([offset_x, offset_y, offset_z, offset_u, offset_v], dim=-1)
+        offsets = torch.stack([offset_x, offset_y, offset_z, offset_u, offset_v, offset_depth], dim=-1)
         logits = None
         if return_logits:
-            logits = torch.stack([logits_x, logits_y, logits_z, logits_u, logits_v], dim=2)
+            logits = torch.stack([logits_x, logits_y, logits_z, logits_u, logits_v, logits_depth], dim=2)
 
         return offsets, logits
 
@@ -140,15 +142,13 @@ class SimDRHead(nn.Module):
 class FastOffsetHead(nn.Module):
     """Lightweight offset regression head for early-layer L1-only supervision."""
 
-    def __init__(self, d_model: int, output_dim: int = 5, hidden_dim: int = 64):
+    def __init__(self, d_model: int, hidden_dim: int = 64):
         super().__init__()
-        if output_dim != 5:
-            raise ValueError(f"FastOffsetHead currently supports output_dim=5, got {output_dim}.")
         hidden_dim = int(max(16, hidden_dim))
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(hidden_dim, 6),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -158,13 +158,13 @@ class FastOffsetHead(nn.Module):
 class RegressionOffsetHead(nn.Module):
     """Shared lightweight regression head used by landmark and mesh branches."""
 
-    def __init__(self, d_model: int, output_dim: int = 5, hidden_dim: int = 64):
+    def __init__(self, d_model: int, hidden_dim: int = 64):
         super().__init__()
         hidden_dim = int(max(16, hidden_dim))
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(hidden_dim, 6),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -471,10 +471,8 @@ class GeometryTransformer(nn.Module):
         num_layers: int = 4,
         dim_feedforward: int = 1024,
         dropout: float = 0.1,
-        output_dim: int = 5,
         backbone_weights: str = 'imagenet',
         model_type: str = 'regression',
-        flatten_regression_outputs: bool = True,
         k_bins: int = 256,
         simdr_head_hidden_dim: int = 256,
         simdr_range_3d: tuple[float, float] = (-1.0, 1.0),
@@ -487,23 +485,24 @@ class GeometryTransformer(nn.Module):
         texture_output_size: int = 1024,
         flip_uv_v: bool = True,
         template_mesh_uv: np.ndarray | None = None,
+        template_mesh_uv_full: np.ndarray | None = None,
         template_mesh_faces: np.ndarray | None = None,
+        template_mesh_faces_full: np.ndarray | None = None,
+        mesh_restore_indices: np.ndarray | None = None,
     ):
         super().__init__()
         model_type = str(model_type).strip().lower()
         if model_type not in {"regression", "simdr"}:
             raise ValueError(f"Unsupported model_type: {model_type}. Expected 'regression' or 'simdr'.")
-        if model_type == "simdr" and output_dim != 5:
-            raise ValueError(f"SimDR mode currently supports output_dim=5, got {output_dim}.")
 
         self.num_landmarks = num_landmarks
         self.num_mesh = num_mesh
         self.n_keypoint = int(n_keypoint)
         self.d_model = int(d_model)
-        self.output_dim = int(output_dim)
+        self.output_dim = 6
         self.model_type = model_type
         self.is_simdr_model = model_type == "simdr"
-        self.flatten_regression_outputs = bool(flatten_regression_outputs)
+        self.flatten_regression_outputs = False
         self.use_deformable_attention = bool(use_deformable_attention)
         self.num_feature_levels = 3
         self.use_fast_aux_regression_heads = bool(use_fast_aux_regression_heads and self.is_simdr_model)
@@ -541,6 +540,43 @@ class GeometryTransformer(nn.Module):
                 )
         self.register_buffer("template_mesh_faces", torch.from_numpy(template_mesh_faces).to(torch.int32))
 
+        # Full (unfiltered) mesh faces and restore mapping for seamless rendering.
+        # template_mesh_faces_full: [F, 3] with indices in [0, num_mesh_full) — used by render functions.
+        # mesh_restore_indices: [num_mesh_full] each entry → unique vertex index in [0, num_mesh) — used to
+        #   expand N_unique predictions to N_full before rasterization so all original faces are covered.
+        if mesh_restore_indices is not None:
+            restore = np.asarray(mesh_restore_indices, dtype=np.int64)
+            self.num_mesh_full = int(restore.shape[0])
+            self.register_buffer("mesh_restore_indices", torch.from_numpy(restore))
+        else:
+            restore = np.arange(num_mesh, dtype=np.int64)
+            self.num_mesh_full = num_mesh
+            self.register_buffer("mesh_restore_indices", torch.arange(num_mesh, dtype=torch.int64))
+
+        if template_mesh_uv_full is None:
+            if restore.shape[0] == template_mesh_uv.shape[0]:
+                template_mesh_uv_full = template_mesh_uv
+            else:
+                template_mesh_uv_full = template_mesh_uv[restore]
+        template_mesh_uv_full = np.asarray(template_mesh_uv_full, dtype=np.float32)
+        if template_mesh_uv_full.shape[0] != self.num_mesh_full or template_mesh_uv_full.shape[1] != 2:
+            raise ValueError(
+                f"template_mesh_uv_full must have shape [{self.num_mesh_full}, 2], got {template_mesh_uv_full.shape}."
+            )
+        template_mesh_uv_full = np.clip(template_mesh_uv_full, 0.0, 1.0)
+        self.register_buffer("template_mesh_uv_full", torch.from_numpy(template_mesh_uv_full).float())
+
+        if template_mesh_faces_full is not None:
+            tmff = np.asarray(template_mesh_faces_full, dtype=np.int32)
+            if tmff.size > 0 and tmff.max() >= self.num_mesh_full:
+                raise ValueError(
+                    f"template_mesh_faces_full index out of range [0, {self.num_mesh_full - 1}]."
+                )
+            self.register_buffer("template_mesh_faces_full", torch.from_numpy(tmff).to(torch.int32))
+        else:
+            # Fall back to the remapped faces if full version not provided
+            self.register_buffer("template_mesh_faces_full", torch.from_numpy(template_mesh_faces).to(torch.int32))
+
         self.register_buffer(
             "landmark2keypoint_knn_indices",
             torch.from_numpy(landmark2keypoint_knn_indices.astype(np.int64)),
@@ -557,6 +593,27 @@ class GeometryTransformer(nn.Module):
             "mesh2landmark_knn_weights",
             torch.from_numpy(mesh2landmark_knn_weights.astype(np.float32)),
         )
+
+        # Static geo texture: UV map where pixel (u, v) → color (u, v, 0) in [0, 1]
+        _gs = self.texture_feature_map_size
+        _u = torch.linspace(0.0, 1.0, _gs).unsqueeze(0).expand(_gs, -1)   # [H, W]
+        _v = torch.linspace(0.0, 1.0, _gs).unsqueeze(1).expand(-1, _gs)   # [H, W]
+        self.register_buffer(
+            "geo_texture",
+            torch.stack([_u, _v, torch.zeros(_gs, _gs)], dim=0),           # [3, H, W]
+        )
+
+        # Pre-computed geo feature atlas (EXR-baked, flood-filled).
+        # Loaded from model/geo_feature_atlas.npy if present; falls back to geo_texture.
+        import os as _os
+        _geo_atlas_path = "model/geo_feature_atlas.npy"
+        if _os.path.exists(_geo_atlas_path):
+            _geo_atlas = torch.from_numpy(np.load(_geo_atlas_path)).float()  # [3, H, W]
+            print(f"[GeometryTransformer] Loaded geo_feature_atlas from {_geo_atlas_path} "
+                  f"{tuple(_geo_atlas.shape)}")
+        else:
+            _geo_atlas = torch.stack([_u, _v, torch.zeros(_gs, _gs)], dim=0)
+        self.register_buffer("geo_feature_atlas", _geo_atlas)  # [3, H, W]
 
         backbone = models.convnext_base(weights=None)
 
@@ -628,7 +685,6 @@ class GeometryTransformer(nn.Module):
             self.landmark_head = SimDRHead(
                 d_model,
                 k_bins=k_bins,
-                output_dim=output_dim,
                 trunk_hidden_dim=simdr_head_hidden_dim,
                 range_3d=simdr_range_3d,
                 range_2d=simdr_range_2d,
@@ -636,7 +692,6 @@ class GeometryTransformer(nn.Module):
             self.mesh_head = SimDRHead(
                 d_model,
                 k_bins=k_bins,
-                output_dim=output_dim,
                 trunk_hidden_dim=simdr_head_hidden_dim,
                 range_3d=simdr_range_3d,
                 range_2d=simdr_range_2d,
@@ -645,12 +700,12 @@ class GeometryTransformer(nn.Module):
         else:
             self.landmark_head = None
             self.mesh_head = None
-            self.to_coord = RegressionOffsetHead(d_model, output_dim=output_dim, hidden_dim=64)
+            self.to_coord = RegressionOffsetHead(d_model, hidden_dim=64)
 
         if self.use_fast_aux_regression_heads:
             fast_hidden = min(64, int(simdr_head_hidden_dim))
-            self.landmark_fast_head = FastOffsetHead(d_model, output_dim=output_dim, hidden_dim=fast_hidden)
-            self.mesh_fast_head = FastOffsetHead(d_model, output_dim=output_dim, hidden_dim=fast_hidden)
+            self.landmark_fast_head = FastOffsetHead(d_model, hidden_dim=fast_hidden)
+            self.mesh_fast_head = FastOffsetHead(d_model, hidden_dim=fast_hidden)
         else:
             self.landmark_fast_head = None
             self.mesh_fast_head = None
@@ -682,17 +737,45 @@ class GeometryTransformer(nn.Module):
             self._dr_context_cache[key] = dr.RasterizeCudaContext(device=device)
         return self._dr_context_cache[key]
 
+    def compute_vertex_normals(self, mesh_xyz: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-vertex geometric normals from predicted XYZ positions and template faces.
+
+        Args:
+            mesh_xyz: [B, N_mesh, 3]  predicted XYZ coordinates
+        Returns:
+            [B, N_mesh, 3]  unit normals encoded in [0, 1] with GT convention (r=1-r, g=1-b, b=1-g)
+        """
+        B, N, _ = mesh_xyz.shape
+        faces = self.template_mesh_faces.long()  # [F, 3]
+        v0 = mesh_xyz[:, faces[:, 0], :]   # [B, F, 3]
+        v1 = mesh_xyz[:, faces[:, 1], :]
+        v2 = mesh_xyz[:, faces[:, 2], :]
+        face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)  # [B, F, 3]
+
+        vertex_normals = torch.zeros_like(mesh_xyz)
+        for i in range(3):
+            idx = faces[:, i].view(1, -1, 1).expand(B, -1, 3)
+            vertex_normals.scatter_add_(1, idx, face_normals)
+
+        vertex_normals = F.normalize(vertex_normals, dim=-1, eps=1e-6)
+        n = vertex_normals * 0.5 + 0.5   # map [-1, 1] → [0, 1]
+        # Remap channels to match GT convention: r=1-r, g=1-b, b=1-g
+        return torch.stack([1.0 - n[..., 0], 1.0 - n[..., 2], 1.0 - n[..., 1]], dim=-1)
+
     def rasterize_mesh_vertex_attributes(
         self,
         vertex_attrs: torch.Tensor,
         out_size: int | None = None,
         return_coverage: bool = False,
+        antialias: bool = True,
     ):
         """
         Rasterize per-vertex attributes to UV map with nvdiffrast barycentric interpolation.
         Args:
             vertex_attrs: [B, M, C]
             out_size: map size (H=W)
+            antialias: apply dr.antialias (set False for static atlas bakes)
         Returns:
             uv_map: [B, C, H, W]
             coverage(optional): [B, 1, H, W]
@@ -734,7 +817,8 @@ class GeometryTransformer(nn.Module):
             raster_out, _ = dr.rasterize(ctx, clip_pos, tri, resolution=[H, H])
             attrs = vertex_attrs.float().contiguous()
             uv_map, _ = dr.interpolate(attrs, raster_out, tri)
-            uv_map = dr.antialias(uv_map, raster_out, clip_pos, tri)
+            if antialias:
+                uv_map = dr.antialias(uv_map, raster_out, clip_pos, tri)
             coverage = (raster_out[..., 3:4] > 0).to(dtype=uv_map.dtype)
             uv_map = uv_map * coverage
 
@@ -987,9 +1071,37 @@ class SimDRGeometryTransformer(GeometryTransformer):
 
     def __init__(self, *args, **kwargs):
         kwargs["model_type"] = "simdr"
-        kwargs.setdefault("flatten_regression_outputs", False)
         kwargs.setdefault("use_deformable_attention", True)
         super().__init__(*args, **kwargs)
+
+
+def floodfill_uv_bchw(uv: torch.Tensor, n: int = 4) -> torch.Tensor:
+    """
+    Dilate valid (non-black) regions in a UV map by flood-filling black pixels
+    with the average color of their non-black neighbors, repeated n times.
+    Args:
+        uv: [B, C, H, W] float32
+        n:  number of passes
+    Returns:
+        [B, C, H, W] float32
+    """
+    img = uv.permute(0, 2, 3, 1)   # → [B, H, W, C]
+    kernel = torch.ones(1, 1, 3, 3, dtype=uv.dtype, device=uv.device)
+    kernel[0, 0, 1, 1] = 0.0       # exclude center (8-neighbor)
+    C = img.shape[-1]
+    for _ in range(n):
+        black = (img.abs() < 0.02).all(dim=-1)          # [B, H, W]
+        non_black = (~black).float()
+        img_bchw = img.permute(0, 3, 1, 2)              # [B, C, H, W]
+        sum_nb  = F.conv2d(img_bchw.reshape(img_bchw.shape[0] * C, 1, *img_bchw.shape[2:]),
+                           kernel, padding=1).reshape(*img_bchw.shape)
+        cnt_nb  = F.conv2d(non_black.unsqueeze(1), kernel, padding=1).expand_as(img_bchw)
+        cnt_nb  = cnt_nb.clamp(min=1.0)
+        avg     = sum_nb / cnt_nb
+        mask    = black.unsqueeze(1).expand_as(img_bchw)
+        img_bchw = torch.where(mask, avg, img_bchw)
+        img = img_bchw.permute(0, 2, 3, 1)
+    return img.permute(0, 3, 1, 2)  # → [B, C, H, W]
 
 
 def create_geometry_transformer(
@@ -1005,10 +1117,8 @@ def create_geometry_transformer(
     d_model: int = 256,
     nhead: int = 8,
     num_layers: int = 4,
-    output_dim: int = 5,
     backbone_weights: str = 'imagenet',
     model_type: str = 'regression',
-    flatten_regression_outputs: bool = True,
     k_bins: int = 256,
     simdr_head_hidden_dim: int = 256,
     simdr_range_3d: tuple[float, float] = (-0.5, 0.5),
@@ -1036,10 +1146,8 @@ def create_geometry_transformer(
         d_model=d_model,
         nhead=nhead,
         num_layers=num_layers,
-        output_dim=output_dim,
         backbone_weights=backbone_weights,
         model_type=model_type,
-        flatten_regression_outputs=flatten_regression_outputs,
         k_bins=k_bins,
         simdr_head_hidden_dim=simdr_head_hidden_dim,
         simdr_range_3d=simdr_range_3d,
@@ -1069,7 +1177,6 @@ def create_simdr_geometry_transformer(
     d_model: int = 256,
     nhead: int = 8,
     num_layers: int = 4,
-    output_dim: int = 5,
     backbone_weights: str = 'imagenet',
     k_bins: int = 256,
     simdr_head_hidden_dim: int = 256,
@@ -1098,9 +1205,7 @@ def create_simdr_geometry_transformer(
         d_model=d_model,
         nhead=nhead,
         num_layers=num_layers,
-        output_dim=output_dim,
         backbone_weights=backbone_weights,
-        flatten_regression_outputs=False,
         k_bins=k_bins,
         simdr_head_hidden_dim=simdr_head_hidden_dim,
         simdr_range_3d=simdr_range_3d,

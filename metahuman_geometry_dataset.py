@@ -24,6 +24,52 @@ except ImportError:
     print("Warning: Albumentations not installed. Using basic augmentation. Install with: pip install albumentations")
 
 
+def _load_exr_as_uint8(path: str) -> Optional[np.ndarray]:
+    """Load an EXR file, return RGB uint8 [H,W,3] clipped to [0,1]*255, or None on failure."""
+    geo_float = None
+    try:
+        import Imath, OpenEXR as _OE
+        _ef = _OE.InputFile(path)
+        _hdr = _ef.header()
+        _dw = _hdr['dataWindow']
+        _ew, _eh = _dw.max.x - _dw.min.x + 1, _dw.max.y - _dw.min.y + 1
+        _chs = {}
+        for _ch in ['R', 'G', 'B']:
+            if _ch in _hdr['channels']:
+                _ct = _hdr['channels'][_ch].type
+                if _ct == Imath.PixelType(Imath.PixelType.FLOAT):
+                    _raw = _ef.channel(_ch, Imath.PixelType(Imath.PixelType.FLOAT))
+                    _chs[_ch] = np.frombuffer(_raw, dtype=np.float32).reshape(_eh, _ew)
+                else:
+                    _raw = _ef.channel(_ch, Imath.PixelType(Imath.PixelType.HALF))
+                    _chs[_ch] = np.frombuffer(_raw, dtype=np.float16).reshape(_eh, _ew).astype(np.float32)
+        if _chs:
+            geo_float = np.stack([_chs.get(c, np.zeros((_eh, _ew), np.float32)) for c in ['R', 'G', 'B']], axis=-1)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    if geo_float is None:
+        try:
+            import imageio.v3 as _iio
+            _arr = _iio.imread(path).astype(np.float32)
+            if _arr.ndim == 3 and _arr.shape[2] >= 3:
+                geo_float = _arr[..., :3]
+        except Exception:
+            pass
+    if geo_float is None:
+        try:
+            os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+            _arr = cv2.imread(path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            if _arr is not None:
+                geo_float = cv2.cvtColor(_arr.astype(np.float32), cv2.COLOR_BGR2RGB)
+        except Exception:
+            pass
+    if geo_float is None:
+        return None
+    return (np.clip(geo_float, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
 class FastGeometryDataset(Dataset):
     """
     Fast dataset for RGB geometry training (landmark + mesh).
@@ -493,6 +539,31 @@ class FastGeometryDataset(Dataset):
             except Exception:
                 pass
 
+        # Load face mask before alignment so it can be warped alongside the GT images.
+        facemask_np = None
+        facemask_path = os.path.join(data_root, "facemask", f"Face_Mask_{sample_id}.png")
+        if os.path.exists(facemask_path):
+            try:
+                fm = cv2.imread(facemask_path, cv2.IMREAD_UNCHANGED)
+                if fm is not None:
+                    if fm.ndim == 3 and fm.shape[2] == 4:
+                        facemask_np = fm[:, :, 3]          # alpha channel
+                    elif fm.ndim == 3:
+                        facemask_np = cv2.cvtColor(fm, cv2.COLOR_BGR2GRAY)
+                    else:
+                        facemask_np = fm
+            except Exception:
+                facemask_np = None
+
+        # Load geo GT before alignment so warpAffine can be applied uniformly.
+        geo_np = None
+        geo_valid = 0.0
+        geo_path = os.path.join(data_root, "geo", f"Geo_{sample_id}.exr")
+        if os.path.exists(geo_path):
+            geo_np = _load_exr_as_uint8(geo_path)
+            if geo_np is not None:
+                geo_valid = 1.0
+
         # 5-point alignment before filtering/augmentation so all geometry stays coherent.
         if has_geometry_gt and landmarks is not None and five_points_px is not None:
             M = self._estimate_alignment_matrix(
@@ -519,6 +590,24 @@ class FastGeometryDataset(Dataset):
                         (self.image_size, self.image_size),
                         flags=cv2.INTER_LINEAR,
                         borderMode=cv2.BORDER_REFLECT_101,
+                    )
+                if geo_np is not None:
+                    geo_np = cv2.warpAffine(
+                        geo_np,
+                        M,
+                        (self.image_size, self.image_size),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0),
+                    )
+                if facemask_np is not None:
+                    facemask_np = cv2.warpAffine(
+                        facemask_np,
+                        M,
+                        (self.image_size, self.image_size),
+                        flags=cv2.INTER_NEAREST,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=0,
                     )
                 landmarks = self._apply_alignment_to_geometry(landmarks, M=M, src_w=w, src_h=h)
                 mesh = self._apply_alignment_to_geometry(mesh, M=M, src_w=w, src_h=h)
@@ -571,6 +660,20 @@ class FastGeometryDataset(Dataset):
             basecolor_np = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
         elif basecolor_np.shape[0] != self.image_size or basecolor_np.shape[1] != self.image_size:
             basecolor_np = cv2.resize(basecolor_np, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        if geo_np is None:
+            geo_np = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
+        elif geo_np.shape[0] != self.image_size or geo_np.shape[1] != self.image_size:
+            geo_np = cv2.resize(geo_np, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        if facemask_np is None:
+            facemask_np = np.ones((self.image_size, self.image_size), dtype=np.uint8) * 255
+        elif facemask_np.shape[0] != self.image_size or facemask_np.shape[1] != self.image_size:
+            facemask_np = cv2.resize(facemask_np, (self.image_size, self.image_size), interpolation=cv2.INTER_NEAREST)
+
+        # Apply face mask to GT images (zero out pixels outside the face region)
+        mask_bin = (facemask_np > 127).astype(np.uint8)   # [H, W] binary
+        mask3 = mask_bin[:, :, np.newaxis]                 # [H, W, 1] for broadcasting
+        basecolor_np = basecolor_np * mask3
+        geo_np       = geo_np       * mask3
 
         rgb_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
         basecolor_tensor = torch.from_numpy(basecolor_np).permute(2, 0, 1).float() / 255.0
@@ -714,6 +817,9 @@ class FastGeometryDataset(Dataset):
             dtype=torch.float32,
         )
 
+        result['geo_gt'] = torch.from_numpy(geo_np.astype(np.float32) / 255.0).permute(2, 0, 1)
+        result['geo_valid'] = torch.tensor(1.0 if geo_valid > 0.5 else 0.0, dtype=torch.float32)
+
         if five_points_px is not None and five_points_valid is not None:
             if align_applied:
                 denom = np.array([float(self.image_size), float(self.image_size)], dtype=np.float32)
@@ -741,6 +847,8 @@ def fast_collate_fn(batch):
         'mesh_texture': torch.stack([item['mesh_texture'] for item in batch]),
         'mesh_texture_valid': torch.stack([item['mesh_texture_valid'] for item in batch]),
         'has_geometry_gt': torch.stack([item['has_geometry_gt'] for item in batch]),
+        'geo_gt': torch.stack([item['geo_gt'] for item in batch]),
+        'geo_valid': torch.stack([item['geo_valid'] for item in batch]),
     }
 
     if all('mesh_depth' in item for item in batch):

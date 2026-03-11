@@ -252,10 +252,11 @@ def render_mesh_texture_from_2d_pred(
     if dev.type != "cuda":
         return None, None
 
-    xy = np.clip(mesh_pred[:, 3:5], 0.0, 1.0)
+    xy = mesh_pred[:, 3:5].astype(np.float32)
     clip_pos = np.zeros((xy.shape[0], 4), dtype=np.float32)
     clip_pos[:, 0] = xy[:, 0] * 2.0 - 1.0
     clip_pos[:, 1] = 1.0 - (xy[:, 1] * 2.0)
+    clip_pos[:, :2] = np.nan_to_num(clip_pos[:, :2], nan=0.0, posinf=2.0, neginf=-2.0)
 
     depth_scale = 0.8
     depth_bias = 0.1

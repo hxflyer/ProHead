@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import OpenEXR, Imath; f = OpenEXR.InputFile\\(''d:/Source/ProHead/model/MID_MI_Face_Skin_Baked_LOD0_0_vtx_uv.exr''\\); h = f.header\\(\\); print\\(''channels:'', list\\(h[''channels''].keys\\(\\)\\)\\); dw = h[''dataWindow'']; print\\(''size:'', dw.max.x - dw.min.x + 1, ''x'', dw.max.y - dw.min.y + 1\\)\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}
