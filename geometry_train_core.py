@@ -506,11 +506,34 @@ def _load_auxiliary_geometry(rank: int):
 
 def prepare_data(rank: int, world_size: int, data_cfg: DataConfig):
     train_loader, val_loader, train_sampler = create_distributed_dataloaders(data_cfg, rank, world_size)
+
+    # Create a synthetic-only loader used before real_data_start_epoch
+    synthetic_train_loader = None
+    synthetic_train_sampler = None
+    if (
+        data_cfg.synthetic_data_roots
+        and sorted(data_cfg.synthetic_data_roots) != sorted(data_cfg.data_roots)
+    ):
+        synthetic_cfg = DataConfig(
+            data_roots=data_cfg.synthetic_data_roots,
+            texture_root=data_cfg.texture_root,
+            batch_size=data_cfg.batch_size,
+            num_workers=data_cfg.num_workers,
+            prefetch_factor=data_cfg.prefetch_factor,
+            persistent_workers=data_cfg.persistent_workers,
+            max_train_samples=data_cfg.max_train_samples,
+        )
+        syn_loader, _, syn_sampler = create_distributed_dataloaders(synthetic_cfg, rank, world_size)
+        synthetic_train_loader = syn_loader
+        synthetic_train_sampler = syn_sampler
+
     aux = _load_auxiliary_geometry(rank)
     return {
         "train_loader": train_loader,
         "val_loader": val_loader,
         "train_sampler": train_sampler,
+        "synthetic_train_loader": synthetic_train_loader,
+        "synthetic_train_sampler": synthetic_train_sampler,
         **aux,
     }
 
@@ -1035,8 +1058,8 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                 else:
                     layer_total = lm_l1 + mesh_l1
             else:
-                lm_l1 = compute_weighted_l1(lm_pred, lm_gt, lm_batch_weights)
-                mesh_l1 = compute_weighted_l1(mesh_pred, mesh_gt, mesh_batch_weights)
+                lm_l1 = compute_weighted_l1(lm_pred.reshape(rgb.shape[0], -1), lm_gt, lm_batch_weights)
+                mesh_l1 = compute_weighted_l1(mesh_pred.reshape(rgb.shape[0], -1), mesh_gt, mesh_batch_weights)
                 
                 # Check for NaN in geometry losses
                 if torch.isnan(lm_l1) or torch.isinf(lm_l1):
@@ -1305,6 +1328,9 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
                     if "_flux" in os.path.basename(path):
                         mesh_batch_weights[i] *= mesh_mask_weights_tensor.view(-1, 6) if model_cfg.model_type == "simdr" else mesh_mask_weights_tensor
 
+            if model_cfg.model_type != "simdr":
+                lm_pred = lm_pred.reshape(rgb.shape[0], -1)
+                mesh_pred = mesh_pred.reshape(rgb.shape[0], -1)
             lm_l1_raw = criterion_val(lm_pred, lm_gt)
             mesh_l1_raw = criterion_val(mesh_pred, mesh_gt)
             lm_loss = (lm_l1_raw * lm_batch_weights).sum() / (lm_batch_weights.sum() + 1e-6) if lm_batch_weights is not None else lm_l1_raw.mean()
@@ -1503,7 +1529,25 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
     prepared = prepare_data(rank, world_size, data_cfg)
     built = build_model_and_optim(rank, world_size, model_cfg, train_cfg, prepared)
 
+    # Cache the full (real+synthetic) loaders so we can switch back after epoch N
+    prepared["_all_train_loader"] = prepared["train_loader"]
+    prepared["_all_train_sampler"] = prepared["train_sampler"]
+
     for epoch in range(train_cfg.epochs):
+        # Swap loader: use synthetic-only before real_data_start_epoch
+        syn_loader = prepared.get("synthetic_train_loader")
+        if syn_loader is not None and int(train_cfg.real_data_start_epoch) > 0:
+            if epoch < int(train_cfg.real_data_start_epoch):
+                if epoch == 0 and rank == 0:
+                    print(f"[Info] Using synthetic-only data for epochs 1–{train_cfg.real_data_start_epoch}")
+                prepared["train_loader"] = syn_loader
+                prepared["train_sampler"] = prepared["synthetic_train_sampler"]
+            else:
+                if epoch == int(train_cfg.real_data_start_epoch) and rank == 0:
+                    print(f"[Info] Epoch {epoch + 1}: switching to full dataset (real + synthetic)")
+                prepared["train_loader"] = prepared["_all_train_loader"]
+                prepared["train_sampler"] = prepared["_all_train_sampler"]
+
         if rank == 0:
             print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
         train_out = train_one_epoch(epoch, rank, world_size, prepared, built, data_cfg, model_cfg, train_cfg)

@@ -765,6 +765,7 @@ def _save_preview(
         canvas = np.concatenate(rows, axis=0)
         out_path = os.path.join(output_dir, f"epoch_{epoch + 1:03d}_dense_preview.png")
         cv2.imwrite(out_path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+        print(f"Saved preview: {out_path}")
 
 
 def train_one_epoch(
