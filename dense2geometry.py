@@ -204,7 +204,7 @@ class Dense2Geometry(nn.Module):
 
         self.vertex_image_proj = nn.Linear(128 + 256 + 512, self.d_model)
         self.vertex_dense_proj = nn.Sequential(
-            nn.Linear(14, self.d_model),
+            nn.Linear(10, self.d_model),
             nn.GELU(),
             nn.Linear(self.d_model, self.d_model),
         )
@@ -522,15 +522,9 @@ class Dense2Geometry(nn.Module):
         sampled_normal = self._sample_feature_map(dense_parts["normal"], searched_uv, match_mask)
         sampled_basecolor = self._sample_feature_map(dense_parts["basecolor"], searched_uv, match_mask)
         sampled_mask = self._sample_feature_map(torch.sigmoid(dense_parts["mask_logits"]), searched_uv, match_mask)
-        mesh_geo_codes = self.mesh_geo_codes.unsqueeze(0).expand(rgb.shape[0], -1, -1)
-        sampled_geo_delta = sampled_geo - mesh_geo_codes
-        sampled_geo_similarity = (sampled_geo * mesh_geo_codes).sum(dim=-1, keepdim=True)
-        sampled_dense = torch.cat(
-            [sampled_geo, sampled_normal, sampled_basecolor, sampled_mask, sampled_geo_delta, sampled_geo_similarity],
-            dim=-1,
-        )
+        sampled_dense = torch.cat([sampled_geo, sampled_normal, sampled_basecolor, sampled_mask], dim=-1)
 
-        semantic_token = self.vertex_semantic_proj(mesh_geo_codes)
+        semantic_token = self.vertex_semantic_proj(self.mesh_geo_codes.unsqueeze(0).expand(rgb.shape[0], -1, -1))
         coord_input = torch.cat([searched_uv.clamp_min(0.0), match_mask.unsqueeze(-1), search_dist.unsqueeze(-1)], dim=-1)
         vertex_tokens = (
             self.vertex_image_proj(sampled_feat)
