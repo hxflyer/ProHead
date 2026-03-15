@@ -325,7 +325,7 @@ class Dense2Geometry(nn.Module):
         )
         self.vertex_semantic_proj = nn.Linear(3, self.d_model)
         self.vertex_coord_proj = nn.Sequential(
-            nn.Linear(4, self.d_model),
+            nn.Linear(5, self.d_model),
             nn.GELU(),
             nn.Linear(self.d_model, self.d_model),
         )
@@ -556,9 +556,9 @@ class Dense2Geometry(nn.Module):
         self,
         feat_map: torch.Tensor,
         uv: torch.Tensor,
-        match_mask: torch.Tensor,
+        match_weight: torch.Tensor,
     ) -> torch.Tensor:
-        uv_safe = torch.where(match_mask.unsqueeze(-1) > 0.5, uv, torch.zeros_like(uv))
+        uv_safe = torch.where(match_weight.unsqueeze(-1) > 0.0, uv, torch.zeros_like(uv))
         grid = uv_safe.mul(2.0).sub(1.0)
         grid = grid.view(feat_map.shape[0], uv.shape[1], 1, 2)
         sampled = F.grid_sample(
@@ -569,7 +569,7 @@ class Dense2Geometry(nn.Module):
             align_corners=False,
         )
         sampled = sampled.squeeze(-1).transpose(1, 2).contiguous()
-        return sampled * match_mask.unsqueeze(-1)
+        return sampled * match_weight.unsqueeze(-1)
 
     def _pool_mesh_to_landmarks(
         self,
@@ -629,19 +629,32 @@ class Dense2Geometry(nn.Module):
             pred_geo=dense_parts["geo"],
             pred_mask_logits=dense_parts["mask_logits"],
         )
+        soft_match = match_mask * torch.clamp(
+            1.0 - search_dist / max(self.search_distance_threshold, 1e-6),
+            min=0.0,
+            max=1.0,
+        )
 
-        sampled_f4 = self._sample_feature_map(f4, searched_uv, match_mask)
-        sampled_f8 = self._sample_feature_map(f8, searched_uv, match_mask)
-        sampled_f16 = self._sample_feature_map(f16, searched_uv, match_mask)
+        sampled_f4 = self._sample_feature_map(f4, searched_uv, soft_match)
+        sampled_f8 = self._sample_feature_map(f8, searched_uv, soft_match)
+        sampled_f16 = self._sample_feature_map(f16, searched_uv, soft_match)
         sampled_feat = torch.cat([sampled_f4, sampled_f8, sampled_f16], dim=-1)
-        sampled_geo = self._sample_feature_map(dense_parts["geo"], searched_uv, match_mask)
-        sampled_normal = self._sample_feature_map(dense_parts["normal"], searched_uv, match_mask)
-        sampled_basecolor = self._sample_feature_map(dense_parts["basecolor"], searched_uv, match_mask)
-        sampled_mask = self._sample_feature_map(torch.sigmoid(dense_parts["mask_logits"]), searched_uv, match_mask)
+        sampled_geo = self._sample_feature_map(dense_parts["geo"], searched_uv, soft_match)
+        sampled_normal = self._sample_feature_map(dense_parts["normal"], searched_uv, soft_match)
+        sampled_basecolor = self._sample_feature_map(dense_parts["basecolor"], searched_uv, soft_match)
+        sampled_mask = self._sample_feature_map(torch.sigmoid(dense_parts["mask_logits"]), searched_uv, soft_match)
         sampled_dense = torch.cat([sampled_geo, sampled_normal, sampled_basecolor, sampled_mask], dim=-1)
 
         semantic_token = self.vertex_semantic_proj(self.mesh_geo_codes.unsqueeze(0).expand(rgb.shape[0], -1, -1))
-        coord_input = torch.cat([searched_uv.clamp_min(0.0), match_mask.unsqueeze(-1), search_dist.unsqueeze(-1)], dim=-1)
+        coord_input = torch.cat(
+            [
+                searched_uv.clamp_min(0.0),
+                match_mask.unsqueeze(-1),
+                soft_match.unsqueeze(-1),
+                search_dist.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
         vertex_tokens = (
             self.vertex_image_proj(sampled_feat)
             + self.vertex_dense_proj(sampled_dense)
