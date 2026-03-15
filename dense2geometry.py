@@ -252,7 +252,6 @@ class Dense2Geometry(nn.Module):
         search_mask_threshold: float = 0.30,
         search_min_geo_magnitude: float = 0.02,
         min_search_candidates: int = 512,
-        dense_train_mode: str = "frozen",
         model_dir: str = "model",
     ):
         super().__init__()
@@ -267,11 +266,7 @@ class Dense2Geometry(nn.Module):
         self.search_mask_threshold = float(search_mask_threshold)
         self.search_min_geo_magnitude = float(search_min_geo_magnitude)
         self.min_search_candidates = int(max(8, min_search_candidates))
-        dense_train_mode = str(dense_train_mode).strip().lower()
-        if dense_train_mode not in {"frozen", "decoder", "full"}:
-            raise ValueError(f"Unsupported dense_train_mode: {dense_train_mode}")
-        self.dense_train_mode = dense_train_mode
-        self.freeze_dense_stage = bool(freeze_dense_stage) if dense_train_mode == "frozen" else False
+        self.freeze_dense_stage = bool(freeze_dense_stage)
 
         template_mesh, template_mesh_uv, template_mesh_faces = _load_filtered_template_mesh(model_dir=model_dir)
         self.num_mesh = int(template_mesh.shape[0])
@@ -312,7 +307,9 @@ class Dense2Geometry(nn.Module):
         )
         if dense_checkpoint:
             self.load_dense_stage(dense_checkpoint)
-        self._configure_dense_train_mode()
+        if self.freeze_dense_stage:
+            for param in self.dense_stage.parameters():
+                param.requires_grad = False
 
         self.image_proj_4 = nn.Conv2d(128, self.d_model, kernel_size=1)
         self.image_proj_8 = nn.Conv2d(256, self.d_model, kernel_size=1)
@@ -385,18 +382,6 @@ class Dense2Geometry(nn.Module):
         if load_notes:
             print(f"[Dense2Geometry] Dense-stage load notes: {load_notes[:10]}")
 
-    def _configure_dense_train_mode(self) -> None:
-        if self.dense_train_mode == "full":
-            for param in self.dense_stage.parameters():
-                param.requires_grad = True
-            return
-
-        for param in self.dense_stage.parameters():
-            param.requires_grad = False
-        if self.dense_train_mode == "decoder":
-            for param in self.dense_stage.decoder.parameters():
-                param.requires_grad = True
-
     def _run_dense_stage(self, rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         rgb_in = _normalize_imagenet(rgb)
 
@@ -433,7 +418,7 @@ class Dense2Geometry(nn.Module):
             }
             return f4, f8, f16, parts
 
-        if self.dense_train_mode == "frozen":
+        if self.freeze_dense_stage:
             with torch.no_grad():
                 return _forward_impl()
         return _forward_impl()
