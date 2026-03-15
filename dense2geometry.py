@@ -155,6 +155,7 @@ class Dense2Geometry(nn.Module):
         self.search_mask_threshold = float(search_mask_threshold)
         self.search_min_geo_magnitude = float(search_min_geo_magnitude)
         self.min_search_candidates = int(max(8, min_search_candidates))
+        self.local_refine_radius = max(2, int(round(512.0 / float(self.search_size))))
         self.freeze_dense_stage = bool(freeze_dense_stage)
 
         template_mesh, template_mesh_uv = _load_filtered_template_mesh(model_dir=model_dir)
@@ -409,7 +410,87 @@ class Dense2Geometry(nn.Module):
         searched_uv = candidate_uv[nearest_idx]
         searched_uv = searched_uv.to(dtype=torch.float32)
         searched_uv[~accept] = -1.0
+        searched_uv, accept, distances = self._refine_single_sample(
+            pred_geo=pred_geo,
+            pred_mask_logits=pred_mask_logits,
+            coarse_uv=searched_uv,
+            coarse_accept=accept,
+            coarse_distances=distances,
+        )
         return searched_uv, accept.float(), distances
+
+    def _refine_single_sample(
+        self,
+        pred_geo: torch.Tensor,
+        pred_mask_logits: torch.Tensor,
+        coarse_uv: torch.Tensor,
+        coarse_accept: torch.Tensor,
+        coarse_distances: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if coarse_uv.numel() == 0:
+            return coarse_uv, coarse_accept, coarse_distances
+
+        h, w = int(pred_geo.shape[-2]), int(pred_geo.shape[-1])
+        radius = int(max(1, min(self.local_refine_radius, max(h, w) // 8)))
+        if radius <= 0:
+            return coarse_uv, coarse_accept, coarse_distances
+
+        offsets_y, offsets_x = torch.meshgrid(
+            torch.arange(-radius, radius + 1, device=pred_geo.device, dtype=torch.long),
+            torch.arange(-radius, radius + 1, device=pred_geo.device, dtype=torch.long),
+            indexing="ij",
+        )
+        offsets_x = offsets_x.reshape(1, -1)
+        offsets_y = offsets_y.reshape(1, -1)
+
+        geo_flat = pred_geo.permute(1, 2, 0).reshape(-1, 3).float()
+        mask_prob = torch.sigmoid(pred_mask_logits[0]).reshape(-1)
+        geo_mag = torch.linalg.norm(geo_flat, dim=1)
+        query_codes = self.mesh_geo_codes.to(device=pred_geo.device, dtype=torch.float32)
+
+        refined_uv = coarse_uv.clone()
+        refined_accept = coarse_accept.clone()
+        refined_dist = coarse_distances.clone()
+
+        valid_vertices = torch.nonzero(coarse_accept, as_tuple=False).flatten()
+        if valid_vertices.numel() == 0:
+            return refined_uv, refined_accept, refined_dist
+
+        coarse_px = (coarse_uv[:, 0] * float(w) - 0.5).round().long()
+        coarse_py = (coarse_uv[:, 1] * float(h) - 0.5).round().long()
+        chunk = max(256, self.search_chunk_size // 2)
+
+        for start in range(0, int(valid_vertices.numel()), chunk):
+            idx = valid_vertices[start : start + chunk]
+            base_x = coarse_px[idx].unsqueeze(1)
+            base_y = coarse_py[idx].unsqueeze(1)
+            cand_x = (base_x + offsets_x).clamp_(0, w - 1)
+            cand_y = (base_y + offsets_y).clamp_(0, h - 1)
+            linear_idx = cand_y * w + cand_x
+
+            cand_codes = geo_flat[linear_idx]
+            cand_mask = mask_prob[linear_idx] > self.search_mask_threshold
+            cand_mag = geo_mag[linear_idx] > self.search_min_geo_magnitude
+            cand_valid = cand_mask & cand_mag
+
+            query = query_codes[idx].unsqueeze(1)
+            dist = torch.linalg.norm(cand_codes - query, dim=-1)
+            dist = dist.masked_fill(~cand_valid, float("inf"))
+            best_dist, best_local_idx = dist.min(dim=1)
+            has_valid = torch.isfinite(best_dist)
+            if not bool(has_valid.any().item()):
+                continue
+
+            best_linear = linear_idx[torch.arange(idx.shape[0], device=pred_geo.device), best_local_idx]
+            best_x = (best_linear % w).float()
+            best_y = torch.div(best_linear, w, rounding_mode="floor").float()
+            best_uv = torch.stack([(best_x + 0.5) / float(w), (best_y + 0.5) / float(h)], dim=-1)
+
+            keep_idx = idx[has_valid]
+            refined_uv[keep_idx] = best_uv[has_valid]
+            refined_dist[keep_idx] = best_dist[has_valid]
+
+        return refined_uv, refined_accept, refined_dist
 
     def _search_mesh_positions(
         self,
