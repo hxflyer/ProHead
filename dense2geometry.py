@@ -547,15 +547,7 @@ class Dense2Geometry(nn.Module):
             mesh_tokens = block(mesh_tokens)
 
         offsets = self.output_head(mesh_tokens)
-        mesh_coords = self.template_mesh.unsqueeze(0).expand(rgb.shape[0], -1, -1).clone()
-        mesh_coords[..., :3] = mesh_coords[..., :3] + offsets[..., :3]
-        uv_base = torch.where(
-            match_mask.unsqueeze(-1) > 0.5,
-            searched_uv,
-            mesh_coords[..., 3:5],
-        )
-        mesh_coords[..., 3:5] = (uv_base + offsets[..., 3:5]).clamp_(0.0, 1.0)
-        mesh_coords[..., 5:] = mesh_coords[..., 5:] + offsets[..., 5:]
+        mesh_coords = self.template_mesh.unsqueeze(0) + offsets
         return {
             "mesh": mesh_coords,
             "searched_uv": searched_uv,
