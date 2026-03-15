@@ -1,6 +1,7 @@
 ﻿import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -102,11 +103,58 @@ class WingLoss(nn.Module):
 
 
 def compute_weighted_l1(pred: torch.Tensor, target: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-    l1 = (pred - target).abs().float()
+    l1 = torch.nan_to_num((pred - target).abs().float(), nan=0.0, posinf=0.0, neginf=0.0)
     if weights is not None:
         w = weights.to(device=l1.device, dtype=torch.float32)
         return (l1 * w).sum(dtype=torch.float32) / (w.sum(dtype=torch.float32) + 1e-6)
     return l1.mean()
+
+
+class MeshSmoothnessLoss(nn.Module):
+    """Edge-based Laplacian smoothness on the predicted offset field.
+
+    Loss = mean over edges of ||offset_i - offset_j||^2
+    where offset_i = pred_i - template_i (the deformation applied to vertex i).
+
+    Precomputes unique edge pairs and template edge differences from face
+    connectivity at construction time; all forward ops are vectorised.
+    """
+
+    def __init__(self, faces: np.ndarray, template: np.ndarray):
+        """
+        faces:    [F, 3] int32/int64 triangle indices in N_unique vertex space
+        template: [N, D] float32 template coords  (xyz in [:3], uv in [3:5])
+        """
+        super().__init__()
+
+        f = np.asarray(faces, dtype=np.int64)
+        # Collect all half-edges, sort each pair so i < j, then deduplicate
+        edges = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], axis=0)
+        edges = np.sort(edges, axis=1)
+        edges = np.unique(edges, axis=0)   # [E, 2]
+
+        t = np.asarray(template, dtype=np.float32)
+        i_idx, j_idx = edges[:, 0], edges[:, 1]
+        tmpl_diff = t[i_idx] - t[j_idx]   # [E, D]
+
+        self.register_buffer("edge_pairs", torch.from_numpy(edges))      # [E, 2] int64
+        self.register_buffer("tmpl_diff",  torch.from_numpy(tmpl_diff))  # [E, D] float32
+
+    def forward(self, pred: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        pred: [B, N, 6]  — predicted coords  (xyz in [:,:,:3], uv in [3:5], depth in [5:6])
+        Returns (loss_3d, loss_2d, loss_depth) — scalar tensors.
+        """
+        i = self.edge_pairs[:, 0]   # [E]
+        j = self.edge_pairs[:, 1]   # [E]
+
+        diff = pred[:, i] - pred[:, j]              # [B, E, 6]
+        off  = diff - self.tmpl_diff.unsqueeze(0)   # [B, E, 6]  offset diff
+
+        loss_3d = (off[:, :, :3] ** 2).mean()
+        loss_2d = (off[:, :, 3:5] ** 2).mean()
+        loss_depth = (off[:, :, 5:6] ** 2).mean() if pred.shape[-1] > 5 else torch.tensor(0.0, device=pred.device)
+        return loss_3d, loss_2d, loss_depth
 
 
 def is_finite_tensor(t: torch.Tensor | None) -> bool:

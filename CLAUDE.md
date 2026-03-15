@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Response Rules
+The user is not native English speaker, you need optimize his input, correct grammar, wording, spelling, and send this optimized prompt at begining of you reply, let the user could improve his English by learn from you. Keep it simple.
+
+## Working Rules
+You should try to use Language Server Protocal (LSP) first instead of use grep
+
 ## Project Overview
 
 **ProHead** is a deep learning system for 3D head geometry and appearance prediction from 2D images. It predicts:

@@ -707,7 +707,6 @@ def run_inference(args):
                 out_texture_path = os.path.join(args.output_dir, f"{basename}_pred_texture.png")
                 cv2.imwrite(out_texture_path, cv2.cvtColor(texture_u8, cv2.COLOR_RGB2BGR))
 
-                mesh_depth = mesh_pred_orig[:, 5] if mesh_pred_orig.shape[1] >= 6 else None
                 render_img, _ = render_mesh_texture_from_2d_pred(
                     mesh_pred=mesh_pred_orig,
                     mesh_texture=texture_img,
@@ -715,7 +714,6 @@ def run_inference(args):
                     template_mesh_faces=template_mesh_faces,
                     out_h=h_orig,
                     out_w=w_orig,
-                    mesh_depth=mesh_depth,
                     device=device,
                     flip_uv_v=True,
                 )

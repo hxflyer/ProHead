@@ -617,18 +617,24 @@ class GeometryTransformer(nn.Module):
 
         backbone = models.convnext_base(weights=None)
 
-        if backbone_weights == 'dinov3':
+        if backbone_weights in ('none', 'checkpoint', ''):
+            print("Backbone weights: skipped (will be loaded from checkpoint)")
+        elif backbone_weights == 'dinov3':
             print("Loading DINOv3 pretrained backbone...")
             weight_path = "models/dinov3_lvd1689m_torchvision.pth"
+            print(f"Loading weights from: {weight_path}")
+            state_dict = torch.load(weight_path, map_location="cpu")
+            if 'model' in state_dict:
+                state_dict = state_dict['model']
+            backbone.load_state_dict(state_dict, strict=False)
         else:
             print("Loading ImageNet pretrained backbone...")
             weight_path = "models/convnext_base-6075fbad.pth"
-
-        print(f"Loading weights from: {weight_path}")
-        state_dict = torch.load(weight_path, map_location="cpu")
-        if 'model' in state_dict:
-            state_dict = state_dict['model']
-        backbone.load_state_dict(state_dict, strict=False)
+            print(f"Loading weights from: {weight_path}")
+            state_dict = torch.load(weight_path, map_location="cpu")
+            if 'model' in state_dict:
+                state_dict = state_dict['model']
+            backbone.load_state_dict(state_dict, strict=False)
 
         return_nodes = {
             'features.1': 'stride4',
@@ -948,9 +954,11 @@ class GeometryTransformer(nn.Module):
             )
 
         features = self.backbone(rgb)
-        f4 = features['stride4']
-        f8 = features['stride8']
-        f16 = features['stride16']
+        # ConvNeXt feature extractor emits channels-last tensors; normalize them
+        # before our 1x1 conv projections so DDP sees consistent grad strides.
+        f4 = features['stride4'].contiguous()
+        f8 = features['stride8'].contiguous()
+        f16 = features['stride16'].contiguous()
 
         if self.use_deformable_attention:
             x4 = self.level_proj_4(f4)

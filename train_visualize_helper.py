@@ -201,6 +201,110 @@ def draw_uv_points_on_texture(
     return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
 
 
+def derive_depth_from_3d_to_2d(xyz: np.ndarray, uv: np.ndarray) -> np.ndarray:
+    """Derive view-space depth by fitting an affine projection from 3D to 2D.
+
+    Solves for a 3x4 affine matrix P such that:
+        [u, v, depth]^T ≈ P @ [x, y, z, 1]^T
+    using least squares on the u,v correspondences, then uses the
+    fitted transform to produce a consistent depth per vertex.
+
+    Args:
+        xyz: [N, 3] predicted 3D coordinates.
+        uv:  [N, 2] predicted 2D screen coordinates (in [0,1]).
+
+    Returns:
+        depth: [N] normalised depth in [0, 1], suitable for rasterisation z-order.
+    """
+    N = xyz.shape[0]
+    if N < 4:
+        return np.zeros(N, dtype=np.float32)
+
+    # Build [N, 4] homogeneous coordinates
+    ones = np.ones((N, 1), dtype=np.float64)
+    A = np.hstack([xyz.astype(np.float64), ones])  # [N, 4]
+
+    # Solve for rows 1 & 2 of P via least squares: uv = A @ P12^T
+    uv64 = uv.astype(np.float64)
+    P12, _, _, _ = np.linalg.lstsq(A, uv64, rcond=None)  # [4, 2]
+
+    # Residual — how well the affine model fits
+    uv_fit = A @ P12  # [N, 2]
+    residual = np.sqrt(((uv64 - uv_fit) ** 2).sum(axis=1).mean())
+
+    # Build the 3rd row (depth) orthogonal to the first two rows.
+    # The first two rows of P span a 2D subspace in 4D; the depth direction
+    # should be the component of the z-axis that is orthogonal to this subspace.
+    r1 = P12[:3, 0]  # first 3 elements of row 1
+    r2 = P12[:3, 1]  # first 3 elements of row 2
+    # Cross product gives a direction perpendicular to both rows in 3D
+    depth_dir = np.cross(r1, r2)
+    depth_norm = np.linalg.norm(depth_dir)
+    if depth_norm < 1e-12:
+        return np.full(N, 0.5, dtype=np.float32)
+    depth_dir = depth_dir / depth_norm
+
+    # Project 3D coords onto the depth direction
+    raw_depth = xyz.astype(np.float64) @ depth_dir  # [N]
+
+    # Normalise to [0, 1]
+    d_min, d_max = raw_depth.min(), raw_depth.max()
+    d_range = d_max - d_min
+    if d_range < 1e-8:
+        return np.full(N, 0.5, dtype=np.float32)
+
+    depth = ((raw_depth - d_min) / d_range).astype(np.float32)
+    return np.clip(depth, 0.0, 1.0)
+
+
+def derive_depth_from_3d_to_2d_torch(xyz: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+    """Batched torch version of derive_depth_from_3d_to_2d.
+
+    Args:
+        xyz: [B, N, 3] predicted 3D coordinates.
+        uv:  [B, N, 2] predicted 2D screen coordinates.
+
+    Returns:
+        depth: [B, N] normalised depth in [0, 1].
+    """
+    B, N, _ = xyz.shape
+    device = xyz.device
+    dtype = xyz.dtype
+
+    # Build homogeneous coords [B, N, 4]
+    ones = torch.ones(B, N, 1, device=device, dtype=torch.float32)
+    A = torch.cat([xyz.float(), ones], dim=-1)  # [B, N, 4]
+    uv_f = uv.float()  # [B, N, 2]
+
+    # Solve least squares per batch: A @ P = uv  =>  P = (A^T A)^{-1} A^T uv
+    AtA = torch.bmm(A.transpose(1, 2), A)  # [B, 4, 4]
+    Atb = torch.bmm(A.transpose(1, 2), uv_f)  # [B, 4, 2]
+    try:
+        P = torch.linalg.solve(AtA, Atb)  # [B, 4, 2]
+    except Exception:
+        return torch.full((B, N), 0.5, device=device, dtype=dtype)
+
+    # Extract the 3D part of the two rows
+    r1 = P[:, :3, 0]  # [B, 3]
+    r2 = P[:, :3, 1]  # [B, 3]
+
+    # Cross product gives depth direction orthogonal to both projection rows
+    depth_dir = torch.cross(r1, r2, dim=-1)  # [B, 3]
+    depth_norm = depth_dir.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+    depth_dir = depth_dir / depth_norm  # [B, 3]
+
+    # Project 3D coords onto depth direction
+    raw_depth = torch.bmm(xyz.float(), depth_dir.unsqueeze(-1)).squeeze(-1)  # [B, N]
+
+    # Normalise to [0, 1] per batch
+    d_min = raw_depth.min(dim=1, keepdim=True).values
+    d_max = raw_depth.max(dim=1, keepdim=True).values
+    d_range = (d_max - d_min).clamp(min=1e-8)
+    depth = ((raw_depth - d_min) / d_range).clamp(0.0, 1.0)
+
+    return depth.to(dtype=dtype)
+
+
 def render_mesh_texture_from_2d_pred(
     mesh_pred: np.ndarray,
     mesh_texture: np.ndarray,
@@ -208,7 +312,6 @@ def render_mesh_texture_from_2d_pred(
     template_mesh_faces: np.ndarray,
     out_h: int,
     out_w: int,
-    mesh_depth: np.ndarray | None = None,
     device: torch.device | str | None = None,
     flip_uv_v: bool = True,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -258,15 +361,14 @@ def render_mesh_texture_from_2d_pred(
     clip_pos[:, 1] = 1.0 - (xy[:, 1] * 2.0)
     clip_pos[:, :2] = np.nan_to_num(clip_pos[:, :2], nan=0.0, posinf=2.0, neginf=-2.0)
 
+    # Derive depth from 3D→2D alignment instead of using predicted depth
     depth_scale = 0.8
     depth_bias = 0.1
-    if mesh_depth is None and mesh_pred.shape[1] >= 6:
-        mesh_depth = mesh_pred[:, 5]
-    if mesh_depth is not None and len(mesh_depth) == xy.shape[0]:
-        depth_norm = np.asarray(mesh_depth, dtype=np.float32)
-        depth_norm = np.clip(depth_norm, 0.0, 1.0)
-        depth_norm = depth_norm * float(depth_scale) + float(depth_bias)
-        clip_pos[:, 2] = -depth_norm
+    if mesh_pred.shape[1] >= 5:
+        xyz_3d = mesh_pred[:, :3]
+        uv_2d = mesh_pred[:, 3:5]
+        derived_depth = derive_depth_from_3d_to_2d(xyz_3d, uv_2d)
+        clip_pos[:, 2] = -(derived_depth * depth_scale + depth_bias)
     else:
         clip_pos[:, 2] = 0.0
     clip_pos[:, 3] = 1.0
@@ -627,62 +729,7 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
         img_vis = create_combined_overlay(img_np, current_lm, landmark_topology)
         landmark_images.append(img_vis)
     
-    # Save mesh visualizations
-    mesh_images = []
-    for i in range(num_samples):
-        img_np = (rgb_tensor[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        img_np = cv2.resize(img_np, (1024, 1024), interpolation=cv2.INTER_LINEAR)
-        H, W = img_np.shape[:2]
-        
-        current_mesh = mesh_pred[i].copy()
-        if output_dim >= 5:
-            current_mesh = current_mesh[:, 3:5]
-        elif output_dim > 2:
-            current_mesh = current_mesh[:, :2]
-            
-        current_mesh = np.clip(current_mesh, 0.0, 1.0)
-        
-        if mesh_restore_indices is not None:
-            current_mesh = current_mesh[mesh_restore_indices]
-        
-        current_mesh[:, 0] *= W
-        current_mesh[:, 1] *= H
-        
-        img_vis = create_combined_overlay(img_np, current_mesh, mesh_topology)
-        mesh_images.append(img_vis)
-    
-    # Save grids
-    cols = 4
-    rows = (num_samples + cols - 1) // cols
-    
-    # Landmark grid
-    grid_h = rows * landmark_images[0].shape[0]
-    grid_w = cols * landmark_images[0].shape[1]
-    lm_grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
-    
-    for idx, img in enumerate(landmark_images):
-        r = idx // cols
-        c = idx % cols
-        h, w = img.shape[:2]
-        lm_grid[r*h:(r+1)*h, c*w:(c+1)*w] = img
-    
-    lm_path = os.path.join(output_dir, f'epoch_{epoch+1:02d}_landmark_overlay.png')
-    cv2.imwrite(lm_path, cv2.cvtColor(lm_grid, cv2.COLOR_RGB2BGR))
-    print(f"Saved landmark overlay: {lm_path}")
-    
-    # Mesh grid
-    mesh_grid = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
-    
-    for idx, img in enumerate(mesh_images):
-        r = idx // cols
-        c = idx % cols
-        h, w = img.shape[:2]
-        mesh_grid[r*h:(r+1)*h, c*w:(c+1)*w] = img
-    
-    mesh_path = os.path.join(output_dir, f'epoch_{epoch+1:02d}_mesh_overlay.png')
-    cv2.imwrite(mesh_path, cv2.cvtColor(mesh_grid, cv2.COLOR_RGB2BGR))
-    print(f"Saved mesh overlay: {mesh_path}")
-
+    # Load template data for rendering
     combined_mesh_uv = None
     template_mesh_uv = None
     template_mesh_faces = None
@@ -695,6 +742,96 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
         template_mesh_faces = geometry_model.template_mesh_faces.detach().cpu().numpy().astype(np.int32, copy=False)
     except Exception as e:
         print(f"Warning: failed to load template mesh UV/faces for render export: {e}")
+
+    # Save mesh visualizations: combined grid with overlay, pred texture, pred render
+    vis_size = 512  # size for each cell in the combined grid
+    mesh_overlay_images = []
+    texture_images = []
+    render_images = []
+    for i in range(num_samples):
+        img_np = (rgb_tensor[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        img_np = cv2.resize(img_np, (1024, 1024), interpolation=cv2.INTER_LINEAR)
+        H, W = img_np.shape[:2]
+
+        current_mesh = mesh_pred[i].copy()
+        if output_dim >= 5:
+            current_mesh = current_mesh[:, 3:5]
+        elif output_dim > 2:
+            current_mesh = current_mesh[:, :2]
+
+        current_mesh = np.clip(current_mesh, 0.0, 1.0)
+
+        if mesh_restore_indices is not None:
+            current_mesh = current_mesh[mesh_restore_indices]
+
+        current_mesh[:, 0] *= W
+        current_mesh[:, 1] *= H
+
+        img_vis = create_combined_overlay(img_np, current_mesh, mesh_topology)
+        img_vis = cv2.resize(img_vis, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+        mesh_overlay_images.append(img_vis)
+
+        # Pred texture
+        if mesh_texture_pred is not None:
+            tex_img = mesh_texture_pred[i].transpose(1, 2, 0)
+            tex_img = np.nan_to_num(tex_img, nan=0.0, posinf=1.0, neginf=0.0)
+            tex_img = np.clip(tex_img, 0.0, 1.0)
+            tex_u8 = (tex_img * 255.0).astype(np.uint8)
+            tex_u8 = cv2.resize(tex_u8, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+            texture_images.append(tex_u8)
+        else:
+            texture_images.append(np.zeros((vis_size, vis_size, 3), dtype=np.uint8))
+
+        # Pred render
+        if mesh_texture_pred is not None and template_mesh_uv is not None and template_mesh_faces is not None:
+            tex_for_render = mesh_texture_pred[i].transpose(1, 2, 0)
+            tex_for_render = np.nan_to_num(tex_for_render, nan=0.0, posinf=1.0, neginf=0.0)
+            tex_for_render = np.clip(tex_for_render, 0.0, 1.0)
+            render_img, _ = render_mesh_texture_from_2d_pred(
+                mesh_pred=mesh_pred[i],
+                mesh_texture=tex_for_render,
+                template_mesh_uv=template_mesh_uv,
+                template_mesh_faces=template_mesh_faces,
+                out_h=vis_size,
+                out_w=vis_size,
+                device=device,
+                flip_uv_v=True,
+            )
+            if render_img is not None:
+                render_u8 = (np.clip(render_img, 0.0, 1.0) * 255.0).astype(np.uint8)
+                render_images.append(render_u8)
+            else:
+                render_images.append(np.zeros((vis_size, vis_size, 3), dtype=np.uint8))
+        else:
+            render_images.append(np.zeros((vis_size, vis_size, 3), dtype=np.uint8))
+
+    # Landmark grid (4 cols)
+    lm_cols = 4
+    lm_rows = (num_samples + lm_cols - 1) // lm_cols
+    lm_cell_h = landmark_images[0].shape[0]
+    lm_cell_w = landmark_images[0].shape[1]
+    lm_grid = np.zeros((lm_rows * lm_cell_h, lm_cols * lm_cell_w, 3), dtype=np.uint8)
+
+    for idx, img in enumerate(landmark_images):
+        r = idx // lm_cols
+        c = idx % lm_cols
+        lm_grid[r*lm_cell_h:(r+1)*lm_cell_h, c*lm_cell_w:(c+1)*lm_cell_w] = img
+
+    lm_path = os.path.join(output_dir, f'epoch_{epoch+1:02d}_landmark_overlay.png')
+    cv2.imwrite(lm_path, cv2.cvtColor(lm_grid, cv2.COLOR_RGB2BGR))
+    print(f"Saved landmark overlay: {lm_path}")
+
+    # Combined mesh grid: each row = [overlay | texture | render] per sample
+    mesh_cols = 3
+    mesh_grid = np.zeros((num_samples * vis_size, mesh_cols * vis_size, 3), dtype=np.uint8)
+    for i in range(num_samples):
+        mesh_grid[i*vis_size:(i+1)*vis_size, 0*vis_size:1*vis_size] = mesh_overlay_images[i]
+        mesh_grid[i*vis_size:(i+1)*vis_size, 1*vis_size:2*vis_size] = texture_images[i]
+        mesh_grid[i*vis_size:(i+1)*vis_size, 2*vis_size:3*vis_size] = render_images[i]
+
+    mesh_path = os.path.join(output_dir, f'epoch_{epoch+1:02d}_mesh_combined.png')
+    cv2.imwrite(mesh_path, cv2.cvtColor(mesh_grid, cv2.COLOR_RGB2BGR))
+    print(f"Saved mesh combined grid (overlay|texture|render): {mesh_path}")
     
     # Save 3D OBJ files
     for i in range(num_samples):
@@ -759,27 +896,6 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
             texture_png_path = os.path.join(output_dir, texture_png_name)
             cv2.imwrite(texture_png_path, cv2.cvtColor(tex_u8, cv2.COLOR_RGB2BGR))
 
-            if template_mesh_uv is not None and template_mesh_faces is not None:
-                mesh_depth = mesh_pred[i, :, 5] if mesh_pred[i].shape[1] >= 6 else None
-                render_img, _ = render_mesh_texture_from_2d_pred(
-                    mesh_pred=mesh_pred[i],
-                    mesh_texture=tex_img,
-                    template_mesh_uv=template_mesh_uv,
-                    template_mesh_faces=template_mesh_faces,
-                    out_h=1024,
-                    out_w=1024,
-                    mesh_depth=mesh_depth,
-                    device=device,
-                    flip_uv_v=True,
-                )
-                if render_img is not None:
-                    render_u8 = (np.clip(render_img, 0.0, 1.0) * 255.0).astype(np.uint8)
-                    render_png_name = f'epoch_{epoch+1:02d}_sample_{i}_pred_render.png'
-                    render_png_path = os.path.join(output_dir, render_png_name)
-                    cv2.imwrite(render_png_path, cv2.cvtColor(render_u8, cv2.COLOR_RGB2BGR))
-
-
-
         if combined_mesh_uv is not None and len(combined_mesh_uv) == len(mesh_verts):
             combined_obj_name = f'epoch_{epoch+1:02d}_sample_{i}_mesh_combined_uv.obj'
             combined_obj_path = os.path.join(output_dir, combined_obj_name)
@@ -827,6 +943,111 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
                 "Warning: skip combined UV OBJ export due to vertex count mismatch "
                 f"(combined_uv={len(combined_mesh_uv)}, mesh_verts={len(mesh_verts)})."
             )
+
+
+def save_dense2geometry_visualizations(
+    model,
+    batch,
+    epoch,
+    device,
+    output_dir,
+    mesh_topology,
+    mesh_restore_indices=None,
+):
+    """Save mesh-focused visualizations for Dense2Geometry training."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    max_samples = 8
+    model.eval()
+    with torch.no_grad():
+        rgb = batch["rgb"][:max_samples].to(device)
+        outputs = model(rgb)
+
+    rgb_tensor = batch["rgb"][:max_samples]
+    gt_mesh = batch["mesh"][:max_samples].detach().cpu().numpy()
+    pred_mesh = outputs["mesh"][:max_samples].detach().cpu().numpy()
+    searched_uv = outputs["searched_uv"][:max_samples].detach().cpu().numpy()
+    match_mask = outputs["match_mask"][:max_samples].detach().cpu().numpy()
+    pred_geo = outputs["pred_geo"][:max_samples].detach().cpu().numpy()
+
+    num_samples = int(rgb_tensor.shape[0])
+    vis_size = 512
+    rows = []
+
+    def _restore(coords_uv: np.ndarray | None):
+        if coords_uv is None:
+            return None
+        out = np.asarray(coords_uv, dtype=np.float32).copy()
+        if mesh_restore_indices is not None:
+            out = out[mesh_restore_indices]
+        return out
+
+    def _prepare_overlay_points(coords_uv: np.ndarray, width: int, height: int) -> np.ndarray:
+        pts = np.asarray(coords_uv, dtype=np.float32).copy()
+        invalid = ~np.isfinite(pts).all(axis=1)
+        invalid |= (pts[:, 0] < 0.0) | (pts[:, 1] < 0.0)
+        pts[invalid] = np.nan
+        pts[:, 0] *= float(width)
+        pts[:, 1] *= float(height)
+        return pts
+
+    def _draw_points_only(rgb_image: np.ndarray, coords_uv: np.ndarray, matched_mask: np.ndarray | None) -> np.ndarray:
+        out = cv2.cvtColor(rgb_image.copy(), cv2.COLOR_RGB2BGR)
+        pts = _prepare_overlay_points(coords_uv, rgb_image.shape[1], rgb_image.shape[0])
+        matched = None if matched_mask is None else np.asarray(matched_mask, dtype=bool)
+        for idx, (px, py) in enumerate(pts):
+            if not np.isfinite(px) or not np.isfinite(py):
+                continue
+            color = (0, 220, 0) if matched is None or matched[idx] else (0, 80, 255)
+            cv2.circle(
+                out,
+                (int(round(float(px))), int(round(float(py)))),
+                1,
+                color,
+                thickness=-1,
+                lineType=cv2.LINE_AA,
+            )
+        return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+
+    for i in range(num_samples):
+        img_np = (rgb_tensor[i].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+        img_np = cv2.resize(img_np, (1024, 1024), interpolation=cv2.INTER_LINEAR)
+        H, W = img_np.shape[:2]
+
+        gt_uv = gt_mesh[i, :, 3:5]
+        pred_uv = pred_mesh[i, :, 3:5]
+        searched_uv_i = searched_uv[i].copy()
+        searched_uv_i[match_mask[i] <= 0.5] = -1.0
+
+        gt_uv = _restore(gt_uv)
+        pred_uv = _restore(pred_uv)
+        searched_uv_i = _restore(searched_uv_i)
+
+        gt_overlay = create_combined_overlay(img_np, _prepare_overlay_points(gt_uv, W, H), mesh_topology)
+        searched_overlay = _draw_points_only(img_np, searched_uv_i, match_mask[i] > 0.5)
+        pred_overlay = create_combined_overlay(img_np, _prepare_overlay_points(pred_uv, W, H), mesh_topology)
+
+        rgb_vis = cv2.resize(img_np, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+        geo_vis = np.transpose(pred_geo[i], (1, 2, 0))
+        geo_vis = np.nan_to_num(geo_vis, nan=0.0, posinf=1.0, neginf=0.0)
+        geo_vis = np.clip(geo_vis, 0.0, 1.0)
+        pred_mask = outputs["pred_mask_logits"][i : i + 1].detach().cpu()
+        pred_mask = torch.sigmoid(pred_mask)
+        pred_mask = F.interpolate(pred_mask, size=geo_vis.shape[:2], mode="bilinear", align_corners=False)[0, 0].numpy()
+        geo_vis = geo_vis * np.clip(pred_mask[..., None], 0.0, 1.0)
+        geo_vis = cv2.resize((geo_vis * 255.0).astype(np.uint8), (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+        gt_overlay = cv2.resize(gt_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+        searched_overlay = cv2.resize(searched_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+        pred_overlay = cv2.resize(pred_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+
+        row = np.concatenate([rgb_vis, geo_vis, gt_overlay, searched_overlay, pred_overlay], axis=1)
+        rows.append(row)
+
+    if rows:
+        grid = np.concatenate(rows, axis=0)
+        grid_path = os.path.join(output_dir, f"epoch_{epoch + 1:02d}_dense2geometry_mesh.png")
+        cv2.imwrite(grid_path, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
+        print(f"Saved dense2geometry mesh visualization: {grid_path}")
 
 
 # --- Geo/DPT Visualization Helpers ---

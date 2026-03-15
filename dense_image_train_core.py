@@ -1081,11 +1081,14 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
         backbone_weights=model_cfg.backbone_weights,
     ).to(device)
 
+    resumed_ckpt = None
     if train_cfg.load_model and os.path.exists(train_cfg.load_model):
         ckpt = torch.load(train_cfg.load_model, map_location="cpu")
         if "model_state_dict" in ckpt:
-            ckpt = ckpt["model_state_dict"]
-        skipped_keys, load_notes = _load_matching_state_dict(model, ckpt)
+            skipped_keys, load_notes = _load_matching_state_dict(model, ckpt["model_state_dict"])
+            resumed_ckpt = ckpt
+        else:
+            skipped_keys, load_notes = _load_matching_state_dict(model, ckpt)
         print(f"Loaded checkpoint: {train_cfg.load_model}")
         if skipped_keys:
             print(f"[Warn] Skipped incompatible checkpoint keys: {skipped_keys[:10]}")
@@ -1104,11 +1107,40 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
         amp_dtype = torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == torch.float16))
 
+    # Restore training state from checkpoint if available
+    start_epoch = 0
+    best_val = float("inf")
+    if resumed_ckpt is not None:
+        if "optimizer_state_dict" in resumed_ckpt:
+            try:
+                optimizer.load_state_dict(resumed_ckpt["optimizer_state_dict"])
+                print("[Resume] Restored optimizer state")
+            except Exception as e:
+                print(f"[Resume] Could not restore optimizer state: {e}")
+        if "scheduler_state_dict" in resumed_ckpt:
+            try:
+                scheduler.load_state_dict(resumed_ckpt["scheduler_state_dict"])
+                print("[Resume] Restored scheduler state")
+            except Exception as e:
+                print(f"[Resume] Could not restore scheduler state: {e}")
+        if "scaler_state_dict" in resumed_ckpt:
+            try:
+                scaler.load_state_dict(resumed_ckpt["scaler_state_dict"])
+                print("[Resume] Restored scaler state")
+            except Exception as e:
+                print(f"[Resume] Could not restore scaler state: {e}")
+        if "epoch" in resumed_ckpt:
+            start_epoch = int(resumed_ckpt["epoch"]) + 1
+            print(f"[Resume] Resuming from epoch {start_epoch + 1}")
+        if "best_val" in resumed_ckpt:
+            best_val = float(resumed_ckpt["best_val"])
+        elif "val_loss" in resumed_ckpt:
+            best_val = float(resumed_ckpt["val_loss"])
+
     run_name = f"dense_img_{model_cfg.backbone_weights}_{int(time.time())}"
     writer = SummaryWriter(os.path.join("runs", run_name))
 
-    best_val = float("inf")
-    for epoch in range(train_cfg.epochs):
+    for epoch in range(start_epoch, train_cfg.epochs):
         print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device=device)
@@ -1184,7 +1216,10 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                     "val_loss": val_out["avg_loss"],
+                    "best_val": best_val,
                     "output_channels": model_cfg.output_channels,
                     "predict_basecolor": model_cfg.predict_basecolor,
                     "predict_geo": model_cfg.predict_geo,
@@ -1226,11 +1261,16 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
     ).to(device)
 
     # Load checkpoint
+    resumed_ckpt = None
     if train_cfg.load_model and os.path.exists(train_cfg.load_model):
         ckpt = torch.load(train_cfg.load_model, map_location="cpu")
         if "model_state_dict" in ckpt:
-            ckpt = ckpt["model_state_dict"]
-        skipped_keys, load_notes = _load_matching_state_dict(model, ckpt)
+            # Full checkpoint with training state
+            skipped_keys, load_notes = _load_matching_state_dict(model, ckpt["model_state_dict"])
+            resumed_ckpt = ckpt
+        else:
+            # Weights-only checkpoint
+            skipped_keys, load_notes = _load_matching_state_dict(model, ckpt)
         if rank == 0:
             print(f"Loaded checkpoint: {train_cfg.load_model}")
             if skipped_keys:
@@ -1252,14 +1292,50 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
         amp_dtype = torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
 
+    # Restore training state from checkpoint if available
+    start_epoch = 0
+    best_val = float("inf")
+    if resumed_ckpt is not None:
+        if "optimizer_state_dict" in resumed_ckpt:
+            try:
+                optimizer.load_state_dict(resumed_ckpt["optimizer_state_dict"])
+                if rank == 0:
+                    print("[Resume] Restored optimizer state")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[Resume] Could not restore optimizer state: {e}")
+        if "scheduler_state_dict" in resumed_ckpt:
+            try:
+                scheduler.load_state_dict(resumed_ckpt["scheduler_state_dict"])
+                if rank == 0:
+                    print("[Resume] Restored scheduler state")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[Resume] Could not restore scheduler state: {e}")
+        if "scaler_state_dict" in resumed_ckpt:
+            try:
+                scaler.load_state_dict(resumed_ckpt["scaler_state_dict"])
+                if rank == 0:
+                    print("[Resume] Restored scaler state")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[Resume] Could not restore scaler state: {e}")
+        if "epoch" in resumed_ckpt:
+            start_epoch = int(resumed_ckpt["epoch"]) + 1
+            if rank == 0:
+                print(f"[Resume] Resuming from epoch {start_epoch + 1}")
+        if "best_val" in resumed_ckpt:
+            best_val = float(resumed_ckpt["best_val"])
+        elif "val_loss" in resumed_ckpt:
+            best_val = float(resumed_ckpt["val_loss"])
+
     # Tensorboard writer only on rank 0
     writer = None
     if rank == 0:
         run_name = f"dense_img_{model_cfg.backbone_weights}_{int(time.time())}"
         writer = SummaryWriter(os.path.join("runs", run_name))
 
-    best_val = float("inf")
-    for epoch in range(train_cfg.epochs):
+    for epoch in range(start_epoch, train_cfg.epochs):
         if rank == 0:
             print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
 
@@ -1345,7 +1421,10 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
                         "epoch": epoch,
                         "model_state_dict": _unwrap_model(model).state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "scaler_state_dict": scaler.state_dict(),
                         "val_loss": val_out["avg_loss"],
+                        "best_val": best_val,
                         "output_channels": model_cfg.output_channels,
                         "predict_basecolor": model_cfg.predict_basecolor,
                         "predict_geo": model_cfg.predict_geo,

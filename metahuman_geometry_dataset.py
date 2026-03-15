@@ -24,8 +24,18 @@ except ImportError:
     print("Warning: Albumentations not installed. Using basic augmentation. Install with: pip install albumentations")
 
 
-def _load_exr_as_uint8(path: str) -> Optional[np.ndarray]:
-    """Load an EXR file, return RGB uint8 [H,W,3] clipped to [0,1]*255, or None on failure."""
+def _should_log_dataset_init() -> bool:
+    """Log dataset construction once in DDP (rank 0 only)."""
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank()) == 0
+    except Exception:
+        pass
+    return True
+
+
+def _load_exr_as_float32(path: str) -> Optional[np.ndarray]:
+    """Load an EXR file and return RGB float32 [H,W,3] clipped to [0,1], or None on failure."""
     geo_float = None
     try:
         import Imath, OpenEXR as _OE
@@ -67,7 +77,16 @@ def _load_exr_as_uint8(path: str) -> Optional[np.ndarray]:
             pass
     if geo_float is None:
         return None
-    return (np.clip(geo_float, 0.0, 1.0) * 255.0).astype(np.uint8)
+    if geo_float.ndim == 2:
+        geo_float = np.repeat(geo_float[..., None], 3, axis=2)
+    elif geo_float.ndim == 3 and geo_float.shape[2] >= 3:
+        geo_float = geo_float[..., :3]
+    elif geo_float.ndim == 3 and geo_float.shape[2] == 1:
+        geo_float = np.repeat(geo_float, 3, axis=2)
+    else:
+        return None
+    geo_float = np.nan_to_num(geo_float.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(geo_float, 0.0, 1.0)
 
 
 class FastGeometryDataset(Dataset):
@@ -83,8 +102,8 @@ class FastGeometryDataset(Dataset):
     ALIGN_5PT_DIRECTION_SHIFT = 0.08
     
     def __init__(
-        self, 
-        data_roots, 
+        self,
+        data_roots,
         split: str = 'train',
         image_size: int = 512,
         train_ratio: float = 0.8,
@@ -103,6 +122,8 @@ class FastGeometryDataset(Dataset):
             texture_root: Optional override for mesh textures root directory
             texture_png_cache_max_items: Max cached source texture PNGs per dataset instance (0 disables cache)
             combined_texture_cache_max_items: Max cached composed 1024 texture maps per dataset instance (0 disables cache)
+
+        Note: Samples without both landmark and mesh txt files are skipped entirely.
         """
         if isinstance(data_roots, str):
             self.data_roots = [data_roots]
@@ -176,13 +197,14 @@ class FastGeometryDataset(Dataset):
                         base_id = full_id[:-len(s)]
                         break
                 
-                # Construct paths directly (assume all files exist)
-                landmark_path = os.path.join(data_root, "landmark", f"landmark_{base_id}.txt")
-                mesh_path = os.path.join(data_root, "mesh", f"mesh_{base_id}.txt")
+                lm_p   = os.path.join(data_root, "landmark", f"landmark_{base_id}.txt")
+                mesh_p = os.path.join(data_root, "mesh",     f"mesh_{base_id}.txt")
                 basecolor_path = os.path.join(data_root, "basecolor", f"BaseColor_{base_id}.png")
-                
-                # Add all samples (existence checked later in __getitem__)
-                self.samples.append((data_root, color_file, landmark_path, mesh_path, basecolor_path))
+
+                if not os.path.exists(lm_p) or not os.path.exists(mesh_p):
+                    continue
+
+                self.samples.append((data_root, color_file, lm_p, mesh_p, basecolor_path))
         
         # Remove duplicates and sort deterministically.
         self.samples = list(set(self.samples))
@@ -208,7 +230,10 @@ class FastGeometryDataset(Dataset):
                 split_samples.extend(root_samples[:val_count])
 
         self.samples = split_samples
-        
+
+        if _should_log_dataset_init():
+            print(f"[{self.__class__.__name__}] split={split}  total={len(self.samples)}")
+
         # Augmentation transforms (image-only; geometric augment is disabled).
         self.image_only_augment = None
         self.image_only_augment_tv = None
@@ -287,6 +312,18 @@ class FastGeometryDataset(Dataset):
         self.default_landmarks = landmark_template[:, :5].astype(np.float32, copy=True)
         self.default_mesh = mesh_template[:, :5].astype(np.float32, copy=True)
 
+        # Template depth (column 5) for computing depth offsets.
+        # If templates have a 6th column with precomputed average depth, use it;
+        # otherwise fall back to zeros.
+        if landmark_template.shape[1] >= 6:
+            self.template_landmark_depth = landmark_template[:, 5].astype(np.float32, copy=True)
+        else:
+            self.template_landmark_depth = np.zeros(landmark_template.shape[0], dtype=np.float32)
+        if mesh_template.shape[1] >= 6:
+            self.template_mesh_depth = mesh_template[:, 5].astype(np.float32, copy=True)
+        else:
+            self.template_mesh_depth = np.zeros(mesh_template.shape[0], dtype=np.float32)
+
     def _find_basecolor_file(self, data_root: str, color_path: str, sample_id: str) -> Optional[str]:
         # Color: Color_id1_id2_suffix.png -> BaseColor: basecolor/BaseColor_id1_id2.png
         # sample_id is id1_id2 (suffix already removed)
@@ -360,6 +397,13 @@ class FastGeometryDataset(Dataset):
             return geom
         except Exception:
             return (None, None) if return_raw_xyz else None
+
+    @staticmethod
+    def _compute_geometry_found_mask(geom: Optional[np.ndarray]) -> np.ndarray:
+        if geom is None or geom.ndim != 2 or geom.shape[1] < 5:
+            return np.zeros((0,), dtype=bool)
+        uv = geom[:, 3:5].astype(np.float32, copy=False)
+        return np.isfinite(uv).all(axis=1) & np.all(uv >= 0.0, axis=1)
     
     def __len__(self):
         return len(self.samples)
@@ -431,41 +475,37 @@ class FastGeometryDataset(Dataset):
         if basecolor_np is None:
             basecolor_np = np.zeros_like(image_np, dtype=np.uint8)
 
-        # Load geometry (fallback to template defaults for real-only samples).
-        has_geometry_gt = bool(landmark_path and mesh_path)
-        landmarks_raw_xyz = None
-        mesh_raw_xyz = None
-        if has_geometry_gt:
-            landmarks, landmarks_raw_xyz = self._load_geometry(landmark_path, return_raw_xyz=True)
-            mesh, mesh_raw_xyz = self._load_geometry(mesh_path, return_raw_xyz=True)
-        else:
-            landmarks = None
-            mesh = None
+        # Load geometry
+        landmarks, landmarks_raw_xyz = self._load_geometry(landmark_path, return_raw_xyz=True)
+        mesh, mesh_raw_xyz = self._load_geometry(mesh_path, return_raw_xyz=True)
 
         mesh_texture = None
         mesh_texture_valid = None
-        five_points_px = None
-        five_points_valid = None
-        head_center_px = None
-        is_extreme_pose = False
-        face_direction = None
         align_applied = False
 
-        if landmarks is None or mesh is None:
-            has_geometry_gt = False
+        geometry_fallback = landmarks is None or mesh is None
+        if geometry_fallback:
+            # Should not happen since we skip samples without geometry files,
+            # but guard against corrupted files.
             landmarks = self.default_landmarks.copy()
             mesh = self.default_mesh.copy()
             landmarks_raw_xyz = None
             mesh_raw_xyz = None
-            landmark_weights = np.zeros((landmarks.shape[0],), dtype=np.float32)
-            mesh_weights = np.zeros((mesh.shape[0],), dtype=np.float32)
-        else:
-            landmark_weights = np.ones((landmarks.shape[0],), dtype=np.float32)
-            mesh_weights = np.ones((mesh.shape[0],), dtype=np.float32)
-            five_points_px, five_points_valid = self._extract_five_points_px(landmarks, w=w, h=h)
-            head_center_px = self._compute_head_center_px(landmarks, w=w, h=h)
-            is_extreme_pose = self._is_extreme_pose(five_points_px, five_points_valid)
-            face_direction = self._estimate_face_direction(five_points_px, five_points_valid)
+
+        landmark_found_mask = self._compute_geometry_found_mask(landmarks)
+        mesh_found_mask = self._compute_geometry_found_mask(mesh)
+        if geometry_fallback:
+            landmark_found_mask = np.zeros((landmarks.shape[0],), dtype=bool)
+            mesh_found_mask = np.zeros((mesh.shape[0],), dtype=bool)
+
+        landmark_weights = np.ones((landmarks.shape[0],), dtype=np.float32)
+        mesh_weights = np.ones((mesh.shape[0],), dtype=np.float32)
+        landmark_weights[~landmark_found_mask] = 0.0
+        mesh_weights[~mesh_found_mask] = 0.0
+        five_points_px, five_points_valid = self._extract_five_points_px(landmarks, w=w, h=h)
+        head_center_px = self._compute_head_center_px(landmarks, w=w, h=h)
+        is_extreme_pose = self._is_extreme_pose(five_points_px, five_points_valid)
+        face_direction = self._estimate_face_direction(five_points_px, five_points_valid)
 
         # Load mask (if present) to down-weight occluded landmarks/mesh vertices.
         dir_name = os.path.dirname(color_path)
@@ -480,19 +520,15 @@ class FastGeometryDataset(Dataset):
                 break
         sample_id = name_no_ext
 
-        if has_geometry_gt:
-            mesh_texture_valid = 1.0
-            try:
-                mesh_texture = self._load_mesh_texture_map(
-                    data_root=data_root,
-                    sample_id=sample_id,
-                )
-                if mesh_texture is None:
-                    mesh_texture_valid = 0.0
-            except Exception:
-                mesh_texture = None
+        mesh_texture_valid = 1.0
+        try:
+            mesh_texture = self._load_mesh_texture_map(
+                data_root=data_root,
+                sample_id=sample_id,
+            )
+            if mesh_texture is None:
                 mesh_texture_valid = 0.0
-        else:
+        except Exception:
             mesh_texture = None
             mesh_texture_valid = 0.0
 
@@ -560,12 +596,12 @@ class FastGeometryDataset(Dataset):
         geo_valid = 0.0
         geo_path = os.path.join(data_root, "geo", f"Geo_{sample_id}.exr")
         if os.path.exists(geo_path):
-            geo_np = _load_exr_as_uint8(geo_path)
+            geo_np = _load_exr_as_float32(geo_path)
             if geo_np is not None:
                 geo_valid = 1.0
 
         # 5-point alignment before filtering/augmentation so all geometry stays coherent.
-        if has_geometry_gt and landmarks is not None and five_points_px is not None:
+        if landmarks is not None and five_points_px is not None:
             M = self._estimate_alignment_matrix(
                 five_points_px,
                 five_points_valid,
@@ -622,6 +658,8 @@ class FastGeometryDataset(Dataset):
                 landmarks = landmarks[self.landmark_indices]
                 if landmarks_raw_xyz is not None and self.landmark_indices.max() < len(landmarks_raw_xyz):
                     landmarks_raw_xyz = landmarks_raw_xyz[self.landmark_indices]
+                if landmark_found_mask is not None and self.landmark_indices.max() < len(landmark_found_mask):
+                    landmark_found_mask = landmark_found_mask[self.landmark_indices]
                 if landmark_weights is not None:
                     landmark_weights = landmark_weights[self.landmark_indices]
 
@@ -630,6 +668,8 @@ class FastGeometryDataset(Dataset):
                 mesh = mesh[self.mesh_indices]
                 if mesh_raw_xyz is not None and self.mesh_indices.max() < len(mesh_raw_xyz):
                     mesh_raw_xyz = mesh_raw_xyz[self.mesh_indices]
+                if mesh_found_mask is not None and self.mesh_indices.max() < len(mesh_found_mask):
+                    mesh_found_mask = mesh_found_mask[self.mesh_indices]
                 if mesh_weights is not None:
                     mesh_weights = mesh_weights[self.mesh_indices]
 
@@ -637,13 +677,13 @@ class FastGeometryDataset(Dataset):
         if landmarks is None or landmarks.shape[0] != self.default_landmarks.shape[0]:
             landmarks = self.default_landmarks.copy()
             landmarks_raw_xyz = None
+            landmark_found_mask = np.zeros((landmarks.shape[0],), dtype=bool)
             landmark_weights = np.zeros((landmarks.shape[0],), dtype=np.float32)
-            has_geometry_gt = False
         if mesh is None or mesh.shape[0] != self.default_mesh.shape[0]:
             mesh = self.default_mesh.copy()
             mesh_raw_xyz = None
+            mesh_found_mask = np.zeros((mesh.shape[0],), dtype=bool)
             mesh_weights = np.zeros((mesh.shape[0],), dtype=np.float32)
-            has_geometry_gt = False
 
         # Image-only augmentation path (used with fixed 5-point alignment).
         if self.image_only_augment is not None and ALBUMENTATIONS_AVAILABLE:
@@ -661,7 +701,7 @@ class FastGeometryDataset(Dataset):
         elif basecolor_np.shape[0] != self.image_size or basecolor_np.shape[1] != self.image_size:
             basecolor_np = cv2.resize(basecolor_np, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
         if geo_np is None:
-            geo_np = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
+            geo_np = np.zeros((self.image_size, self.image_size, 3), dtype=np.float32)
         elif geo_np.shape[0] != self.image_size or geo_np.shape[1] != self.image_size:
             geo_np = cv2.resize(geo_np, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
         if facemask_np is None:
@@ -673,7 +713,7 @@ class FastGeometryDataset(Dataset):
         mask_bin = (facemask_np > 127).astype(np.uint8)   # [H, W] binary
         mask3 = mask_bin[:, :, np.newaxis]                 # [H, W, 1] for broadcasting
         basecolor_np = basecolor_np * mask3
-        geo_np       = geo_np       * mask3
+        geo_np       = geo_np       * mask3.astype(np.float32, copy=False)
 
         rgb_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
         basecolor_tensor = torch.from_numpy(basecolor_np).permute(2, 0, 1).float() / 255.0
@@ -681,112 +721,109 @@ class FastGeometryDataset(Dataset):
         # Load matrix data and compute z-depth for mesh
         mesh_depth = None
         landmark_depth = None
-        if has_geometry_gt:
-            mat_path = os.path.join(data_root, "mat", f"Mats_{sample_id}.txt")
-            if os.path.exists(mat_path):
-                try:
-                    matrix_data = load_matrix_data(mat_path)
-                    
-                    # Compute depth for landmarks
-                    if landmarks is not None:
-                        if landmarks_raw_xyz is not None and landmarks_raw_xyz.shape[0] == landmarks.shape[0]:
-                            landmark_xyz_original = landmarks_raw_xyz.copy()
-                        else:
-                            landmark_xyz_original = landmarks[:, 0:3].copy()
-                        landmark_depth_raw = compute_vertex_depth(landmark_xyz_original, matrix_data)
-                        
-                        # Validate raw depth values
-                        if np.any(~np.isfinite(landmark_depth_raw)):
-                            print(f"[DEPTH WARNING] {sample_id}: landmark_depth_raw contains NaN/inf")
+        mat_path = os.path.join(data_root, "mat", f"Mats_{sample_id}.txt")
+        if os.path.exists(mat_path):
+            try:
+                matrix_data = load_matrix_data(mat_path)
+
+                # Compute depth for landmarks
+                if landmarks is not None:
+                    if landmarks_raw_xyz is not None and landmarks_raw_xyz.shape[0] == landmarks.shape[0]:
+                        landmark_xyz_original = landmarks_raw_xyz.copy()
+                    else:
+                        landmark_xyz_original = landmarks[:, 0:3].copy()
+                    landmark_depth_raw = compute_vertex_depth(landmark_xyz_original, matrix_data)
+
+                    # Validate raw depth values
+                    if np.any(~np.isfinite(landmark_depth_raw)):
+                        print(f"[DEPTH WARNING] {sample_id}: landmark_depth_raw contains NaN/inf")
+                        print(f"  Path: {color_path}")
+                        print(f"  min={np.nanmin(landmark_depth_raw):.4f}, max={np.nanmax(landmark_depth_raw):.4f}")
+                        landmark_depth = np.zeros_like(landmark_depth_raw)
+                    else:
+                        depth_min = landmark_depth_raw.min()
+                        depth_max = landmark_depth_raw.max()
+                        depth_range = depth_max - depth_min
+
+                        # Log if depth values are behind camera or range is too small
+                        if depth_min < 0:
+                            print(f"[DEPTH WARNING] {sample_id}: landmark depth_min={depth_min:.4f} < 0 (behind camera)")
                             print(f"  Path: {color_path}")
-                            print(f"  min={np.nanmin(landmark_depth_raw):.4f}, max={np.nanmax(landmark_depth_raw):.4f}")
+                        if depth_range < 1e-6:
+                            print(f"[DEPTH WARNING] {sample_id}: landmark depth_range={depth_range:.8f} (too small, using zeros)")
+                            print(f"  Path: {color_path}")
                             landmark_depth = np.zeros_like(landmark_depth_raw)
                         else:
-                            depth_min = landmark_depth_raw.min()
-                            depth_max = landmark_depth_raw.max()
-                            depth_range = depth_max - depth_min
-                            
-                            # Log if depth values are behind camera or range is too small
-                            if depth_min < 0:
-                                print(f"[DEPTH WARNING] {sample_id}: landmark depth_min={depth_min:.4f} < 0 (behind camera)")
-                                print(f"  Path: {color_path}")
-                            if depth_range < 1e-6:
-                                print(f"[DEPTH WARNING] {sample_id}: landmark depth_range={depth_range:.8f} (too small, using zeros)")
-                                print(f"  Path: {color_path}")
+                            # Normalize to [0, 1] per sample with epsilon for safety
+                            landmark_depth = (landmark_depth_raw - depth_min) / (depth_range + 1e-8)
+                            landmark_depth = np.clip(landmark_depth, 0.0, 1.0)
+                            # Convert to offset from template depth
+                            landmark_depth = landmark_depth - self.template_landmark_depth
+
+                            # Final validation
+                            if np.any(~np.isfinite(landmark_depth)):
+                                print(f"[DEPTH ERROR] {sample_id}: landmark_depth contains NaN/inf after normalization!")
                                 landmark_depth = np.zeros_like(landmark_depth_raw)
-                            else:
-                                # Normalize to [0, 1] per sample with epsilon for safety
-                                landmark_depth = (landmark_depth_raw - depth_min) / (depth_range + 1e-8)
-                                landmark_depth = np.clip(landmark_depth, 0.0, 1.0)
-                                
-                                # Final validation
-                                if np.any(~np.isfinite(landmark_depth)):
-                                    print(f"[DEPTH ERROR] {sample_id}: landmark_depth contains NaN/inf after normalization!")
-                                    landmark_depth = np.zeros_like(landmark_depth_raw)
-                        
-                        # Add depth as 6th column to landmarks
-                        landmarks = np.concatenate([landmarks, landmark_depth[:, None]], axis=1)
-                    
-                    # Compute depth for mesh
-                    if mesh is not None:
-                        if mesh_raw_xyz is not None and mesh_raw_xyz.shape[0] == mesh.shape[0]:
-                            mesh_xyz_original = mesh_raw_xyz.copy()
-                        else:
-                            mesh_xyz_original = mesh[:, 0:3].copy()
-                        mesh_depth_raw = compute_vertex_depth(mesh_xyz_original, matrix_data)
-                        
-                        # Validate raw depth values
-                        if np.any(~np.isfinite(mesh_depth_raw)):
-                            print(f"[DEPTH WARNING] {sample_id}: mesh_depth_raw contains NaN/inf")
+
+                    # Add depth as 6th column to landmarks
+                    landmarks = np.concatenate([landmarks, landmark_depth[:, None]], axis=1)
+
+                # Compute depth for mesh
+                if mesh is not None:
+                    if mesh_raw_xyz is not None and mesh_raw_xyz.shape[0] == mesh.shape[0]:
+                        mesh_xyz_original = mesh_raw_xyz.copy()
+                    else:
+                        mesh_xyz_original = mesh[:, 0:3].copy()
+                    mesh_depth_raw = compute_vertex_depth(mesh_xyz_original, matrix_data)
+
+                    # Validate raw depth values
+                    if np.any(~np.isfinite(mesh_depth_raw)):
+                        print(f"[DEPTH WARNING] {sample_id}: mesh_depth_raw contains NaN/inf")
+                        print(f"  Path: {color_path}")
+                        print(f"  min={np.nanmin(mesh_depth_raw):.4f}, max={np.nanmax(mesh_depth_raw):.4f}")
+                        mesh_depth_normalized = np.zeros_like(mesh_depth_raw)
+                        mesh_depth = None
+                    else:
+                        depth_min = mesh_depth_raw.min()
+                        depth_max = mesh_depth_raw.max()
+                        depth_range = depth_max - depth_min
+
+                        # Log if depth values are behind camera or range is too small
+                        if depth_min < 0:
+                            print(f"[DEPTH WARNING] {sample_id}: mesh depth_min={depth_min:.4f} < 0 (behind camera)")
                             print(f"  Path: {color_path}")
-                            print(f"  min={np.nanmin(mesh_depth_raw):.4f}, max={np.nanmax(mesh_depth_raw):.4f}")
+                        if depth_range < 1e-6:
+                            print(f"[DEPTH WARNING] {sample_id}: mesh depth_range={depth_range:.8f} (too small, using zeros)")
+                            print(f"  Path: {color_path}")
                             mesh_depth_normalized = np.zeros_like(mesh_depth_raw)
                             mesh_depth = None
                         else:
-                            depth_min = mesh_depth_raw.min()
-                            depth_max = mesh_depth_raw.max()
-                            depth_range = depth_max - depth_min
-                            
-                            # Log if depth values are behind camera or range is too small
-                            if depth_min < 0:
-                                print(f"[DEPTH WARNING] {sample_id}: mesh depth_min={depth_min:.4f} < 0 (behind camera)")
-                                print(f"  Path: {color_path}")
-                            if depth_range < 1e-6:
-                                print(f"[DEPTH WARNING] {sample_id}: mesh depth_range={depth_range:.8f} (too small, using zeros)")
-                                print(f"  Path: {color_path}")
+                            # Normalize to [0, 1] per sample with epsilon for safety
+                            mesh_depth_normalized = (mesh_depth_raw - depth_min) / (depth_range + 1e-8)
+                            mesh_depth_normalized = np.clip(mesh_depth_normalized, 0.0, 1.0)
+                            # Convert to offset from template depth
+                            mesh_depth_normalized = mesh_depth_normalized - self.template_mesh_depth
+
+                            # Final validation
+                            if np.any(~np.isfinite(mesh_depth_normalized)):
+                                print(f"[DEPTH ERROR] {sample_id}: mesh_depth contains NaN/inf after normalization!")
                                 mesh_depth_normalized = np.zeros_like(mesh_depth_raw)
                                 mesh_depth = None
                             else:
-                                # Normalize to [0, 1] per sample with epsilon for safety
-                                mesh_depth_normalized = (mesh_depth_raw - depth_min) / (depth_range + 1e-8)
-                                mesh_depth_normalized = np.clip(mesh_depth_normalized, 0.0, 1.0)
-                                
-                                # Final validation
-                                if np.any(~np.isfinite(mesh_depth_normalized)):
-                                    print(f"[DEPTH ERROR] {sample_id}: mesh_depth contains NaN/inf after normalization!")
-                                    mesh_depth_normalized = np.zeros_like(mesh_depth_raw)
-                                    mesh_depth = None
-                                else:
-                                    # Keep raw depth for rendering
-                                    mesh_depth = mesh_depth_raw
-                        
-                        # Add depth as 6th column to mesh
-                        mesh = np.concatenate([mesh, mesh_depth_normalized[:, None]], axis=1)
-                except Exception:
-                    # If depth computation fails, pad with zeros
-                    if landmarks is not None:
-                        landmarks = np.concatenate([landmarks, np.zeros((landmarks.shape[0], 1), dtype=np.float32)], axis=1)
-                    if mesh is not None:
-                        mesh = np.concatenate([mesh, np.zeros((mesh.shape[0], 1), dtype=np.float32)], axis=1)
-                    mesh_depth = None
-            else:
-                # No matrix file, pad with zeros
+                                # Keep raw depth for rendering
+                                mesh_depth = mesh_depth_raw
+
+                    # Add depth as 6th column to mesh
+                    mesh = np.concatenate([mesh, mesh_depth_normalized[:, None]], axis=1)
+            except Exception:
+                # If depth computation fails, pad with zeros
                 if landmarks is not None:
                     landmarks = np.concatenate([landmarks, np.zeros((landmarks.shape[0], 1), dtype=np.float32)], axis=1)
                 if mesh is not None:
                     mesh = np.concatenate([mesh, np.zeros((mesh.shape[0], 1), dtype=np.float32)], axis=1)
+                mesh_depth = None
         else:
-            # No geometry GT, ensure 6D format
+            # No matrix file, pad with zeros
             if landmarks is not None and landmarks.shape[1] < 6:
                 landmarks = np.concatenate([landmarks, np.zeros((landmarks.shape[0], 1), dtype=np.float32)], axis=1)
             if mesh is not None and mesh.shape[1] < 6:
@@ -797,10 +834,11 @@ class FastGeometryDataset(Dataset):
             'basecolor': basecolor_tensor,
             'basecolor_valid': torch.tensor(1.0 if float(basecolor_valid) > 0.5 else 0.0, dtype=torch.float32),
             'image_path': color_path,
-            'has_geometry_gt': torch.tensor(1.0 if has_geometry_gt else 0.0, dtype=torch.float32),
             'landmarks': torch.from_numpy(landmarks).float(),
+            'landmark_found_mask': torch.from_numpy(landmark_found_mask.astype(np.float32, copy=False)),
             'landmark_weights': torch.from_numpy(landmark_weights).float(),
             'mesh': torch.from_numpy(mesh).float(),
+            'mesh_found_mask': torch.from_numpy(mesh_found_mask.astype(np.float32, copy=False)),
             'mesh_weights': torch.from_numpy(mesh_weights).float(),
         }
 
@@ -817,7 +855,7 @@ class FastGeometryDataset(Dataset):
             dtype=torch.float32,
         )
 
-        result['geo_gt'] = torch.from_numpy(geo_np.astype(np.float32) / 255.0).permute(2, 0, 1)
+        result['geo_gt'] = torch.from_numpy(geo_np.astype(np.float32, copy=False)).permute(2, 0, 1)
         result['geo_valid'] = torch.tensor(1.0 if geo_valid > 0.5 else 0.0, dtype=torch.float32)
 
         if five_points_px is not None and five_points_valid is not None:
@@ -841,12 +879,13 @@ def fast_collate_fn(batch):
         'basecolor': torch.stack([item['basecolor'] for item in batch]),
         'basecolor_valid': torch.stack([item['basecolor_valid'] for item in batch]),
         'landmarks': torch.stack([item['landmarks'] for item in batch]),
+        'landmark_found_mask': torch.stack([item['landmark_found_mask'] for item in batch]),
         'landmark_weights': torch.stack([item['landmark_weights'] for item in batch]),
         'mesh': torch.stack([item['mesh'] for item in batch]),
+        'mesh_found_mask': torch.stack([item['mesh_found_mask'] for item in batch]),
         'mesh_weights': torch.stack([item['mesh_weights'] for item in batch]),
         'mesh_texture': torch.stack([item['mesh_texture'] for item in batch]),
         'mesh_texture_valid': torch.stack([item['mesh_texture_valid'] for item in batch]),
-        'has_geometry_gt': torch.stack([item['has_geometry_gt'] for item in batch]),
         'geo_gt': torch.stack([item['geo_gt'] for item in batch]),
         'geo_valid': torch.stack([item['geo_valid'] for item in batch]),
     }

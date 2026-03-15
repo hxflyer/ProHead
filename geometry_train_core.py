@@ -28,8 +28,9 @@ except Exception:
 from geometry_transformer import GeometryTransformer
 from obj_load_helper import load_uv_obj_file
 from metahuman_geometry_dataset import FastGeometryDataset, fast_collate_fn
-from train_loss_helper import MetricAccumulator, SimDRLoss, compute_weighted_l1
+from train_loss_helper import MetricAccumulator, MeshSmoothnessLoss, SimDRLoss, compute_weighted_l1
 from train_visualize_helper import (
+    derive_depth_from_3d_to_2d_torch,
     load_combined_mesh_uv,
     load_landmark_topology,
     load_mesh_topology,
@@ -46,6 +47,7 @@ FIXED_SIMDR_MAX_3D = 0.5
 FIXED_SIMDR_MIN_2D = -0.5
 FIXED_SIMDR_MAX_2D = 0.5
 FIXED_BASECOLOR_RENDER_L1_LAMBDA = 1.0
+FIXED_MESH_SMOOTHNESS_LAMBDA = 0.2
 
 
 @dataclass
@@ -100,7 +102,13 @@ class TrainConfig:
     basecolor_render_l1_lambda: float = FIXED_BASECOLOR_RENDER_L1_LAMBDA
     normal_render_l1_lambda: float = 0.0
     geo_render_l1_lambda: float = 1.0
-    real_data_start_epoch: int = 10
+    real_data_geo_start_epoch: int = 10
+    real_data_basecolor_start_epoch: int = 10
+    mesh_smoothness_lambda: float = FIXED_MESH_SMOOTHNESS_LAMBDA
+    real_data_warmup_epochs: int = 5
+    test_mode: bool = False
+    test_preview_every: int = 100
+    ddp_find_unused_parameters: bool = False
 
 
 def _parse_bool_arg(v):
@@ -116,9 +124,9 @@ def _parse_bool_arg(v):
 
 def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_train_samples", type=int, default=0)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=6)
     parser.add_argument("--prefetch_factor", type=int, default=1)
     parser.add_argument("--persistent_workers", type=_parse_bool_arg, nargs="?", const=True, default=True)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -144,37 +152,26 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--num_deformable_points", type=int, default=16)
     parser.add_argument("--deformable_offset_warmup_epochs", type=int, default=0)
-    parser.add_argument("--real_data_start_epoch", type=int, default=10)
+    parser.add_argument("--real_data_geo_start_epoch", type=int, default=10,
+                        help="Epochs after resume before enabling real data geo render loss")
+    parser.add_argument("--real_data_basecolor_start_epoch", type=int, default=10,
+                        help="Epochs after resume before enabling real data basecolor render loss")
+    parser.add_argument("--mesh_smoothness_lambda", type=float, default=FIXED_MESH_SMOOTHNESS_LAMBDA)
+    parser.add_argument("--real_data_warmup_epochs", type=int, default=5)
     parser.add_argument("--use_deformable_attention", type=_parse_bool_arg, nargs="?", const=True, default=True)
+
+    parser.add_argument("--test_mode", action="store_true")
+    parser.add_argument("--test_preview_every", type=int, default=100)
+    parser.add_argument("--ddp_find_unused_parameters", type=_parse_bool_arg, nargs="?", const=True, default=False)
 
     parser.add_argument("--data_roots", nargs="*", default=None)
     parser.add_argument("--texture_root", type=str, default="")
     return parser
 
 
-def _default_data_roots(platform_name: str) -> list[str]:
-    if platform_name == "linux":
-        return [
-            "/hy-tmp/CapturedFrames_final1_processed",
-            "/hy-tmp/CapturedFrames_final7_processed",
-            "/hy-tmp/CapturedFrames_final8_processed",
-            "/hy-tmp/CapturedFrames_final9_processed",
-        ]
-    return [
-        "G:/CapturedFrames_final1_processed",
-        "G:/CapturedFrames_final7_processed",
-        "G:/CapturedFrames_final8_processed",
-        "G:/CapturedFrames_final9_processed",
-    ]
-
-
-def _default_texture_root(platform_name: str) -> str:
-    return "/hy-tmp/textures" if platform_name == "linux" else "G:/textures"
-
-
-def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, ModelConfig, TrainConfig]:
-    data_roots = list(args.data_roots) if args.data_roots else _default_data_roots(platform_name)
-    texture_root = args.texture_root.strip() if args.texture_root else _default_texture_root(platform_name)
+def build_configs_from_args(args) -> tuple[DataConfig, ModelConfig, TrainConfig]:
+    data_roots = list(args.data_roots) if args.data_roots else []
+    texture_root = args.texture_root.strip() if args.texture_root else ""
     
     # Get synthetic_data_roots if specified
     synthetic_data_roots = getattr(args, 'synthetic_data_roots', None)
@@ -214,7 +211,13 @@ def build_configs_from_args(args, platform_name: str) -> tuple[DataConfig, Model
         simdr_kl_layers=str(args.simdr_kl_layers),
         amp_dtype=str(args.amp_dtype),
         deformable_offset_warmup_epochs=int(args.deformable_offset_warmup_epochs),
-        real_data_start_epoch=int(args.real_data_start_epoch),
+        real_data_geo_start_epoch=int(args.real_data_geo_start_epoch),
+        real_data_basecolor_start_epoch=int(args.real_data_basecolor_start_epoch),
+        mesh_smoothness_lambda=float(args.mesh_smoothness_lambda),
+        real_data_warmup_epochs=int(args.real_data_warmup_epochs),
+        test_mode=bool(getattr(args, "test_mode", False)),
+        test_preview_every=int(getattr(args, "test_preview_every", 100)),
+        ddp_find_unused_parameters=bool(getattr(args, "ddp_find_unused_parameters", False)),
     )
     return data_cfg, model_cfg, train_cfg
 
@@ -354,6 +357,20 @@ def cleanup_distributed() -> None:
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
+
+
+def _load_matching_state_dict(model, state_dict: dict[str, torch.Tensor]) -> tuple[list[str], list[str]]:
+    """Load state dict, skipping keys with incompatible shapes."""
+    model_state = model.state_dict()
+    filtered_state = {}
+    skipped_keys: list[str] = []
+    for key, value in state_dict.items():
+        if key not in model_state or model_state[key].shape != value.shape:
+            skipped_keys.append(key)
+            continue
+        filtered_state[key] = value
+    missing_keys, unexpected_keys = model.load_state_dict(filtered_state, strict=False)
+    return skipped_keys, list(missing_keys) + list(unexpected_keys)
 
 def worker_init_fn(_worker_id):
     import cv2
@@ -507,7 +524,7 @@ def _load_auxiliary_geometry(rank: int):
 def prepare_data(rank: int, world_size: int, data_cfg: DataConfig):
     train_loader, val_loader, train_sampler = create_distributed_dataloaders(data_cfg, rank, world_size)
 
-    # Create a synthetic-only loader used before real_data_start_epoch
+    # Create a synthetic-only loader used before real_data_{geo,basecolor}_start_epoch
     synthetic_train_loader = None
     synthetic_train_sampler = None
     if (
@@ -534,6 +551,7 @@ def prepare_data(rank: int, world_size: int, data_cfg: DataConfig):
         "train_sampler": train_sampler,
         "synthetic_train_loader": synthetic_train_loader,
         "synthetic_train_sampler": synthetic_train_sampler,
+        "synthetic_data_roots": list(data_cfg.synthetic_data_roots) if data_cfg.synthetic_data_roots else None,
         **aux,
     }
 
@@ -572,11 +590,22 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
         texture_output_size=model_cfg.mesh_texture_size,
     ).to(device)
 
+    resumed_ckpt = None
     if train_cfg.load_model and os.path.exists(train_cfg.load_model):
         ckpt = torch.load(train_cfg.load_model, map_location="cpu")
         if "model_state_dict" in ckpt:
-            ckpt = ckpt["model_state_dict"]
-        model.load_state_dict(ckpt, strict=False)
+            # Full checkpoint with training state
+            skipped_keys, load_notes = _load_matching_state_dict(model, ckpt["model_state_dict"])
+            resumed_ckpt = ckpt
+        else:
+            # Weights-only checkpoint
+            skipped_keys, load_notes = _load_matching_state_dict(model, ckpt)
+        if rank == 0:
+            print(f"Loaded checkpoint: {train_cfg.load_model}")
+            if skipped_keys:
+                print(f"[Warn] Skipped incompatible checkpoint keys: {skipped_keys[:10]}")
+            if load_notes:
+                print(f"[Warn] Missing/unexpected checkpoint keys: {load_notes[:10]}")
 
     if model_cfg.freeze_backbone:
         for p in model.backbone.parameters():
@@ -586,20 +615,18 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
 
     # Use DDP only when running real multi-process training.
     if world_size > 1 and dist.is_available() and dist.is_initialized():
-        # This model has conditional branches (e.g., texture/render losses can be
-        # disabled per-rank by sample composition and warmup settings), so some
-        # parameters may be unused in a given iteration.
+        ddp_find_unused = bool(getattr(train_cfg, "ddp_find_unused_parameters", False))
         if dist.get_backend() == "nccl":
             model = DDP(
                 model,
                 device_ids=[rank],
-                find_unused_parameters=True,
+                find_unused_parameters=ddp_find_unused,
                 gradient_as_bucket_view=False,
             )
         else:
             model = DDP(
                 model,
-                find_unused_parameters=True,
+                find_unused_parameters=ddp_find_unused,
                 gradient_as_bucket_view=False,
             )
 
@@ -645,6 +672,50 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
         amp_dtype = torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
 
+    # Restore training state from checkpoint if available
+    start_epoch = 0
+    best_loss = float("inf")
+    if resumed_ckpt is not None:
+        if "optimizer_state_dict" in resumed_ckpt:
+            try:
+                optimizer.load_state_dict(resumed_ckpt["optimizer_state_dict"])
+                if rank == 0:
+                    print("[Resume] Restored optimizer state")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[Resume] Could not restore optimizer state: {e}")
+        if "scheduler_state_dict" in resumed_ckpt:
+            try:
+                scheduler.load_state_dict(resumed_ckpt["scheduler_state_dict"])
+                if rank == 0:
+                    print("[Resume] Restored scheduler state")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[Resume] Could not restore scheduler state: {e}")
+        if "scaler_state_dict" in resumed_ckpt:
+            try:
+                scaler.load_state_dict(resumed_ckpt["scaler_state_dict"])
+                if rank == 0:
+                    print("[Resume] Restored scaler state")
+            except Exception as e:
+                if rank == 0:
+                    print(f"[Resume] Could not restore scaler state: {e}")
+        if "epoch" in resumed_ckpt:
+            start_epoch = int(resumed_ckpt["epoch"]) + 1
+            if rank == 0:
+                print(f"[Resume] Resuming from epoch {start_epoch + 1}")
+            # If scheduler state wasn't restored, fast-forward it to match resume epoch
+            if "scheduler_state_dict" not in resumed_ckpt and start_epoch > 0:
+                for _ in range(start_epoch):
+                    scheduler.step()
+                if rank == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    print(f"[Resume] Fast-forwarded scheduler to epoch {start_epoch}, LR={current_lr:.6e}")
+        if "best_loss" in resumed_ckpt:
+            best_loss = float(resumed_ckpt["best_loss"])
+        elif "val_loss" in resumed_ckpt:
+            best_loss = float(resumed_ckpt["val_loss"])
+
     layer_weights = build_deep_supervision_weights(
         num_layers=model_cfg.num_layers,
         custom_weights=train_cfg.deep_supervision_weights,
@@ -661,6 +732,28 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
         mesh_mask_labels = np.loadtxt("model/mesh_mask.txt").astype(np.float32)
         mesh_mask_weights_tensor = torch.from_numpy(np.repeat(mesh_mask_labels, 6, axis=0)).to(device)
 
+    mesh_smooth_loss_fn = None
+    if train_cfg.mesh_smoothness_lambda > 0:
+        mesh_smooth_loss_fn = MeshSmoothnessLoss(
+            faces=prepared["template_mesh_faces"],
+            template=prepared["template_mesh"],
+        ).to(device)
+
+    # Load face mask texture for masking render losses (neck/back of head)
+    real_face_mask_texture = None
+    face_mask_path = os.path.join("model", "real_dataset_face_mask.png")
+    if os.path.exists(face_mask_path):
+        import cv2 as _cv2
+        mask_img = _cv2.imread(face_mask_path, _cv2.IMREAD_COLOR)  # BGR
+        if mask_img is not None:
+            # Mask is RGB with: red=back-of-head, green=neck, white=face
+            # Store as [1, 3, H, W] so rendered mask preserves per-channel info
+            mask_f = mask_img[:, :, ::-1].astype(np.float32) / 255.0  # BGR→RGB
+            mask_t = torch.from_numpy(mask_f.copy()).permute(2, 0, 1).unsqueeze(0).contiguous().to(device)  # [1, 3, H, W]
+            real_face_mask_texture = mask_t
+            if rank == 0:
+                print(f"[Info] Loaded face mask texture (color): {face_mask_path} shape={mask_img.shape}")
+
     return {
         "model": model,
         "optimizer": optimizer,
@@ -673,7 +766,10 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
         "simdr_kl_layer_mask": simdr_kl_layer_mask,
         "landmark_mask_weights_tensor": landmark_mask_weights_tensor,
         "mesh_mask_weights_tensor": mesh_mask_weights_tensor,
-        "best_loss": float("inf"),
+        "mesh_smooth_loss_fn": mesh_smooth_loss_fn,
+        "real_face_mask_texture": real_face_mask_texture,
+        "best_loss": best_loss,
+        "start_epoch": start_epoch,
     }
 
 
@@ -684,6 +780,33 @@ def _build_batch_weights(batch, key: str, model_type: str, device):
     if model_type == "simdr":
         return w.unsqueeze(-1).repeat(1, 1, 6)
     return torch.repeat_interleave(w, 6, dim=1)
+
+
+def _merge_batch_weight_masks(primary: torch.Tensor | None, extra: torch.Tensor | None) -> torch.Tensor | None:
+    if primary is None:
+        return extra
+    if extra is None:
+        return primary
+    return primary * extra
+
+
+def _build_domain_masks(batch, synthetic_data_roots, device):
+    """Split a batch into synthetic and real samples from image_path prefixes."""
+    if "image_path" not in batch or not synthetic_data_roots:
+        return None, None
+
+    synthetic_roots = tuple(os.path.normpath(r) for r in synthetic_data_roots)
+    batch_size = len(batch["image_path"])
+    synthetic_sample_mask = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+    real_sample_mask = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+
+    for i, path in enumerate(batch["image_path"]):
+        path_normalized = os.path.normpath(path)
+        is_synthetic = any(path_normalized.startswith(root) for root in synthetic_roots)
+        synthetic_sample_mask[i] = bool(is_synthetic)
+        real_sample_mask[i] = not bool(is_synthetic)
+
+    return synthetic_sample_mask, real_sample_mask
 
 
 def render_vertex_attrs_to_image(model_ref, mesh_pred: torch.Tensor, vertex_attrs: torch.Tensor, out_h: int, out_w: int, use_pred_depth: bool = True):
@@ -726,9 +849,13 @@ def render_vertex_attrs_to_image(model_ref, mesh_pred: torch.Tensor, vertex_attr
     x_clip = torch.nan_to_num(xy[..., 0] * 2.0 - 1.0,       nan=0.0, posinf=2.0, neginf=-2.0)
     y_clip = torch.nan_to_num(1.0 - xy[..., 1] * 2.0,        nan=0.0, posinf=2.0, neginf=-2.0)
 
+    # Derive depth from 3D→2D alignment
     depth_scale, depth_bias = 0.8, 0.1
-    if use_pred_depth and mesh_pred_full.shape[-1] >= 6:
-        z_clip = -(mesh_pred_full[..., 5].float().clamp(0.0, 1.0) * depth_scale + depth_bias)
+    if use_pred_depth and mesh_pred_full.shape[-1] >= 5:
+        derived_depth = derive_depth_from_3d_to_2d_torch(
+            mesh_pred_full[..., :3], mesh_pred_full[..., 3:5],
+        )
+        z_clip = -(derived_depth.float().clamp(0.0, 1.0) * depth_scale + depth_bias)
     else:
         z_clip = torch.zeros_like(x_clip)
     z_clip = torch.nan_to_num(z_clip, nan=0.0, posinf=0.0, neginf=0.0)
@@ -758,7 +885,7 @@ def render_vertex_attrs_to_image(model_ref, mesh_pred: torch.Tensor, vertex_attr
     return color, cov
 
 
-def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_texture: torch.Tensor, out_h: int, out_w: int, use_pred_depth: bool = True):
+def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_texture: torch.Tensor, out_h: int, out_w: int, use_pred_depth: bool = True, antialias: bool = True):
     if (not _NVDIFFRAST_AVAILABLE) or mesh_texture is None:
         return None, None
     if mesh_pred is None:
@@ -792,11 +919,14 @@ def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_textur
     x_clip = torch.nan_to_num(xy[..., 0] * 2.0 - 1.0,  nan=0.0, posinf=2.0, neginf=-2.0)
     y_clip = torch.nan_to_num(1.0 - xy[..., 1] * 2.0,   nan=0.0, posinf=2.0, neginf=-2.0)
 
+    # Derive depth from 3D→2D alignment
     depth_scale = 0.8
     depth_bias = 0.1
-    if use_pred_depth and mesh_pred_full.shape[-1] >= 6:
-        depth_norm = mesh_pred_full[..., 5].float().clamp(0.0, 1.0)
-        z_clip = -(depth_norm * depth_scale + depth_bias)
+    if use_pred_depth and mesh_pred_full.shape[-1] >= 5:
+        derived_depth = derive_depth_from_3d_to_2d_torch(
+            mesh_pred_full[..., :3], mesh_pred_full[..., 3:5],
+        )
+        z_clip = -(derived_depth.float().clamp(0.0, 1.0) * depth_scale + depth_bias)
     else:
         z_clip = torch.zeros_like(x_clip)
     z_clip = torch.nan_to_num(z_clip, nan=0.0, posinf=0.0, neginf=0.0)
@@ -808,9 +938,9 @@ def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_textur
     uv = uv_full.unsqueeze(0).expand(bsz, -1, -1).contiguous()
     tex = mesh_texture.float().permute(0, 2, 3, 1).contiguous()
 
-    # Render at 2x resolution for anti-aliasing, then downscale
-    render_h = int(out_h) * 2
-    render_w = int(out_w) * 2
+    # Render at 2x resolution for anti-aliasing, then downscale (skip for masks)
+    render_h = int(out_h) * 2 if antialias else int(out_h)
+    render_w = int(out_w) * 2 if antialias else int(out_w)
 
     with torch.amp.autocast(device_type=device.type, enabled=False):
         rast, _ = dr.rasterize(ctx, clip_pos, tri, resolution=[render_h, render_w])
@@ -820,7 +950,8 @@ def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_textur
         uv_pix = uv_pix.clamp(0.0, 1.0)
 
         color = dr.texture(tex, uv_pix, filter_mode="linear", boundary_mode="clamp")
-        color = dr.antialias(color, rast, clip_pos, tri)
+        if antialias:
+            color = dr.antialias(color, rast, clip_pos, tri)
         cov = (rast[..., 3:4] > 0).to(dtype=color.dtype)
         color = color * cov
         color = torch.nan_to_num(color, nan=0.0, posinf=0.0, neginf=0.0)
@@ -828,16 +959,151 @@ def render_mesh_texture_to_image(model_ref, mesh_pred: torch.Tensor, mesh_textur
 
     color = color.permute(0, 3, 1, 2).contiguous().to(dtype=mesh_texture.dtype)
     cov = cov.permute(0, 3, 1, 2).contiguous().to(dtype=mesh_texture.dtype)
-    
-    # Downsample from 2x to target resolution for anti-aliasing
-    color = F.interpolate(color, size=(int(out_h), int(out_w)), mode='bilinear', align_corners=False)
-    cov = F.interpolate(cov, size=(int(out_h), int(out_w)), mode='bilinear', align_corners=False)
+
+    if antialias:
+        # Downsample from 2x to target resolution
+        color = F.interpolate(color, size=(int(out_h), int(out_w)), mode='bilinear', align_corners=False)
+        cov = F.interpolate(cov, size=(int(out_h), int(out_w)), mode='bilinear', align_corners=False)
     
     # Flip vertically after rendering
     color = torch.flip(color, dims=[2])
     cov = torch.flip(cov, dims=[2])
     
     return color, cov
+
+def _save_test_preview(
+    epoch: int,
+    step: int,
+    batch,
+    model_ref,
+    mesh_pred: torch.Tensor,
+    mesh_texture_pred: torch.Tensor | None,
+    real_face_mask_texture: torch.Tensor | None = None,
+    output_dir: str = "test_previews",
+):
+    """Save a visualization grid for real samples in test mode.
+
+    Grid columns per sample:
+      input_rgb | gt_basecolor | rendered_basecolor | basecolor_diff
+                | gt_geo       | rendered_geo       | geo_diff
+    """
+    import cv2 as _cv2
+
+    os.makedirs(output_dir, exist_ok=True)
+    bsz = mesh_pred.shape[0]
+
+    rgb_np = batch["rgb"][:bsz].detach().cpu().numpy()  # [B, 3, H, W]
+    out_h, out_w = rgb_np.shape[2], rgb_np.shape[3]
+
+    # GT basecolor and geo from dataset
+    gt_basecolor_np = batch["basecolor"][:bsz].detach().cpu().numpy() if "basecolor" in batch else None
+    gt_geo_np = batch["geo_gt"][:bsz].detach().cpu().numpy() if "geo_gt" in batch else None
+
+    # Render basecolor from predicted mesh + texture
+    render_bc_np = None
+    if mesh_texture_pred is not None and _NVDIFFRAST_AVAILABLE:
+        try:
+            render_bc, render_bc_cov = render_mesh_texture_to_image(
+                model_ref, mesh_pred, mesh_texture_pred,
+                out_h=out_h, out_w=out_w, use_pred_depth=True,
+            )
+            if render_bc is not None:
+                render_bc_np = (render_bc * render_bc_cov).detach().cpu().numpy()
+        except Exception:
+            pass
+
+    # Render geo from predicted mesh + static geo atlas
+    render_geo_np = None
+    if hasattr(model_ref, "geo_feature_atlas") and _NVDIFFRAST_AVAILABLE:
+        try:
+            geo_texture = model_ref.geo_feature_atlas.unsqueeze(0).expand(bsz, -1, -1, -1).contiguous()
+            geo_texture_rs = F.interpolate(geo_texture, size=(out_h, out_w), mode="bilinear", align_corners=False)
+            render_geo, render_geo_cov = render_mesh_texture_to_image(
+                model_ref, mesh_pred, geo_texture_rs,
+                out_h=out_h, out_w=out_w, use_pred_depth=True,
+            )
+            if render_geo is not None:
+                render_geo_np = (render_geo * render_geo_cov).detach().cpu().numpy()
+        except Exception:
+            pass
+
+    # Render face mask to screen space
+    render_mask_np = None
+    if real_face_mask_texture is not None and _NVDIFFRAST_AVAILABLE:
+        try:
+            mask_tex = real_face_mask_texture.expand(bsz, -1, -1, -1).contiguous()
+            render_mask, render_mask_cov = render_mesh_texture_to_image(
+                model_ref, mesh_pred, mask_tex,
+                out_h=out_h, out_w=out_w, use_pred_depth=True, antialias=False,
+            )
+            if render_mask is not None:
+                r_ch = render_mask[:, 0:1].detach()
+                g_ch = render_mask[:, 1:2].detach()
+                cov1 = render_mask_cov[:, :1]
+                is_red = (r_ch > 0.3) & (g_ch < 0.3) & (cov1 > 0)
+                is_green = (g_ch > 0.3) & (r_ch < 0.3) & (cov1 > 0)
+                red_expanded = F.max_pool2d(is_red.float(), kernel_size=21, stride=1, padding=10)
+                green_expanded = F.max_pool2d(is_green.float(), kernel_size=5, stride=1, padding=2)
+                fm = 1.0 - (red_expanded + green_expanded).clamp(0.0, 1.0)
+                render_mask_np = fm.cpu().numpy()
+        except Exception:
+            pass
+
+    def _to_hwc(arr):
+        """Convert [C, H, W] float to [H, W, 3] uint8."""
+        img = np.clip(np.transpose(arr, (1, 2, 0))[:, :, :3], 0.0, 1.0)
+        return (img * 255.0).astype(np.uint8)
+
+    def _diff_map(a, b):
+        """Absolute diff, amplified x3 for visibility."""
+        d = np.abs(a.astype(np.float32) / 255.0 - b.astype(np.float32) / 255.0) * 3.0
+        return (np.clip(d, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    def _placeholder(h, w):
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
+    rows = []
+    for i in range(bsz):
+        h, w = out_h, out_w
+        input_img = _to_hwc(rgb_np[i])
+
+        # Face mask for this sample (HxW float, 0..1)
+        if render_mask_np is not None:
+            mask_gray = np.clip(render_mask_np[i, 0], 0.0, 1.0)
+            mask_rgb = np.stack([mask_gray] * 3, axis=-1)
+            mask_img = (mask_rgb * 255.0).astype(np.uint8)
+        else:
+            mask_gray = None
+            mask_img = _placeholder(h, w)
+
+        # Basecolor row: gt | rendered | diff
+        gt_bc = _to_hwc(gt_basecolor_np[i]) if gt_basecolor_np is not None else _placeholder(h, w)
+        rd_bc = _to_hwc(render_bc_np[i]) if render_bc_np is not None else _placeholder(h, w)
+        bc_diff = _diff_map(gt_bc, rd_bc) if (gt_basecolor_np is not None and render_bc_np is not None) else _placeholder(h, w)
+        if mask_gray is not None:
+            bc_diff = (bc_diff.astype(np.float32) * mask_rgb).astype(np.uint8)
+
+        # Geo row: gt | rendered | diff
+        gt_geo = _to_hwc(gt_geo_np[i]) if gt_geo_np is not None else _placeholder(h, w)
+        rd_geo = _to_hwc(render_geo_np[i]) if render_geo_np is not None else _placeholder(h, w)
+        geo_diff = _diff_map(gt_geo, rd_geo) if (gt_geo_np is not None and render_geo_np is not None) else _placeholder(h, w)
+        if mask_gray is not None:
+            geo_diff = (geo_diff.astype(np.float32) * mask_rgb).astype(np.uint8)
+
+        # Build grid: 2 rows x 5 cols
+        # Row 1: input | gt_basecolor | rendered_basecolor | basecolor_diff | face_mask
+        # Row 2: input | gt_geo       | rendered_geo       | geo_diff       | face_mask
+        row_bc = np.concatenate([input_img, gt_bc, rd_bc, bc_diff, mask_img], axis=1)
+        row_geo = np.concatenate([input_img, gt_geo, rd_geo, geo_diff, mask_img], axis=1)
+        sample_grid = np.concatenate([row_bc, row_geo], axis=0)
+        rows.append(sample_grid)
+
+    if rows:
+        canvas = np.concatenate(rows, axis=0)
+        out_path = os.path.join(output_dir, f"test_e{epoch + 1:03d}_s{step:05d}.png")
+        _cv2.imwrite(out_path, _cv2.cvtColor(canvas, _cv2.COLOR_RGB2BGR))
+        print(f"[TestMode] Saved preview: {out_path}")
+
 
 def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainConfig):
     model = built["model"]
@@ -849,6 +1115,8 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
     simdr_kl_layer_mask = built["simdr_kl_layer_mask"]
     landmark_mask_weights_tensor = built["landmark_mask_weights_tensor"]
     mesh_mask_weights_tensor = built["mesh_mask_weights_tensor"]
+    mesh_smooth_loss_fn = built.get("mesh_smooth_loss_fn", None)
+    real_face_mask_texture = built.get("real_face_mask_texture", None)
 
     train_loader = prepared["train_loader"]
     train_sampler = prepared["train_sampler"]
@@ -857,6 +1125,16 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
     train_sampler.set_epoch(epoch)
     model.train()
     model_ref = _unwrap_model(model)
+
+    # real_data_{geo,basecolor}_start_epoch count from the loaded/resume epoch
+    start_epoch = built["start_epoch"]
+    epochs_since_load = epoch - start_epoch  # 0-based count since resume
+
+    if rank == 0:
+        geo_start = int(train_cfg.real_data_geo_start_epoch)
+        bc_start = int(train_cfg.real_data_basecolor_start_epoch)
+        print(f"[Epoch {epoch + 1}] epochs_since_load={epochs_since_load}, "
+              f"real_data_geo_start={geo_start}, real_data_basecolor_start={bc_start}")
 
     if model_cfg.model_type == "simdr" and hasattr(model_ref, "set_deformable_offset_scale"):
         if model_cfg.use_deformable_attention and train_cfg.deformable_offset_warmup_epochs > 0:
@@ -929,6 +1207,10 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
 
         lm_batch_weights = _build_batch_weights(batch, "landmark_weights", model_cfg.model_type, device)
         mesh_batch_weights = _build_batch_weights(batch, "mesh_weights", model_cfg.model_type, device)
+        lm_found_mask = _build_batch_weights(batch, "landmark_found_mask", model_cfg.model_type, device)
+        mesh_found_mask = _build_batch_weights(batch, "mesh_found_mask", model_cfg.model_type, device)
+        lm_batch_weights = _merge_batch_weight_masks(lm_batch_weights, lm_found_mask)
+        mesh_batch_weights = _merge_batch_weight_masks(mesh_batch_weights, mesh_found_mask)
         
         # Check if all weights are zero
         if lm_batch_weights is not None:
@@ -942,25 +1224,22 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
 
         # Split mixed batches into synthetic-vs-real supervision paths.
         # Synthetic: GT mesh/landmark loss plus UV texture loss on the de-duplicated topology.
-        # Real: restore predicted mesh back to full topology for texture rendering/image losses.
-        synthetic_sample_mask = None
-        real_sample_mask = None
-        if "image_path" in batch and hasattr(data_cfg, 'synthetic_data_roots') and data_cfg.synthetic_data_roots:
-            synthetic_roots = set(os.path.normpath(r) for r in data_cfg.synthetic_data_roots)
-            synthetic_sample_mask = torch.zeros((rgb.shape[0],), dtype=torch.bool, device=device)
-            real_sample_mask = torch.zeros((rgb.shape[0],), dtype=torch.bool, device=device)
-            for i, path in enumerate(batch["image_path"]):
-                path_normalized = os.path.normpath(path)
-                is_synthetic = any(path_normalized.startswith(root) for root in synthetic_roots)
-                synthetic_sample_mask[i] = bool(is_synthetic)
-
-                # Real data: zero out GT geometry losses and keep render/image supervision only.
-                if not is_synthetic:
-                    real_sample_mask[i] = True
-                    if lm_batch_weights is not None:
-                        lm_batch_weights[i] = 0.0
-                    if mesh_batch_weights is not None:
-                        mesh_batch_weights[i] = 0.0
+        # Real: render/image supervision only (no GT geometry or UV texture-space loss).
+        synthetic_sample_mask, real_sample_mask = _build_domain_masks(
+            batch,
+            getattr(data_cfg, "synthetic_data_roots", None),
+            device,
+        )
+        if real_sample_mask is not None and bool(real_sample_mask.any().item()):
+            if lm_batch_weights is not None:
+                lm_batch_weights = lm_batch_weights.clone()
+                lm_batch_weights[real_sample_mask] = 0.0
+            if mesh_batch_weights is not None:
+                mesh_batch_weights = mesh_batch_weights.clone()
+                mesh_batch_weights[real_sample_mask] = 0.0
+            if mesh_texture_valid is not None:
+                mesh_texture_valid = mesh_texture_valid.clone()
+                mesh_texture_valid[real_sample_mask] = 0.0
 
         # Synthetic data still keeps UV texture supervision; skip only screen-space basecolor/geo render losses.
         if synthetic_sample_mask is not None and bool(synthetic_sample_mask.any().item()):
@@ -972,22 +1251,41 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                 geo_valid[synthetic_sample_mask] = 0.0
 
         # Delay real-data training (render/texture supervision) until configured epoch.
-        # Uses 1-based epoch semantics: with start=10, real data starts at epoch 11.
-        if (
-            real_sample_mask is not None
-            and bool(real_sample_mask.any().item())
-            and int(train_cfg.real_data_start_epoch) > 0
-            and int(epoch + 1) <= int(train_cfg.real_data_start_epoch)
-        ):
-            if mesh_texture_valid is not None:
-                mesh_texture_valid = mesh_texture_valid.clone()
-                mesh_texture_valid[real_sample_mask] = 0.0
+        # start_epoch counts are relative to resume epoch (epochs_since_load).
+        _REAL_WARMUP_SCHEDULE = [0.01, 0.03, 0.1, 0.2, 0.4, 0.6]
+
+        def _real_data_warmup_weight(start_ep):
+            """Compute warmup weight for a real-data channel given its start epoch offset."""
+            if start_ep <= 0:
+                return 1.0
+            if epochs_since_load < start_ep:
+                return 0.0
+            es = epochs_since_load - start_ep + 1
+            if es <= len(_REAL_WARMUP_SCHEDULE):
+                return _REAL_WARMUP_SCHEDULE[es - 1]
+            return _REAL_WARMUP_SCHEDULE[-1]
+
+        geo_start = int(train_cfg.real_data_geo_start_epoch)
+        bc_start = int(train_cfg.real_data_basecolor_start_epoch)
+
+        if real_sample_mask is not None and bool(real_sample_mask.any().item()) and (geo_start > 0 or bc_start > 0):
+            geo_warmup = _real_data_warmup_weight(geo_start)
+            bc_warmup = _real_data_warmup_weight(bc_start)
+            if num_batches == 0 and rank == 0:
+                print(f"[Info] Real data warmup scale: geo={geo_warmup:.3f}, basecolor={bc_warmup:.3f} "
+                      f"(epochs_since_load={epochs_since_load}, geo_start={geo_start}, bc_start={bc_start})")
             if basecolor_valid is not None:
                 basecolor_valid = basecolor_valid.clone()
-                basecolor_valid[real_sample_mask] = 0.0
+                if bc_warmup <= 0:
+                    basecolor_valid[real_sample_mask] = 0.0
+                else:
+                    basecolor_valid[real_sample_mask] *= float(bc_warmup)
             if geo_valid is not None:
                 geo_valid = geo_valid.clone()
-                geo_valid[real_sample_mask] = 0.0
+                if geo_warmup <= 0:
+                    geo_valid[real_sample_mask] = 0.0
+                else:
+                    geo_valid[real_sample_mask] *= float(geo_warmup)
 
         if landmark_mask_weights_tensor is not None and "image_path" in batch:
             if lm_batch_weights is None:
@@ -1035,12 +1333,24 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                     if model_cfg.model_type == "simdr":
                         lm_err = (lm_pred - lm_gt).abs()
                         mesh_err = (mesh_pred - mesh_gt).abs()
+                        lm_metric_weights = lm_batch_weights if lm_batch_weights is not None else torch.ones_like(lm_err)
+                        mesh_metric_weights = mesh_batch_weights if mesh_batch_weights is not None else torch.ones_like(mesh_err)
                     else:
                         lm_err = (lm_pred.view(rgb.shape[0], -1, 6) - lm_gt.view(rgb.shape[0], -1, 6)).abs()
                         mesh_err = (mesh_pred.view(rgb.shape[0], -1, 6) - mesh_gt.view(rgb.shape[0], -1, 6)).abs()
+                        lm_metric_weights = lm_batch_weights.view(rgb.shape[0], -1, 6) if lm_batch_weights is not None else torch.ones_like(lm_err)
+                        mesh_metric_weights = mesh_batch_weights.view(rgb.shape[0], -1, 6) if mesh_batch_weights is not None else torch.ones_like(mesh_err)
 
-                    train_metrics.update_sum_count("train_3d", lm_err[..., :3].sum() + mesh_err[..., :3].sum(), lm_err[..., :3].numel() + mesh_err[..., :3].numel())
-                    train_metrics.update_sum_count("train_2d", lm_err[..., 3:5].sum() + mesh_err[..., 3:5].sum(), lm_err[..., 3:5].numel() + mesh_err[..., 3:5].numel())
+                    train_metrics.update_sum_count(
+                        "train_3d",
+                        (lm_err[..., :3] * lm_metric_weights[..., :3]).sum() + (mesh_err[..., :3] * mesh_metric_weights[..., :3]).sum(),
+                        lm_metric_weights[..., :3].sum() + mesh_metric_weights[..., :3].sum(),
+                    )
+                    train_metrics.update_sum_count(
+                        "train_2d",
+                        (lm_err[..., 3:5] * lm_metric_weights[..., 3:5]).sum() + (mesh_err[..., 3:5] * mesh_metric_weights[..., 3:5]).sum(),
+                        lm_metric_weights[..., 3:5].sum() + mesh_metric_weights[..., 3:5].sum(),
+                    )
 
             if model_cfg.model_type == "simdr":
                 lm_l1 = compute_weighted_l1(lm_pred, lm_gt, lm_batch_weights)
@@ -1077,6 +1387,23 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                 
                 layer_total = lm_l1 + mesh_l1
 
+            if mesh_smooth_loss_fn is not None and layer_idx == (model_cfg.num_layers - 1):
+                mesh_pred_6d = mesh_pred if mesh_pred.ndim == 3 else mesh_pred.view(rgb.shape[0], -1, 6)
+                s3d, s2d, sdepth = mesh_smooth_loss_fn(mesh_pred_6d.float())
+                smooth_lambda = float(train_cfg.mesh_smoothness_lambda)
+                if smooth_lambda > 0 and torch.isfinite(s3d):
+                    smooth_3d_total = smooth_lambda * s3d
+                    layer_total = layer_total + smooth_3d_total
+                    train_metrics.update_sum_count("smooth_3d", smooth_3d_total.detach(), 1.0)
+                if smooth_lambda > 0 and torch.isfinite(s2d):
+                    smooth_2d_total = smooth_lambda * s2d
+                    layer_total = layer_total + smooth_2d_total
+                    train_metrics.update_sum_count("smooth_2d", smooth_2d_total.detach(), 1.0)
+                if smooth_lambda > 0 and torch.isfinite(sdepth):
+                    smooth_depth_total = smooth_lambda * sdepth
+                    layer_total = layer_total + smooth_depth_total
+                    train_metrics.update_sum_count("smooth_depth", smooth_depth_total.detach(), 1.0)
+
             if mesh_texture_pred is not None:
                 if mesh_texture_gt is not None:
                     tex_weights = mesh_texture_loss_weights
@@ -1106,21 +1433,50 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                 else:
                     layer_total = layer_total + torch.zeros((), device=layer_total.device, dtype=layer_total.dtype)
 
+                # Render face mask to screen space for masking neck/back of head
+                rendered_face_mask = None
+                if real_face_mask_texture is not None and mesh_pred is not None:
+                    mask_tex = real_face_mask_texture.expand(mesh_pred.shape[0], -1, -1, -1).contiguous()
+                    rendered_face_mask_raw, face_mask_cov = render_mesh_texture_to_image(
+                        model_ref, mesh_pred, mask_tex,
+                        out_h=256, out_w=256, use_pred_depth=True, antialias=False,
+                    )
+                    if rendered_face_mask_raw is not None:
+                        # Rendered mask has RGB channels: R=back-of-head, G=neck, B=~0
+                        # Detect red (back-of-head) and green (neck) regions
+                        r_ch = rendered_face_mask_raw[:, 0:1].detach()  # red channel
+                        g_ch = rendered_face_mask_raw[:, 1:2].detach()  # green channel
+                        cov1 = face_mask_cov[:, :1]
+                        is_red = (r_ch > 0.3) & (g_ch < 0.3) & (cov1 > 0)    # back of head
+                        is_green = (g_ch > 0.3) & (r_ch < 0.3) & (cov1 > 0)   # neck
+                        # Expand red area by 10 pixels, green area by 1 pixel
+                        red_expanded = F.max_pool2d(is_red.float(), kernel_size=21, stride=1, padding=10)
+                        green_expanded = F.max_pool2d(is_green.float(), kernel_size=5, stride=1, padding=2)
+                        # Mask = 1 (keep) everywhere except expanded red/green areas
+                        rendered_face_mask = 1.0 - (red_expanded + green_expanded).clamp(0.0, 1.0)
+
                 if basecolor_gt is not None and mesh_texture_pred is not None and train_cfg.basecolor_render_l1_lambda > 0:
+                    # Render at 256 (internally 512 with 2x AA), compare at 256
+                    bc_loss_h = basecolor_gt.shape[-2] // 2
+                    bc_loss_w = basecolor_gt.shape[-1] // 2
                     render_pred, render_cov = render_mesh_texture_to_image(
                         model_ref,
                         mesh_pred,
                         mesh_texture_pred,
-                        out_h=basecolor_gt.shape[-2],
-                        out_w=basecolor_gt.shape[-1],
+                        out_h=bc_loss_h,
+                        out_w=bc_loss_w,
                         use_pred_depth=True,
                     )
                     if render_pred is not None:
+                        basecolor_gt_ds = F.interpolate(basecolor_gt, size=(bc_loss_h, bc_loss_w), mode="bilinear", align_corners=False)
                         bc_weights = render_cov
+                        if rendered_face_mask is not None:
+                            fm = F.interpolate(rendered_face_mask, size=(bc_loss_h, bc_loss_w), mode="bilinear", align_corners=False)
+                            bc_weights = bc_weights * fm
                         if basecolor_valid is not None:
                             bc_weights = bc_weights * basecolor_valid.view(-1, 1, 1, 1).to(device=render_pred.device, dtype=render_pred.dtype)
                         if bc_weights.sum().detach().item() > 0:
-                            bc_l1 = compute_weighted_l1(render_pred.float(), basecolor_gt.float(), bc_weights.expand_as(render_pred))
+                            bc_l1 = compute_weighted_l1(render_pred.float(), basecolor_gt_ds.float(), bc_weights.expand_as(render_pred))
                             if torch.isfinite(bc_l1):
                                 layer_total = layer_total + train_cfg.basecolor_render_l1_lambda * bc_l1
                                 if layer_idx == (model_cfg.num_layers - 1):
@@ -1129,24 +1485,31 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                 # Normal render loss — direct screen-space interpolation of vertex normals
                 # Geo render loss (static UV-map texture rendered via predicted mesh UVs)
                 if geo_gt is not None and mesh_pred is not None and train_cfg.geo_render_l1_lambda > 0:
+                    # Render at 256 (internally 512 with 2x AA), compare at 256
+                    geo_loss_h = geo_gt.shape[-2] // 2
+                    geo_loss_w = geo_gt.shape[-1] // 2
                     geo_texture = model_ref.geo_feature_atlas.unsqueeze(0).expand(mesh_pred.shape[0], -1, -1, -1).contiguous()
                     geo_texture_rs = F.interpolate(
                         geo_texture,
-                        size=(geo_gt.shape[-2], geo_gt.shape[-1]),
+                        size=(geo_loss_h, geo_loss_w),
                         mode="bilinear",
                         align_corners=False,
                     )
                     render_geo, render_geo_cov = render_mesh_texture_to_image(
                         model_ref, mesh_pred, geo_texture_rs,
-                        out_h=geo_gt.shape[-2], out_w=geo_gt.shape[-1],
+                        out_h=geo_loss_h, out_w=geo_loss_w,
                         use_pred_depth=True,
                     )
                     if render_geo is not None:
+                        geo_gt_ds = F.interpolate(geo_gt, size=(geo_loss_h, geo_loss_w), mode="bilinear", align_corners=False)
                         g_w = render_geo_cov
+                        if rendered_face_mask is not None:
+                            fm = F.interpolate(rendered_face_mask, size=(geo_loss_h, geo_loss_w), mode="bilinear", align_corners=False)
+                            g_w = g_w * fm
                         if geo_valid is not None:
                             g_w = g_w * geo_valid.view(-1, 1, 1, 1).to(device=render_geo.device, dtype=render_geo.dtype)
                         if g_w.sum().detach().item() > 0:
-                            g_l1 = compute_weighted_l1(render_geo.float(), geo_gt.float(), g_w.expand_as(render_geo))
+                            g_l1 = compute_weighted_l1(render_geo.float(), geo_gt_ds.float(), g_w.expand_as(render_geo))
                             if torch.isfinite(g_l1):
                                 layer_total = layer_total + train_cfg.geo_render_l1_lambda * g_l1
                                 if layer_idx == (model_cfg.num_layers - 1):
@@ -1157,6 +1520,30 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
         if model_cfg.model_type == "simdr" and batch_oob_count > 0:
             train_oob_sum += batch_oob_sum
             train_oob_count += float(batch_oob_count)
+
+        # Test mode: save preview grids for real samples every N steps
+        if (
+            train_cfg.test_mode
+            and rank == 0
+            and real_sample_mask is not None
+            and bool(real_sample_mask.any().item())
+            and num_batches % train_cfg.test_preview_every == 0
+        ):
+            final_output = outputs_list[-1]
+            test_mesh_pred = final_output["mesh"].float()
+            if test_mesh_pred.ndim == 2:
+                test_mesh_pred = test_mesh_pred.view(rgb.shape[0], -1, 6)
+            test_tex_pred = final_output.get("mesh_texture", None)
+            with torch.no_grad():
+                _save_test_preview(
+                    epoch=epoch,
+                    step=num_batches,
+                    batch=batch,
+                    model_ref=model_ref,
+                    mesh_pred=test_mesh_pred.detach(),
+                    mesh_texture_pred=test_tex_pred.detach() if test_tex_pred is not None else None,
+                    real_face_mask_texture=real_face_mask_texture,
+                )
 
         # Check for NaN/inf before backward.
         # Important for DDP: if any rank sees non-finite loss, all ranks must follow
@@ -1172,14 +1559,7 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                 print(f"  Loss value: {loss.item()}")
                 if "image_path" in batch:
                     print(f"  Sample paths: {batch['image_path'][:2]}")
-            safe_loss = torch.nan_to_num(loss.float(), nan=0.0, posinf=0.0, neginf=0.0)
-            if scaler.is_enabled():
-                scaler.scale(safe_loss).backward()
-                optimizer.zero_grad(set_to_none=True)
-                scaler.update()
-            else:
-                safe_loss.backward()
-                optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
             continue
 
         if scaler.is_enabled():
@@ -1202,11 +1582,13 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
                 postfix_dict["3D"] = f"{train_metrics.mean('train_3d'):.5f}"
             if train_metrics.has("train_2d"):
                 train_2d_px = train_metrics.mean("train_2d") * 1024.0
-                postfix_dict["2D_px"] = f"{train_2d_px:.2f}"
+                postfix_dict["px"] = f"{train_2d_px:.2f}"
             if train_metrics.has("mesh_texture_l1"):
                 postfix_dict["tex"] = f"{train_metrics.mean('mesh_texture_l1'):.4f}"
             if train_metrics.has("basecolor_render_l1"):
-                postfix_dict["basecolor"] = f"{train_metrics.mean('basecolor_render_l1'):.4f}"
+                postfix_dict["bc"] = f"{train_metrics.mean('basecolor_render_l1'):.4f}"
+            if train_metrics.has("geo_render_l1"):
+                postfix_dict["geo"] = f"{train_metrics.mean('geo_render_l1'):.4f}"
             pbar.set_postfix(postfix_dict)
 
     if world_size > 1:
@@ -1224,6 +1606,10 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
         train_metrics.get_count("mesh_texture_l1"),
         train_metrics.get_sum("basecolor_render_l1"),
         train_metrics.get_count("basecolor_render_l1"),
+        train_metrics.get_sum("smooth_3d"),
+        train_metrics.get_count("smooth_3d"),
+        train_metrics.get_sum("smooth_2d"),
+        train_metrics.get_count("smooth_2d"),
     ], device=device, dtype=torch.float32)
     if world_size > 1:
         dist.all_reduce(train_metric_tensor, op=dist.ReduceOp.SUM)
@@ -1232,12 +1618,16 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
     train_2d_sum, train_2d_count = train_metric_tensor[2].item(), train_metric_tensor[3].item()
     train_tex_sum, train_tex_count = train_metric_tensor[4].item(), train_metric_tensor[5].item()
     train_bc_sum, train_bc_count = train_metric_tensor[6].item(), train_metric_tensor[7].item()
+    train_s3d_sum, train_s3d_count = train_metric_tensor[8].item(), train_metric_tensor[9].item()
+    train_s2d_sum, train_s2d_count = train_metric_tensor[10].item(), train_metric_tensor[11].item()
 
     avg_train_3d_error = train_3d_sum / max(train_3d_count, 1e-6) if train_3d_count > 0 else None
     avg_train_2d_error = train_2d_sum / max(train_2d_count, 1e-6) if train_2d_count > 0 else None
     avg_train_2d_pixel_error = avg_train_2d_error * 1024.0 if avg_train_2d_error is not None else None
     avg_train_mesh_texture_l1 = train_tex_sum / max(train_tex_count, 1e-6) if train_tex_count > 0 else None
     avg_train_basecolor_render_l1 = train_bc_sum / max(train_bc_count, 1e-6) if train_bc_count > 0 else None
+    avg_train_smooth_3d = train_s3d_sum / max(train_s3d_count, 1e-6) if train_s3d_count > 0 else None
+    avg_train_smooth_2d = train_s2d_sum / max(train_s2d_count, 1e-6) if train_s2d_count > 0 else None
 
     simdr_oob_avg = None
     if model_cfg.model_type == "simdr":
@@ -1253,6 +1643,8 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, prepared, built, dat
         "avg_train_2d_pixel_error": avg_train_2d_pixel_error,
         "avg_train_mesh_texture_l1": avg_train_mesh_texture_l1,
         "avg_train_basecolor_render_l1": avg_train_basecolor_render_l1,
+        "avg_train_smooth_3d": avg_train_smooth_3d,
+        "avg_train_smooth_2d": avg_train_smooth_2d,
         "simdr_oob_avg": simdr_oob_avg,
         "visualization_batch": visualization_batch,
     }
@@ -1263,6 +1655,7 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
     criterion_val = built["criterion_val"]
     landmark_mask_weights_tensor = built["landmark_mask_weights_tensor"]
     mesh_mask_weights_tensor = built["mesh_mask_weights_tensor"]
+    real_face_mask_texture = built.get("real_face_mask_texture", None)
 
     val_loader = prepared["val_loader"]
     device = torch.device(f"cuda:{rank}")
@@ -1313,6 +1706,19 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
 
             lm_batch_weights = _build_batch_weights(batch, "landmark_weights", model_cfg.model_type, device)
             mesh_batch_weights = _build_batch_weights(batch, "mesh_weights", model_cfg.model_type, device)
+            lm_found_mask = _build_batch_weights(batch, "landmark_found_mask", model_cfg.model_type, device)
+            mesh_found_mask = _build_batch_weights(batch, "mesh_found_mask", model_cfg.model_type, device)
+            lm_batch_weights = _merge_batch_weight_masks(lm_batch_weights, lm_found_mask)
+            mesh_batch_weights = _merge_batch_weight_masks(mesh_batch_weights, mesh_found_mask)
+            synthetic_sample_mask, real_sample_mask = _build_domain_masks(
+                batch,
+                prepared.get("synthetic_data_roots"),
+                device,
+            )
+
+            if real_sample_mask is not None and bool(real_sample_mask.any().item()) and mesh_texture_valid is not None:
+                mesh_texture_valid = mesh_texture_valid.clone()
+                mesh_texture_valid[real_sample_mask] = 0.0
 
             if landmark_mask_weights_tensor is not None and "image_path" in batch:
                 if lm_batch_weights is None:
@@ -1367,23 +1773,37 @@ def validate_one_epoch(rank: int, world_size: int, prepared, built, model_cfg: M
 
             if mesh_texture_pred is not None and basecolor_gt is not None:
                 model_ref = _unwrap_model(model)
-                # Use predicted depth from model (6th dimension)
+                # Render at 256 (internally 512 with 2x AA), compare at 256
+                val_bc_h = basecolor_gt.shape[-2] // 2
+                val_bc_w = basecolor_gt.shape[-1] // 2
                 render_pred, render_cov = render_mesh_texture_to_image(
                     model_ref,
                     mesh_pred,
                     mesh_texture_pred,
-                    out_h=basecolor_gt.shape[-2],
-                    out_w=basecolor_gt.shape[-1],
+                    out_h=val_bc_h,
+                    out_w=val_bc_w,
                     use_pred_depth=True,
                 )
                 if render_pred is not None:
+                    basecolor_gt_ds = F.interpolate(basecolor_gt, size=(val_bc_h, val_bc_w), mode="bilinear", align_corners=False)
                     bc_weights = render_cov
+                    if real_face_mask_texture is not None:
+                        mask_tex = real_face_mask_texture.expand(mesh_pred.shape[0], -1, -1, -1).contiguous()
+                        rendered_mask_raw, _ = render_mesh_texture_to_image(
+                            model_ref, mesh_pred, mask_tex,
+                            out_h=val_bc_h, out_w=val_bc_w, use_pred_depth=True,
+                        )
+                        if rendered_mask_raw is not None:
+                            fm = rendered_mask_raw[:, :1].detach()
+                            if fm.shape[-2] != val_bc_h or fm.shape[-1] != val_bc_w:
+                                fm = F.interpolate(fm, size=(val_bc_h, val_bc_w), mode="bilinear", align_corners=False)
+                            bc_weights = bc_weights * fm
                     if basecolor_valid is not None:
                         bc_weights = bc_weights * basecolor_valid.view(-1, 1, 1, 1).to(device=render_pred.device, dtype=render_pred.dtype)
                     denom = bc_weights.sum()
                     if denom.detach().item() > 0:
                         bc_weights_3 = bc_weights.expand_as(render_pred)
-                        bc_l1 = compute_weighted_l1(render_pred.float(), basecolor_gt.float(), bc_weights_3)
+                        bc_l1 = compute_weighted_l1(render_pred.float(), basecolor_gt_ds.float(), bc_weights_3)
                         if torch.isfinite(bc_l1):
                             val_metrics.update_sum_count("val_basecolor_render_l1", bc_l1, 1.0)
                             loss = loss + train_cfg.basecolor_render_l1_lambda * bc_l1
@@ -1474,6 +1894,10 @@ def log_and_checkpoint(epoch: int, rank: int, built, prepared, train_out, val_ou
             writer.add_scalar("Loss/BasecolorRender_Train_L1", train_out["avg_train_basecolor_render_l1"], epoch)
         if val_out.get("avg_val_basecolor_render_l1") is not None:
             writer.add_scalar("Loss/BasecolorRender_Val_L1", val_out["avg_val_basecolor_render_l1"], epoch)
+        if train_out.get("avg_train_smooth_3d") is not None:
+            writer.add_scalar("Loss/Smooth3D_Train", train_out["avg_train_smooth_3d"], epoch)
+        if train_out.get("avg_train_smooth_2d") is not None:
+            writer.add_scalar("Loss/Smooth2D_Train", train_out["avg_train_smooth_2d"], epoch)
         if val_out["avg_val_3d_error"] is not None:
             writer.add_scalar("Metrics/Val_3D_Error", val_out["avg_val_3d_error"], epoch)
         if val_out["avg_val_2d_pixel_error"] is not None:
@@ -1482,20 +1906,24 @@ def log_and_checkpoint(epoch: int, rank: int, built, prepared, train_out, val_ou
         writer.add_scalar("LR/backbone", optimizer.param_groups[0]["lr"], epoch)
         writer.add_scalar("LR/head", optimizer.param_groups[2]["lr"], epoch)
 
+    # Always save latest checkpoint (with full training state)
+    filename = "best_geometry_transformer_dim6.pth"
+    save_dict = {
+        "epoch": epoch,
+        "model_state_dict": _unwrap_model(model).state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": built["scheduler"].state_dict(),
+        "scaler_state_dict": built["scaler"].state_dict(),
+        "val_loss": val_out["avg_val_loss"],
+        "best_loss": built["best_loss"],
+        "output_dim": 6,
+    }
     if val_out["avg_val_loss"] < built["best_loss"]:
         built["best_loss"] = val_out["avg_val_loss"]
-        filename = "best_geometry_transformer_dim6.pth"
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": _unwrap_model(model).state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_out["avg_val_loss"],
-                "output_dim": 6,
-            },
-            filename,
-        )
-        print(f"Saved best model to {filename} (Val Loss: {val_out['avg_val_loss']:.6f})")
+        save_dict["best_loss"] = built["best_loss"]
+        print(f"New best model (Val Loss: {val_out['avg_val_loss']:.6f})")
+    torch.save(save_dict, filename)
+    print(f"Saved checkpoint to {filename} (epoch {epoch + 1}, Val Loss: {val_out['avg_val_loss']:.6f})")
 
     if train_out["visualization_batch"] is not None and landmark_topology and mesh_topology:
         save_geometry_visualizations(
@@ -1533,17 +1961,19 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
     prepared["_all_train_loader"] = prepared["train_loader"]
     prepared["_all_train_sampler"] = prepared["train_sampler"]
 
-    for epoch in range(train_cfg.epochs):
-        # Swap loader: use synthetic-only before real_data_start_epoch
+    for epoch in range(built["start_epoch"], train_cfg.epochs):
+        # Swap loader: use synthetic-only before real data starts (use min of geo/basecolor start)
         syn_loader = prepared.get("synthetic_train_loader")
-        if syn_loader is not None and int(train_cfg.real_data_start_epoch) > 0:
-            if epoch < int(train_cfg.real_data_start_epoch):
-                if epoch == 0 and rank == 0:
-                    print(f"[Info] Using synthetic-only data for epochs 1–{train_cfg.real_data_start_epoch}")
+        real_data_start = min(int(train_cfg.real_data_geo_start_epoch), int(train_cfg.real_data_basecolor_start_epoch))
+        epochs_since_load = epoch - built["start_epoch"]
+        if syn_loader is not None and real_data_start > 0:
+            if epochs_since_load < real_data_start:
+                if epochs_since_load == 0 and rank == 0:
+                    print(f"[Info] Using synthetic-only data for first {real_data_start} epochs after resume")
                 prepared["train_loader"] = syn_loader
                 prepared["train_sampler"] = prepared["synthetic_train_sampler"]
             else:
-                if epoch == int(train_cfg.real_data_start_epoch) and rank == 0:
+                if epochs_since_load == real_data_start and rank == 0:
                     print(f"[Info] Epoch {epoch + 1}: switching to full dataset (real + synthetic)")
                 prepared["train_loader"] = prepared["_all_train_loader"]
                 prepared["train_sampler"] = prepared["_all_train_sampler"]
@@ -1561,7 +1991,7 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
 
 
 def launch_linux(args):
-    data_cfg, model_cfg, train_cfg = build_configs_from_args(args, platform_name="linux")
+    data_cfg, model_cfg, train_cfg = build_configs_from_args(args)
     world_size = torch.cuda.device_count()
     if world_size <= 0:
         raise RuntimeError("No CUDA devices found")
@@ -1570,7 +2000,7 @@ def launch_linux(args):
 
 
 def launch_windows(args):
-    data_cfg, model_cfg, train_cfg = build_configs_from_args(args, platform_name="windows")
+    data_cfg, model_cfg, train_cfg = build_configs_from_args(args)
     if torch.cuda.device_count() <= 0:
         raise RuntimeError("No CUDA devices found")
     print("Launching single-process training (windows/gloo)")

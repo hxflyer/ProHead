@@ -34,7 +34,7 @@ class Align5PtHelper:
             if lm_idx < 0 or lm_idx >= len(landmarks):
                 continue
             uv = landmarks[lm_idx, 3:5]
-            if not np.isfinite(uv).all():
+            if (not np.isfinite(uv).all()) or np.any(uv < 0.0):
                 continue
             px = np.array([uv[0] * float(w), uv[1] * float(h)], dtype=np.float32)
             pts[i] = px
@@ -47,7 +47,7 @@ class Align5PtHelper:
         if landmarks is None or len(landmarks) == 0:
             return None
         pts = landmarks[:, 3:5].astype(np.float32).copy()
-        finite = np.isfinite(pts).all(axis=1)
+        finite = np.isfinite(pts).all(axis=1) & np.all(pts >= 0.0, axis=1)
         if not finite.any():
             return None
         pts = pts[finite]
@@ -263,9 +263,12 @@ class Align5PtHelper:
             return None
         out = geom.copy()
         pts_px = out[:, 3:5].astype(np.float32).copy()
-        pts_px[:, 0] *= float(src_w)
-        pts_px[:, 1] *= float(src_h)
-        pts_px = self.transform_points_px(pts_px, m)
-        out[:, 3] = pts_px[:, 0] / float(self.image_size)
-        out[:, 4] = pts_px[:, 1] / float(self.image_size)
+        valid_mask = np.isfinite(pts_px).all(axis=1) & np.all(pts_px >= 0.0, axis=1)
+        if valid_mask.any():
+            pts_valid_px = pts_px[valid_mask]
+            pts_valid_px[:, 0] *= float(src_w)
+            pts_valid_px[:, 1] *= float(src_h)
+            pts_valid_px = self.transform_points_px(pts_valid_px, m)
+            out[valid_mask, 3] = pts_valid_px[:, 0] / float(self.image_size)
+            out[valid_mask, 4] = pts_valid_px[:, 1] / float(self.image_size)
         return out
