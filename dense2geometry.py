@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dense_image_transformer import DenseImageTransformer, PositionalEncoding2D
+from obj_load_helper import load_uv_obj_file
 from train_visualize_helper import load_combined_mesh_uv
 
 
@@ -42,9 +43,60 @@ def _sample_texture_at_uv(texture_chw: torch.Tensor, uv: np.ndarray, device: tor
     return samples.squeeze(0).squeeze(-1).transpose(0, 1).contiguous()
 
 
-def _load_filtered_template_mesh(model_dir: str = "model") -> tuple[np.ndarray, np.ndarray]:
+def _load_combined_mesh_triangle_faces(model_dir: str = "model") -> np.ndarray:
+    part_files = [
+        "mesh_head.obj",
+        "mesh_eye_l.obj",
+        "mesh_eye_r.obj",
+        "mesh_mouth.obj",
+    ]
+    tris = []
+    offset = 0
+    for file_name in part_files:
+        obj_path = os.path.join(model_dir, file_name)
+        verts, uvs, _, v_faces, _, _ = load_uv_obj_file(obj_path, triangulate=True)
+        if verts is None or uvs is None or v_faces is None:
+            raise ValueError(f"Failed to load verts/uv/faces from {obj_path}")
+        tris.append(np.asarray(v_faces, dtype=np.int32) + int(offset))
+        offset += int(len(verts))
+    return np.concatenate(tris, axis=0).astype(np.int32, copy=False)
+
+
+def _remap_triangle_faces_after_vertex_filter(
+    triangle_faces: np.ndarray,
+    kept_vertex_indices: np.ndarray,
+    original_vertex_count: int,
+    vertex_positions: np.ndarray | None = None,
+) -> np.ndarray:
+    tri = np.asarray(triangle_faces, dtype=np.int64)
+    if tri.size == 0:
+        return np.zeros((0, 3), dtype=np.int32)
+
+    kept = np.asarray(kept_vertex_indices, dtype=np.int64)
+    remap = np.full((int(original_vertex_count),), -1, dtype=np.int64)
+    remap[kept] = np.arange(kept.shape[0], dtype=np.int64)
+
+    all_indices = np.arange(int(original_vertex_count), dtype=np.int64)
+    filtered = all_indices[remap < 0]
+    if filtered.size > 0:
+        if vertex_positions is not None and vertex_positions.shape[0] == int(original_vertex_count):
+            pos = np.asarray(vertex_positions, dtype=np.float32)
+            kept_pos = pos[kept]
+            filt_pos = pos[filtered]
+            diff = filt_pos[:, None, :] - kept_pos[None, :, :]
+            nn_idx = (diff * diff).sum(axis=-1).argmin(axis=-1)
+        else:
+            nn_idx = np.searchsorted(kept, filtered).clip(0, kept.shape[0] - 1)
+        remap[filtered] = nn_idx
+
+    return remap[tri].astype(np.int32, copy=False)
+
+
+def _load_filtered_template_mesh(model_dir: str = "model") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     template_mesh = np.load(os.path.join(model_dir, "mesh_template.npy")).astype(np.float32)
     template_mesh_uv = load_combined_mesh_uv(model_dir=model_dir, copy=True).astype(np.float32, copy=False)
+    template_mesh_faces = _load_combined_mesh_triangle_faces(model_dir=model_dir)
+    template_mesh_full = template_mesh.copy()
     mesh_indices_path = os.path.join(model_dir, "mesh_indices.npy")
     if os.path.exists(mesh_indices_path):
         mesh_indices = np.load(mesh_indices_path).astype(np.int64, copy=False)
@@ -52,7 +104,39 @@ def _load_filtered_template_mesh(model_dir: str = "model") -> tuple[np.ndarray, 
             template_mesh = template_mesh[mesh_indices]
         if mesh_indices.max() < template_mesh_uv.shape[0]:
             template_mesh_uv = template_mesh_uv[mesh_indices]
-    return template_mesh, template_mesh_uv
+        template_mesh_faces = _remap_triangle_faces_after_vertex_filter(
+            template_mesh_faces,
+            mesh_indices,
+            original_vertex_count=int(template_mesh_full.shape[0]),
+            vertex_positions=template_mesh_full[:, :3],
+        )
+    return template_mesh, template_mesh_uv, template_mesh_faces
+
+
+def _build_directed_mesh_edges(triangle_faces: np.ndarray, num_vertices: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    tri = np.asarray(triangle_faces, dtype=np.int64)
+    if tri.size == 0:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.ones((num_vertices,), dtype=np.float32),
+        )
+    edges = np.concatenate(
+        [
+            tri[:, [0, 1]],
+            tri[:, [1, 2]],
+            tri[:, [2, 0]],
+            tri[:, [1, 0]],
+            tri[:, [2, 1]],
+            tri[:, [0, 2]],
+        ],
+        axis=0,
+    )
+    edges = edges[edges[:, 0] != edges[:, 1]]
+    edges = np.unique(edges, axis=0)
+    degree = np.bincount(edges[:, 1], minlength=num_vertices).astype(np.float32)
+    degree = np.maximum(degree, 1.0)
+    return edges[:, 0], edges[:, 1], degree
 
 
 @dataclass
@@ -123,6 +207,33 @@ class MeshRefineBlock(nn.Module):
         return x + self.ffn(self.norm(x))
 
 
+class MeshGraphBlock(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.self_norm = nn.LayerNorm(d_model)
+        self.neighbor_norm = nn.LayerNorm(d_model)
+        self.update = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_src: torch.Tensor,
+        edge_dst: torch.Tensor,
+        degree: torch.Tensor,
+    ) -> torch.Tensor:
+        neighbor = torch.zeros_like(x)
+        neighbor.index_add_(1, edge_dst, x[:, edge_src, :])
+        neighbor = neighbor / degree.view(1, -1, 1).clamp_min(1.0)
+        update = self.update(torch.cat([self.self_norm(x), self.neighbor_norm(neighbor)], dim=-1))
+        return x + update
+
+
 class Dense2Geometry(nn.Module):
     def __init__(
         self,
@@ -157,10 +268,14 @@ class Dense2Geometry(nn.Module):
         self.min_search_candidates = int(max(8, min_search_candidates))
         self.freeze_dense_stage = bool(freeze_dense_stage)
 
-        template_mesh, template_mesh_uv = _load_filtered_template_mesh(model_dir=model_dir)
+        template_mesh, template_mesh_uv, template_mesh_faces = _load_filtered_template_mesh(model_dir=model_dir)
         self.num_mesh = int(template_mesh.shape[0])
         self.register_buffer("template_mesh", torch.from_numpy(template_mesh.astype(np.float32)))
         self.register_buffer("template_mesh_uv", torch.from_numpy(template_mesh_uv.astype(np.float32)))
+        edge_src, edge_dst, edge_degree = _build_directed_mesh_edges(template_mesh_faces, self.num_mesh)
+        self.register_buffer("mesh_edge_src", torch.from_numpy(edge_src.astype(np.int64)))
+        self.register_buffer("mesh_edge_dst", torch.from_numpy(edge_dst.astype(np.int64)))
+        self.register_buffer("mesh_edge_degree", torch.from_numpy(edge_degree.astype(np.float32)))
 
         mesh2landmark_idx = np.load(os.path.join(model_dir, "mesh2landmark_knn_indices.npy")).astype(np.int64)
         mesh2landmark_w = np.load(os.path.join(model_dir, "mesh2landmark_knn_weights.npy")).astype(np.float32)
@@ -228,6 +343,7 @@ class Dense2Geometry(nn.Module):
         )
         self.landmark_norm = nn.LayerNorm(self.d_model)
         self.mesh_context_proj = nn.Linear(self.d_model, self.d_model)
+        self.mesh_graph_blocks = nn.ModuleList([MeshGraphBlock(self.d_model)])
         self.mesh_refine_blocks = nn.ModuleList(
             [MeshRefineBlock(self.d_model) for _ in range(max(1, int(num_layers // 2)))]
         )
@@ -554,6 +670,13 @@ class Dense2Geometry(nn.Module):
 
         mesh_context = self._broadcast_landmarks_to_mesh(landmark_tokens)
         mesh_tokens = vertex_tokens + self.mesh_context_proj(mesh_context)
+        for block in self.mesh_graph_blocks:
+            mesh_tokens = block(
+                mesh_tokens,
+                self.mesh_edge_src,
+                self.mesh_edge_dst,
+                self.mesh_edge_degree,
+            )
         for block in self.mesh_refine_blocks:
             mesh_tokens = block(mesh_tokens)
 
