@@ -347,7 +347,7 @@ class Dense2Geometry(nn.Module):
             [MeshGraphBlock(self.d_model) for _ in range(2)]
         )
         self.mesh_refine_blocks = nn.ModuleList(
-            [MeshRefineBlock(self.d_model) for _ in range(4)]
+            [MeshRefineBlock(self.d_model) for _ in range(5)]
         )
         self.output_head = nn.Sequential(
             nn.LayerNorm(self.d_model),
