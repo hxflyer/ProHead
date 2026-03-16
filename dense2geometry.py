@@ -144,7 +144,7 @@ class DenseStageConfig:
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 4
-    output_size: int = 512
+    output_size: int = 1024
     transformer_map_size: int = 32
     backbone_weights: str = "imagenet"
     decoder_type: str = "multitask"
@@ -244,7 +244,10 @@ class Dense2Geometry(nn.Module):
         dense_checkpoint: str = "",
         freeze_dense_stage: bool = True,
         image_memory_size: int = 16,
-        search_size: int = 128,
+        search_size: int = 512,
+        landmark_search_size: int = 256,
+        local_search_radius: int = 12,
+        local_min_candidates: int = 9,
         search_chunk_size: int = 1024,
         search_distance_threshold: float = 0.05,
         search_distance_floor: float = 0.02,
@@ -259,6 +262,9 @@ class Dense2Geometry(nn.Module):
         self.output_dim = 6
         self.image_memory_size = int(max(4, image_memory_size))
         self.search_size = int(max(32, search_size))
+        self.landmark_search_size = int(max(32, landmark_search_size))
+        self.local_search_radius = int(max(1, local_search_radius))
+        self.local_min_candidates = int(max(0, local_min_candidates))
         self.search_chunk_size = int(max(32, search_chunk_size))
         self.search_distance_threshold = float(search_distance_threshold)
         self.search_distance_floor = float(search_distance_floor)
@@ -330,6 +336,12 @@ class Dense2Geometry(nn.Module):
             nn.Linear(self.d_model, self.d_model),
         )
         self.vertex_embed = nn.Embedding(self.num_mesh, self.d_model)
+        self.vertex_concat_fuse = nn.Sequential(
+            nn.LayerNorm(self.d_model * 5),
+            nn.Linear(self.d_model * 5, self.d_model * 2),
+            nn.GELU(),
+            nn.Linear(self.d_model * 2, self.d_model),
+        )
 
         self.landmark_semantic_proj = nn.Linear(3, self.d_model)
         self.landmark_coord_proj = nn.Sequential(
@@ -441,10 +453,11 @@ class Dense2Geometry(nn.Module):
         return torch.cat(levels, dim=1)
 
     def _compute_adaptive_threshold(self, distances: torch.Tensor) -> torch.Tensor:
-        if distances.numel() == 0:
+        finite = distances[torch.isfinite(distances)]
+        if finite.numel() == 0:
             return distances.new_tensor(self.search_distance_threshold)
-        median = distances.median()
-        mad = (distances - median).abs().median()
+        median = finite.median()
+        mad = (finite - median).abs().median()
         adaptive = median + self.search_mad_scale * mad
         threshold = torch.minimum(adaptive, distances.new_tensor(self.search_distance_threshold))
         threshold = torch.maximum(threshold, distances.new_tensor(self.search_distance_floor))
@@ -472,20 +485,21 @@ class Dense2Geometry(nn.Module):
             best_idx.append(chunk_idx)
         return torch.cat(best_idx, dim=0), torch.cat(best_dist2, dim=0).sqrt()
 
-    def _search_single_sample(
+    def _build_search_candidates(
         self,
         pred_geo: torch.Tensor,
         pred_mask_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        search_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         search_geo = F.interpolate(
             pred_geo.unsqueeze(0),
-            size=(self.search_size, self.search_size),
+            size=(search_size, search_size),
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
         search_mask = F.interpolate(
             pred_mask_logits.unsqueeze(0),
-            size=(self.search_size, self.search_size),
+            size=(search_size, search_size),
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
@@ -504,20 +518,128 @@ class Dense2Geometry(nn.Module):
             valid[top_idx] = True
 
         ys, xs = torch.meshgrid(
-            torch.arange(self.search_size, device=pred_geo.device, dtype=torch.float32),
-            torch.arange(self.search_size, device=pred_geo.device, dtype=torch.float32),
+            torch.arange(search_size, device=pred_geo.device, dtype=torch.float32),
+            torch.arange(search_size, device=pred_geo.device, dtype=torch.float32),
             indexing="ij",
         )
         uv_grid = torch.stack(
             [
-                (xs + 0.5) / float(self.search_size),
-                (ys + 0.5) / float(self.search_size),
+                (xs + 0.5) / float(search_size),
+                (ys + 0.5) / float(search_size),
             ],
             dim=-1,
         ).view(-1, 2)
 
-        candidate_codes = geo_flat[valid]
-        candidate_uv = uv_grid[valid]
+        return geo_flat[valid], uv_grid[valid]
+
+    def _broadcast_landmark_uv_to_mesh(
+        self,
+        landmark_uv: torch.Tensor,
+        landmark_match: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        idx = self.mesh2landmark_knn_indices
+        w = self.mesh2landmark_knn_weights
+        neighbor_uv = landmark_uv[idx]
+        neighbor_match = landmark_match[idx]
+        uv_weight = w * neighbor_match
+        denom = uv_weight.sum(dim=1, keepdim=True)
+        coarse_uv = (neighbor_uv * uv_weight.unsqueeze(-1)).sum(dim=1) / denom.clamp_min(1e-6)
+        coarse_valid = denom.squeeze(-1) > 1e-6
+        coarse_uv[~coarse_valid] = -1.0
+        return coarse_uv, coarse_valid
+
+    def _local_refine_mesh_search(
+        self,
+        pred_geo: torch.Tensor,
+        pred_mask_logits: torch.Tensor,
+        coarse_uv: torch.Tensor,
+        coarse_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        search_geo = F.interpolate(
+            pred_geo.unsqueeze(0),
+            size=(self.search_size, self.search_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        search_mask = F.interpolate(
+            pred_mask_logits.unsqueeze(0),
+            size=(self.search_size, self.search_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+
+        geo_hw = search_geo.permute(1, 2, 0).contiguous()
+        mask_prob_hw = torch.sigmoid(search_mask[0]).contiguous()
+
+        center_x = torch.round(coarse_uv[:, 0] * float(self.search_size) - 0.5).long()
+        center_y = torch.round(coarse_uv[:, 1] * float(self.search_size) - 0.5).long()
+        center_x = center_x.clamp(0, self.search_size - 1)
+        center_y = center_y.clamp(0, self.search_size - 1)
+
+        offsets_y, offsets_x = torch.meshgrid(
+            torch.arange(-self.local_search_radius, self.local_search_radius + 1, device=pred_geo.device),
+            torch.arange(-self.local_search_radius, self.local_search_radius + 1, device=pred_geo.device),
+            indexing="ij",
+        )
+        offsets_y = offsets_y.reshape(1, -1)
+        offsets_x = offsets_x.reshape(1, -1)
+
+        patch_x = (center_x.unsqueeze(1) + offsets_x).clamp(0, self.search_size - 1)
+        patch_y = (center_y.unsqueeze(1) + offsets_y).clamp(0, self.search_size - 1)
+
+        candidate_codes = geo_hw[patch_y, patch_x]
+        candidate_mask_prob = mask_prob_hw[patch_y, patch_x]
+        candidate_geo_mag = torch.linalg.norm(candidate_codes, dim=-1)
+        valid = candidate_geo_mag > self.search_min_geo_magnitude
+        valid = valid & (candidate_mask_prob > self.search_mask_threshold)
+
+        if self.local_min_candidates > 0:
+            enough_valid = valid.sum(dim=1) >= self.local_min_candidates
+            valid = torch.where(
+                enough_valid.unsqueeze(1),
+                valid,
+                candidate_geo_mag > self.search_min_geo_magnitude,
+            )
+
+        still_empty = valid.sum(dim=1) <= 0
+        valid = torch.where(still_empty.unsqueeze(1), torch.ones_like(valid, dtype=torch.bool), valid)
+        valid = valid & coarse_valid.unsqueeze(1)
+
+        query_codes = self.mesh_geo_codes.float()
+        dist2 = ((candidate_codes.float() - query_codes.unsqueeze(1)) ** 2).sum(dim=-1)
+        dist2 = dist2.masked_fill(~valid, float("inf"))
+        best_dist2, best_idx = dist2.min(dim=1)
+        distances = best_dist2.clamp_min(0.0).sqrt()
+        threshold = self._compute_adaptive_threshold(distances)
+        accept = coarse_valid & torch.isfinite(distances) & (distances <= threshold)
+
+        candidate_uv = torch.stack(
+            [
+                (patch_x.float() + 0.5) / float(self.search_size),
+                (patch_y.float() + 0.5) / float(self.search_size),
+            ],
+            dim=-1,
+        )
+        row_idx = torch.arange(candidate_uv.shape[0], device=pred_geo.device)
+        searched_uv = candidate_uv[row_idx, best_idx].to(dtype=torch.float32)
+        searched_uv[~accept] = -1.0
+        distances = torch.where(
+            torch.isfinite(distances),
+            distances,
+            torch.full_like(distances, self.search_distance_threshold),
+        )
+        return searched_uv, accept.float(), distances
+
+    def _search_single_sample(
+        self,
+        pred_geo: torch.Tensor,
+        pred_mask_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        candidate_codes, candidate_uv = self._build_search_candidates(
+            pred_geo=pred_geo,
+            pred_mask_logits=pred_mask_logits,
+            search_size=self.landmark_search_size,
+        )
         if candidate_codes.numel() == 0:
             return (
                 torch.full((self.num_mesh, 2), -1.0, device=pred_geo.device, dtype=torch.float32),
@@ -525,14 +647,19 @@ class Dense2Geometry(nn.Module):
                 torch.full((self.num_mesh,), self.search_distance_threshold, device=pred_geo.device, dtype=torch.float32),
             )
 
-        nearest_idx, distances = self._nearest_feature_search(self.mesh_geo_codes.to(pred_geo.device), candidate_codes)
+        nearest_idx, distances = self._nearest_feature_search(self.landmark_geo_codes, candidate_codes)
         threshold = self._compute_adaptive_threshold(distances)
-        accept = torch.isfinite(distances) & (distances <= threshold)
+        landmark_accept = torch.isfinite(distances) & (distances <= threshold)
 
-        searched_uv = candidate_uv[nearest_idx]
-        searched_uv = searched_uv.to(dtype=torch.float32)
-        searched_uv[~accept] = -1.0
-        return searched_uv, accept.float(), distances
+        landmark_uv = candidate_uv[nearest_idx].to(dtype=torch.float32)
+        landmark_uv[~landmark_accept] = -1.0
+        coarse_uv, coarse_valid = self._broadcast_landmark_uv_to_mesh(landmark_uv, landmark_accept.float())
+        return self._local_refine_mesh_search(
+            pred_geo=pred_geo,
+            pred_mask_logits=pred_mask_logits,
+            coarse_uv=coarse_uv,
+            coarse_valid=coarse_valid,
+        )
 
     def _search_mesh_positions(
         self,
@@ -581,7 +708,7 @@ class Dense2Geometry(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         device = mesh_tokens.device
         idx = self.mesh2landmark_knn_indices.to(device=device)
-        w = self.mesh2landmark_knn_weights.to(device=device)
+        w = self.mesh2landmark_knn_weights.to(device=device, dtype=mesh_tokens.dtype)
 
         landmark_tokens = torch.zeros(
             (mesh_tokens.shape[0], self.num_landmarks, mesh_tokens.shape[-1]),
@@ -601,7 +728,7 @@ class Dense2Geometry(nn.Module):
         uv_denom = torch.zeros(
             (mesh_tokens.shape[0], self.num_landmarks, 1),
             device=device,
-            dtype=mesh_tokens.dtype,
+            dtype=searched_uv.dtype,
         )
 
         for k in range(idx.shape[1]):
@@ -610,7 +737,7 @@ class Dense2Geometry(nn.Module):
             landmark_tokens.index_add_(1, idx_k, mesh_tokens * w_k)
             token_denom.index_add_(1, idx_k, w_k.expand(mesh_tokens.shape[0], -1, -1))
 
-            uv_weight = w_k * match_mask.unsqueeze(-1)
+            uv_weight = w_k.to(dtype=searched_uv.dtype) * match_mask.unsqueeze(-1).to(dtype=searched_uv.dtype)
             landmark_uv.index_add_(1, idx_k, searched_uv * uv_weight)
             uv_denom.index_add_(1, idx_k, uv_weight)
 
@@ -621,7 +748,7 @@ class Dense2Geometry(nn.Module):
 
     def _broadcast_landmarks_to_mesh(self, landmark_tokens: torch.Tensor) -> torch.Tensor:
         idx = self.mesh2landmark_knn_indices.to(device=landmark_tokens.device)
-        w = self.mesh2landmark_knn_weights.to(device=landmark_tokens.device)
+        w = self.mesh2landmark_knn_weights.to(device=landmark_tokens.device, dtype=landmark_tokens.dtype)
         neighbor_tokens = landmark_tokens[:, idx, :]
         return (neighbor_tokens * w.unsqueeze(0).unsqueeze(-1)).sum(dim=2)
 
@@ -644,13 +771,14 @@ class Dense2Geometry(nn.Module):
 
         semantic_token = self.vertex_semantic_proj(self.mesh_geo_codes.unsqueeze(0).expand(rgb.shape[0], -1, -1))
         coord_input = torch.cat([searched_uv.clamp_min(0.0), match_mask.unsqueeze(-1), search_dist.unsqueeze(-1)], dim=-1)
-        vertex_tokens = (
-            self.vertex_image_proj(sampled_feat)
-            + self.vertex_dense_proj(sampled_dense)
-            + semantic_token
-            + self.vertex_coord_proj(coord_input)
-            + self.vertex_embed.weight.unsqueeze(0)
-        )
+        vertex_parts = [
+            self.vertex_image_proj(sampled_feat),
+            self.vertex_dense_proj(sampled_dense),
+            semantic_token,
+            self.vertex_coord_proj(coord_input),
+            self.vertex_embed.weight.unsqueeze(0).expand(rgb.shape[0], -1, -1),
+        ]
+        vertex_tokens = self.vertex_concat_fuse(torch.cat(vertex_parts, dim=-1))
 
         image_memory = self._build_image_memory(f4, f8, f16)
         landmark_tokens, landmark_uv, landmark_valid = self._pool_mesh_to_landmarks(
@@ -658,13 +786,12 @@ class Dense2Geometry(nn.Module):
             searched_uv,
             match_mask,
         )
-        landmark_tokens = (
-            landmark_tokens
-            + self.landmark_semantic_proj(self.landmark_geo_codes.unsqueeze(0).expand(rgb.shape[0], -1, -1))
-            + self.landmark_coord_proj(
-                torch.cat([landmark_uv.clamp_min(0.0), landmark_valid.unsqueeze(-1)], dim=-1)
-            )
-            + self.landmark_embed.weight.unsqueeze(0)
+        landmark_tokens = landmark_tokens + self.landmark_embed.weight.unsqueeze(0)
+        landmark_tokens = landmark_tokens + self.landmark_semantic_proj(
+            self.landmark_geo_codes.unsqueeze(0).expand(rgb.shape[0], -1, -1)
+        )
+        landmark_tokens = landmark_tokens + self.landmark_coord_proj(
+            torch.cat([landmark_uv.clamp_min(0.0), landmark_valid.unsqueeze(-1)], dim=-1)
         )
         for block in self.landmark_blocks:
             landmark_tokens = block(landmark_tokens, image_memory)

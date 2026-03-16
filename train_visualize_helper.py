@@ -974,10 +974,10 @@ def save_dense2geometry_visualizations(
     vis_size = 512
     rows = []
 
-    def _restore(coords_uv: np.ndarray | None):
-        if coords_uv is None:
+    def _restore(values: np.ndarray | None):
+        if values is None:
             return None
-        out = np.asarray(coords_uv, dtype=np.float32).copy()
+        out = np.asarray(values).copy()
         if mesh_restore_indices is not None:
             out = out[mesh_restore_indices]
         return out
@@ -994,11 +994,12 @@ def save_dense2geometry_visualizations(
     def _draw_points_only(rgb_image: np.ndarray, coords_uv: np.ndarray, matched_mask: np.ndarray | None) -> np.ndarray:
         out = cv2.cvtColor(rgb_image.copy(), cv2.COLOR_RGB2BGR)
         pts = _prepare_overlay_points(coords_uv, rgb_image.shape[1], rgb_image.shape[0])
-        matched = None if matched_mask is None else np.asarray(matched_mask, dtype=bool)
+        matched = None if matched_mask is None else np.asarray(matched_mask, dtype=bool).reshape(-1)
         for idx, (px, py) in enumerate(pts):
             if not np.isfinite(px) or not np.isfinite(py):
                 continue
-            color = (0, 220, 0) if matched is None or matched[idx] else (0, 80, 255)
+            is_matched = matched is None or (idx < matched.shape[0] and matched[idx])
+            color = (0, 220, 0) if is_matched else (0, 80, 255)
             cv2.circle(
                 out,
                 (int(round(float(px))), int(round(float(py)))),
@@ -1017,14 +1018,18 @@ def save_dense2geometry_visualizations(
         gt_uv = gt_mesh[i, :, 3:5]
         pred_uv = pred_mesh[i, :, 3:5]
         searched_uv_i = searched_uv[i].copy()
-        searched_uv_i[match_mask[i] <= 0.5] = -1.0
+        match_mask_i = match_mask[i] > 0.5
+        searched_uv_i[~match_mask_i] = -1.0
 
         gt_uv = _restore(gt_uv)
         pred_uv = _restore(pred_uv)
         searched_uv_i = _restore(searched_uv_i)
+        match_mask_i = _restore(match_mask_i)
+        if match_mask_i is not None:
+            searched_uv_i[~np.asarray(match_mask_i, dtype=bool)] = -1.0
 
         gt_overlay = create_combined_overlay(img_np, _prepare_overlay_points(gt_uv, W, H), mesh_topology)
-        searched_overlay = _draw_points_only(img_np, searched_uv_i, match_mask[i] > 0.5)
+        searched_overlay = _draw_points_only(img_np, searched_uv_i, match_mask_i)
         pred_overlay = create_combined_overlay(img_np, _prepare_overlay_points(pred_uv, W, H), mesh_topology)
 
         rgb_vis = cv2.resize(img_np, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)

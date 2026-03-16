@@ -31,7 +31,7 @@ class DataConfig:
     num_workers: int = 4
     prefetch_factor: int = 1
     persistent_workers: bool = True
-    image_size: int = 512
+    image_size: int = 1024
     train_ratio: float = 0.95
     max_train_samples: int = 0
 
@@ -42,7 +42,10 @@ class ModelConfig:
     nhead: int = 8
     num_layers: int = 4
     image_memory_size: int = 16
-    search_size: int = 128
+    search_size: int = 512
+    landmark_search_size: int = 256
+    local_search_radius: int = 12
+    local_min_candidates: int = 9
     search_chunk_size: int = 1024
     search_distance_threshold: float = 0.05
     search_distance_floor: float = 0.02
@@ -64,7 +67,7 @@ class TrainConfig:
     epochs: int = 50
     amp_dtype: str = "fp16"
     load_model: str = ""
-    load_dense_model: str = ""
+    load_dense_model: str = "best_dense_image_transformer_ch10.pth"
     save_path: str = "best_dense2geometry.pth"
     master_port: str = "12358"
 
@@ -89,14 +92,14 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=1)
     parser.add_argument("--persistent_workers", type=_parse_bool_arg, nargs="?", const=True, default=True)
-    parser.add_argument("--image_size", type=int, default=512)
+    parser.add_argument("--image_size", type=int, default=1024)
     parser.add_argument("--train_ratio", type=float, default=0.95)
 
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--load_model", type=str, default="")
-    parser.add_argument("--load_dense_model", type=str, default="")
+    parser.add_argument("--load_dense_model", type=str, default="best_dense_image_transformer_ch10.pth")
     parser.add_argument("--save_path", type=str, default="best_dense2geometry.pth")
     parser.add_argument("--master_port", type=str, default="12358")
 
@@ -104,7 +107,10 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--image_memory_size", type=int, default=16)
-    parser.add_argument("--search_size", type=int, default=128)
+    parser.add_argument("--search_size", type=int, default=512)
+    parser.add_argument("--landmark_search_size", type=int, default=256)
+    parser.add_argument("--local_search_radius", type=int, default=12)
+    parser.add_argument("--local_min_candidates", type=int, default=9)
     parser.add_argument("--search_chunk_size", type=int, default=1024)
     parser.add_argument("--search_distance_threshold", type=float, default=0.05)
     parser.add_argument("--search_distance_floor", type=float, default=0.02)
@@ -140,6 +146,9 @@ def build_configs_from_args(args) -> tuple[DataConfig, ModelConfig, TrainConfig]
         num_layers=int(args.num_layers),
         image_memory_size=int(args.image_memory_size),
         search_size=int(args.search_size),
+        landmark_search_size=int(args.landmark_search_size),
+        local_search_radius=int(args.local_search_radius),
+        local_min_candidates=int(args.local_min_candidates),
         search_chunk_size=int(args.search_chunk_size),
         search_distance_threshold=float(args.search_distance_threshold),
         search_distance_floor=float(args.search_distance_floor),
@@ -182,12 +191,15 @@ def setup_distributed(rank: int, world_size: int, master_port: str, backend: str
 
 
 def cleanup_distributed() -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
     try:
-        if dist.is_available() and dist.is_initialized():
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            dist.barrier()
-            dist.destroy_process_group()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+    try:
+        dist.destroy_process_group()
     except Exception:
         pass
 
@@ -290,6 +302,9 @@ def build_model_and_optim(rank: int, world_size: int, data_cfg: DataConfig, mode
         freeze_dense_stage=model_cfg.freeze_dense_stage,
         image_memory_size=model_cfg.image_memory_size,
         search_size=model_cfg.search_size,
+        landmark_search_size=model_cfg.landmark_search_size,
+        local_search_radius=model_cfg.local_search_radius,
+        local_min_candidates=model_cfg.local_min_candidates,
         search_chunk_size=model_cfg.search_chunk_size,
         search_distance_threshold=model_cfg.search_distance_threshold,
         search_distance_floor=model_cfg.search_distance_floor,
@@ -638,15 +653,18 @@ def log_and_checkpoint(epoch: int, rank: int, built, train_out, val_out, writer,
     print(f"Saved checkpoint to {train_cfg.save_path} (epoch {epoch + 1}, Val Loss: {val_out['avg_val_loss']:.6f})")
 
     if train_out.get("visualization_batch") is not None and mesh_topology:
-        save_dense2geometry_visualizations(
-            _unwrap_model(built["model"]),
-            train_out["visualization_batch"],
-            epoch,
-            torch.device("cuda:0"),
-            "training_samples",
-            mesh_topology,
-            mesh_restore_indices=mesh_restore_indices,
-        )
+        try:
+            save_dense2geometry_visualizations(
+                _unwrap_model(built["model"]),
+                train_out["visualization_batch"],
+                epoch,
+                torch.device("cuda:0"),
+                "training_samples",
+                mesh_topology,
+                mesh_restore_indices=mesh_restore_indices,
+            )
+        except Exception as exc:
+            print(f"Warning: failed to save dense2geometry visualizations: {exc}")
 
 
 def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainConfig, backend: str):
@@ -655,30 +673,31 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
     torch.set_float32_matmul_precision("high")
 
     writer = None
-    mesh_topology = None
-    mesh_restore_indices = None
-    if rank == 0:
-        run_name = f"dense2geometry_{int(time.time())}"
-        writer = SummaryWriter(f"runs/{run_name}")
-        mesh_topology = load_mesh_topology()
-        mesh_restore_path = os.path.join("model", "mesh_inverse.npy")
-        if os.path.exists(mesh_restore_path):
-            mesh_restore_indices = np.load(mesh_restore_path)
-
-    train_loader, val_loader, train_sampler = create_distributed_dataloaders(data_cfg, rank, world_size)
-    built = build_model_and_optim(rank, world_size, data_cfg, model_cfg, train_cfg)
-
-    for epoch in range(built["start_epoch"], train_cfg.epochs):
+    try:
+        mesh_topology = None
+        mesh_restore_indices = None
         if rank == 0:
-            print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
-        train_out = train_one_epoch(epoch, rank, world_size, data_cfg, built, train_loader, train_sampler)
-        val_out = validate_one_epoch(rank, world_size, data_cfg, built, val_loader)
-        log_and_checkpoint(epoch, rank, built, train_out, val_out, writer, train_cfg, mesh_topology, mesh_restore_indices)
-        built["scheduler"].step()
+            run_name = f"dense2geometry_{int(time.time())}"
+            writer = SummaryWriter(f"runs/{run_name}")
+            mesh_topology = load_mesh_topology()
+            mesh_restore_path = os.path.join("model", "mesh_inverse.npy")
+            if os.path.exists(mesh_restore_path):
+                mesh_restore_indices = np.load(mesh_restore_path)
 
-    if writer:
-        writer.close()
-    cleanup_distributed()
+        train_loader, val_loader, train_sampler = create_distributed_dataloaders(data_cfg, rank, world_size)
+        built = build_model_and_optim(rank, world_size, data_cfg, model_cfg, train_cfg)
+
+        for epoch in range(built["start_epoch"], train_cfg.epochs):
+            if rank == 0:
+                print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
+            train_out = train_one_epoch(epoch, rank, world_size, data_cfg, built, train_loader, train_sampler)
+            val_out = validate_one_epoch(rank, world_size, data_cfg, built, val_loader)
+            log_and_checkpoint(epoch, rank, built, train_out, val_out, writer, train_cfg, mesh_topology, mesh_restore_indices)
+            built["scheduler"].step()
+    finally:
+        if writer:
+            writer.close()
+        cleanup_distributed()
 
 
 def launch_linux(args):
