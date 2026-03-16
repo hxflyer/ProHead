@@ -208,7 +208,7 @@ class MeshRefineBlock(nn.Module):
 
 
 class MeshGraphBlock(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, dropout: float = 0.0):
         super().__init__()
         self.self_norm = nn.LayerNorm(d_model)
         self.neighbor_norm = nn.LayerNorm(d_model)
