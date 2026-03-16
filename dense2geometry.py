@@ -192,7 +192,7 @@ class LandmarkAttentionBlock(nn.Module):
 
 
 class MeshRefineBlock(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, dropout: float = 0.0):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
