@@ -344,10 +344,10 @@ class Dense2Geometry(nn.Module):
         self.landmark_norm = nn.LayerNorm(self.d_model)
         self.mesh_context_proj = nn.Linear(self.d_model, self.d_model)
         self.mesh_graph_blocks = nn.ModuleList(
-            [MeshGraphBlock(self.d_model) for _ in range(max(1, int(num_layers // 2)))]
+            [MeshGraphBlock(self.d_model) for _ in range(2)]
         )
         self.mesh_refine_blocks = nn.ModuleList(
-            [MeshRefineBlock(self.d_model) for _ in range(max(1, int(num_layers // 2)))]
+            [MeshRefineBlock(self.d_model) for _ in range(3)]
         )
         self.output_head = nn.Sequential(
             nn.LayerNorm(self.d_model),
