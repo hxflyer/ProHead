@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional
 import cv2
 
 from align_5pt_helper import Align5PtHelper
@@ -32,6 +32,22 @@ def _should_log_dataset_init() -> bool:
     except Exception:
         pass
     return True
+
+
+def _load_landmark_pixels(filepath: Optional[str]) -> Optional[np.ndarray]:
+    """Read [N, 2] pixel coords (cols 3, 4) from a landmark txt file."""
+    if filepath is None or not os.path.exists(filepath):
+        return None
+    pts = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.replace(",", " ").split()
+            if len(parts) >= 5:
+                pts.append([float(parts[3]), float(parts[4])])
+    return np.array(pts, dtype=np.float32) if pts else None
 
 
 def _load_exr_as_float32(path: str) -> Optional[np.ndarray]:
@@ -95,11 +111,8 @@ class FastGeometryDataset(Dataset):
     Loads RGB images, landmarks, and mesh vertices.
     """
 
-    # 5-point alignment is always enabled with fixed settings.
-    ALIGN_5PT_INDICES = (2219, 2194, 1993, 1896, 1839)
-    ALIGN_5PT_JITTER_STD = 0.003
-    ALIGN_5PT_OUTPUT_SCALE = 0.75
-    ALIGN_5PT_DIRECTION_SHIFT = 0.08
+    ALIGN_SCALE_JITTER = 0.08
+    ALIGN_TRANSLATE_JITTER = 0.03
     
     def __init__(
         self,
@@ -134,29 +147,11 @@ class FastGeometryDataset(Dataset):
         self.image_size = image_size
         self.augment = augment and (split == 'train')
         self.texture_root = texture_root
-        self.align_5pt_indices = np.asarray(list(self.ALIGN_5PT_INDICES), dtype=np.int64)
-        if self.align_5pt_indices.shape[0] != 5:
-            raise ValueError("align_5pt_indices must contain exactly 5 indices: [eye_r, eye_l, nose, mouth_r, mouth_l]")
-        self.align_5pt_jitter_std = float(max(0.0, self.ALIGN_5PT_JITTER_STD))
-        self.align_5pt_output_scale = float(np.clip(self.ALIGN_5PT_OUTPUT_SCALE, 0.1, 2.0))
-        self.align_5pt_direction_shift = float(np.clip(self.ALIGN_5PT_DIRECTION_SHIFT, 0.0, 0.5))
-        # Canonical 5-point targets in normalized image space [0, 1]
-        # Order: [eye_r, eye_l, nose, mouth_r, mouth_l]
-        self.align_5pt_target_norm = np.array([
-            [0.35, 0.38],
-            [0.65, 0.38],
-            [0.50, 0.56],
-            [0.40, 0.72],
-            [0.60, 0.72],
-        ], dtype=np.float32)
 
         self.align_helper = Align5PtHelper(
             image_size=self.image_size,
-            indices=self.align_5pt_indices,
-            target_norm=self.align_5pt_target_norm,
-            jitter_std=self.align_5pt_jitter_std,
-            output_scale=self.align_5pt_output_scale,
-            direction_shift=self.align_5pt_direction_shift,
+            scale_jitter=float(max(0.0, self.ALIGN_SCALE_JITTER)),
+            translate_jitter=float(max(0.0, self.ALIGN_TRANSLATE_JITTER)),
         )
         self.texture_packer = TexturePackHelper(
             texture_root=self.texture_root,
@@ -241,7 +236,7 @@ class FastGeometryDataset(Dataset):
         if self.augment and ALBUMENTATIONS_AVAILABLE:
             self.image_only_augment = A.Compose([
                 A.ISONoise(
-                    color_shift=(0.01, 0.05),
+                    color_shift=(0.0, 0.02),
                     intensity=(0.1, 0.5),
                     p=0.3
                 ),
@@ -408,45 +403,6 @@ class FastGeometryDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _extract_five_points_px(self, landmarks: Optional[np.ndarray], w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
-        return self.align_helper.extract_five_points_px(landmarks, w=w, h=h)
-
-    def _compute_head_center_px(self, landmarks: Optional[np.ndarray], w: int, h: int) -> Optional[np.ndarray]:
-        return self.align_helper.compute_head_center_px(landmarks, w=w, h=h)
-
-    def _is_extreme_pose(self, five_pts_px: np.ndarray, five_valid: np.ndarray) -> bool:
-        return self.align_helper.is_extreme_pose(five_pts_px, five_valid)
-
-    def _estimate_face_direction(self, five_pts_px: np.ndarray, five_valid: np.ndarray) -> np.ndarray:
-        return self.align_helper.estimate_face_direction(five_pts_px, five_valid)
-
-    def _estimate_alignment_matrix(
-        self,
-        five_pts_px: np.ndarray,
-        five_valid: np.ndarray,
-        src_w: int,
-        src_h: int,
-        head_center_px: Optional[np.ndarray] = None,
-        is_extreme_pose: bool = False,
-        face_direction: Optional[np.ndarray] = None,
-    ) -> Optional[np.ndarray]:
-        return self.align_helper.estimate_alignment_matrix(
-            five_pts_px=five_pts_px,
-            five_valid=five_valid,
-            src_w=src_w,
-            src_h=src_h,
-            split=self.split,
-            head_center_px=head_center_px,
-            is_extreme_pose=is_extreme_pose,
-            face_direction=face_direction,
-        )
-
-    def _transform_points_px(self, points_px: np.ndarray, m: np.ndarray) -> np.ndarray:
-        return self.align_helper.transform_points_px(points_px, m)
-
-    def _apply_alignment_to_geometry(self, geom: Optional[np.ndarray], M: np.ndarray, src_w: int, src_h: int) -> Optional[np.ndarray]:
-        return self.align_helper.apply_alignment_to_geometry(geom=geom, m=M, src_w=src_w, src_h=src_h)
-
     def __getitem__(self, idx: int):
         data_root, color_path, landmark_path, mesh_path, basecolor_path = self.samples[idx]
 
@@ -481,7 +437,6 @@ class FastGeometryDataset(Dataset):
 
         mesh_texture = None
         mesh_texture_valid = None
-        align_applied = False
 
         geometry_fallback = landmarks is None or mesh is None
         if geometry_fallback:
@@ -502,10 +457,6 @@ class FastGeometryDataset(Dataset):
         mesh_weights = np.ones((mesh.shape[0],), dtype=np.float32)
         landmark_weights[~landmark_found_mask] = 0.0
         mesh_weights[~mesh_found_mask] = 0.0
-        five_points_px, five_points_valid = self._extract_five_points_px(landmarks, w=w, h=h)
-        head_center_px = self._compute_head_center_px(landmarks, w=w, h=h)
-        is_extreme_pose = self._is_extreme_pose(five_points_px, five_points_valid)
-        face_direction = self._estimate_face_direction(five_points_px, five_points_valid)
 
         # Load mask (if present) to down-weight occluded landmarks/mesh vertices.
         dir_name = os.path.dirname(color_path)
@@ -600,58 +551,33 @@ class FastGeometryDataset(Dataset):
             if geo_np is not None:
                 geo_valid = 1.0
 
-        # 5-point alignment before filtering/augmentation so all geometry stays coherent.
-        if landmarks is not None and five_points_px is not None:
-            M = self._estimate_alignment_matrix(
-                five_points_px,
-                five_points_valid,
-                src_w=w,
-                src_h=h,
-                head_center_px=head_center_px,
-                is_extreme_pose=is_extreme_pose,
-                face_direction=face_direction,
+        # MediaPipe face alignment with GT landmark fallback (same as dense_image_dataset).
+        lm_px_gt = _load_landmark_pixels(landmark_path)
+        lm6, detection_source = self.align_helper.detect_landmarks(image_np, fallback_lm_px=lm_px_gt)
+        M = self.align_helper.estimate_alignment_matrix(lm6, src_w=w, src_h=h, split=self.split)
+        image_np = cv2.warpAffine(
+            image_np, M, (self.image_size, self.image_size),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+        )
+        if basecolor_np is not None:
+            basecolor_np = cv2.warpAffine(
+                basecolor_np, M, (self.image_size, self.image_size),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
             )
-            if M is not None:
-                image_np = cv2.warpAffine(
-                    image_np,
-                    M,
-                    (self.image_size, self.image_size),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_REFLECT_101,
-                )
-                if basecolor_np is not None:
-                    basecolor_np = cv2.warpAffine(
-                        basecolor_np,
-                        M,
-                        (self.image_size, self.image_size),
-                        flags=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_REFLECT_101,
-                    )
-                if geo_np is not None:
-                    geo_np = cv2.warpAffine(
-                        geo_np,
-                        M,
-                        (self.image_size, self.image_size),
-                        flags=cv2.INTER_LINEAR,
-                        borderMode=cv2.BORDER_CONSTANT,
-                        borderValue=(0, 0, 0),
-                    )
-                if facemask_np is not None:
-                    facemask_np = cv2.warpAffine(
-                        facemask_np,
-                        M,
-                        (self.image_size, self.image_size),
-                        flags=cv2.INTER_NEAREST,
-                        borderMode=cv2.BORDER_CONSTANT,
-                        borderValue=0,
-                    )
-                landmarks = self._apply_alignment_to_geometry(landmarks, M=M, src_w=w, src_h=h)
-                mesh = self._apply_alignment_to_geometry(mesh, M=M, src_w=w, src_h=h)
-                five_points_px = self._transform_points_px(five_points_px, M)
-                h = self.image_size
-                w = self.image_size
-                align_applied = True
-
+        if geo_np is not None:
+            geo_np = cv2.warpAffine(
+                geo_np, M, (self.image_size, self.image_size),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+            )
+        if facemask_np is not None:
+            facemask_np = cv2.warpAffine(
+                facemask_np, M, (self.image_size, self.image_size),
+                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+        landmarks = self.align_helper.apply_alignment_to_geometry(landmarks, m=M, src_w=w, src_h=h)
+        mesh = self.align_helper.apply_alignment_to_geometry(mesh, m=M, src_w=w, src_h=h)
+        h = self.image_size
+        w = self.image_size
         # Filter using indices
         if landmarks is not None and self.landmark_indices is not None:
             if self.landmark_indices.max() < len(landmarks):
@@ -858,16 +784,12 @@ class FastGeometryDataset(Dataset):
         result['geo_gt'] = torch.from_numpy(geo_np.astype(np.float32, copy=False)).permute(2, 0, 1)
         result['geo_valid'] = torch.tensor(1.0 if geo_valid > 0.5 else 0.0, dtype=torch.float32)
 
-        if five_points_px is not None and five_points_valid is not None:
-            if align_applied:
-                denom = np.array([float(self.image_size), float(self.image_size)], dtype=np.float32)
-            else:
-                denom = np.array([float(max(1, w)), float(max(1, h))], dtype=np.float32)
-            five_points_norm = five_points_px / denom[None, :]
-            result['align5pts'] = torch.from_numpy(five_points_norm.astype(np.float32))
-            result['align5pts_valid'] = torch.from_numpy(five_points_valid.astype(np.float32))
-            result['align_applied'] = torch.tensor(1.0 if align_applied else 0.0, dtype=torch.float32)
-            result['align_is_extreme'] = torch.tensor(1.0 if is_extreme_pose else 0.0, dtype=torch.float32)
+        key5_px, key5_valid = self.align_helper.extract_key5_from_lm68(lm6)
+        key5_out = self.align_helper.transform_points_px(key5_px, M) / float(max(1, self.image_size))
+        key5_out = np.nan_to_num(key5_out.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        result['align5pts'] = torch.from_numpy(key5_out)
+        result['align5pts_valid'] = torch.from_numpy(key5_valid)
+        result['align_applied'] = torch.tensor(1.0, dtype=torch.float32)
 
         return result
 
@@ -898,8 +820,6 @@ def fast_collate_fn(batch):
         collated['align5pts_valid'] = torch.stack([item['align5pts_valid'] for item in batch])
     if all('align_applied' in item for item in batch):
         collated['align_applied'] = torch.stack([item['align_applied'] for item in batch])
-    if all('align_is_extreme' in item for item in batch):
-        collated['align_is_extreme'] = torch.stack([item['align_is_extreme'] for item in batch])
 
     if 'image_path' in batch[0]:
         collated['image_path'] = [item['image_path'] for item in batch]
