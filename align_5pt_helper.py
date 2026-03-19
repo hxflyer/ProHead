@@ -1,247 +1,180 @@
-﻿import os
-import numpy as np
-import cv2
+"""
+MediaPipe-based face alignment helper.
+Rotation: eye→mouth axis → vertical.
+Scale: eye_center to jaw (chin landmark 152) = FACE_SCALE_RATIO * image_size.
+Translation: mean of 5 face landmarks → image center.
+Fallback: if MediaPipe fails, use GT landmark file indices.
+"""
+import math
+import os
 from typing import Optional
+
+import numpy as np
+
+# eye_center → bottom_jaw = 30% of image height after alignment
+FACE_SCALE_RATIO = 0.30
+
+# MediaPipe Face Landmarker 478-pt model indices (with iris)
+_MP_RIGHT_EYE   = 468   # right iris center
+_MP_LEFT_EYE    = 473   # left iris center
+_MP_NOSE        = 1     # nose tip
+_MP_RIGHT_MOUTH = 61    # right mouth corner
+_MP_LEFT_MOUTH  = 291   # left mouth corner
+_MP_JAW         = 152   # chin bottom
+
+# GT landmark file indices for fallback
+_GT_5PT_INDICES = (2219, 2194, 1993, 1896, 1839)  # eye_r, eye_l, nose, mouth_r, mouth_l
+_GT_JAW_INDEX   = 1788
+
+_MODEL_PATH = os.path.join("models", "face_landmarker.task")
+
+_mp_landmarker = None
+
+
+def _get_landmarker():
+    global _mp_landmarker
+    if _mp_landmarker is None:
+        import mediapipe as mp
+        options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_path=_MODEL_PATH),
+            running_mode=mp.tasks.vision.RunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.3,
+            min_face_presence_confidence=0.3,
+        )
+        _mp_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+    return _mp_landmarker
 
 
 class Align5PtHelper:
-    """Fixed 5-point alignment utilities for geometry datasets."""
+    """MediaPipe-based face alignment with scale/rotation/translate."""
 
     def __init__(
         self,
         image_size: int,
-        indices: np.ndarray,
-        target_norm: np.ndarray,
-        jitter_std: float,
-        output_scale: float,
-        direction_shift: float,
+        indices=None,           # unused, kept for compat
+        jitter_std: float = 0.0,  # unused
+        scale_jitter: float = 0.0,
+        translate_jitter: float = 0.0,
     ):
         self.image_size = int(image_size)
-        self.indices = np.asarray(indices, dtype=np.int64)
-        self.target_norm = np.asarray(target_norm, dtype=np.float32)
-        self.jitter_std = float(max(0.0, jitter_std))
-        self.output_scale = float(np.clip(output_scale, 0.1, 2.0))
-        self.direction_shift = float(np.clip(direction_shift, 0.0, 0.5))
+        self.scale_jitter = float(max(0.0, scale_jitter))
+        self.translate_jitter = float(max(0.0, translate_jitter))
 
-    def extract_five_points_px(self, landmarks: Optional[np.ndarray], w: int, h: int) -> tuple[np.ndarray, np.ndarray]:
-        """Extract 5 anchor points in pixel space from full landmark array."""
-        pts = np.full((5, 2), np.nan, dtype=np.float32)
-        valid = np.zeros((5,), dtype=bool)
-        if landmarks is None:
-            return pts, valid
+    # ------------------------------------------------------------------
+    # MediaPipe detection → 6 key points, with GT fallback
+    # ------------------------------------------------------------------
 
-        for i, lm_idx in enumerate(self.indices.tolist()):
-            if lm_idx < 0 or lm_idx >= len(landmarks):
-                continue
-            uv = landmarks[lm_idx, 3:5]
-            if (not np.isfinite(uv).all()) or np.any(uv < 0.0):
-                continue
-            px = np.array([uv[0] * float(w), uv[1] * float(h)], dtype=np.float32)
-            pts[i] = px
-            valid[i] = True
-        return pts, valid
+    def detect_landmarks(
+        self,
+        image_rgb: np.ndarray,
+        fallback_lm_px: Optional[np.ndarray] = None,
+    ) -> tuple[Optional[np.ndarray], str]:
+        """Run MediaPipe face landmarker on an RGB image.
+        Returns (lm6, source) where:
+          lm6: [6, 2] float32 pixel coords [right_eye, left_eye, nose, right_mouth, left_mouth, jaw]
+               or None if both MediaPipe and fallback fail.
+          source: 'mediapipe', 'landmark_gt', or 'none'
+        fallback_lm_px: [N, 2] float32 GT pixel coords used when MediaPipe fails.
+        """
+        import mediapipe as mp
+        h, w = image_rgb.shape[:2]
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        result = _get_landmarker().detect(mp_image)
+        if result.face_landmarks:
+            lm = result.face_landmarks[0]
 
-    @staticmethod
-    def compute_head_center_px(landmarks: Optional[np.ndarray], w: int, h: int) -> Optional[np.ndarray]:
-        """Compute robust head center from full landmark bbox center (pixel space)."""
-        if landmarks is None or len(landmarks) == 0:
-            return None
-        pts = landmarks[:, 3:5].astype(np.float32).copy()
-        finite = np.isfinite(pts).all(axis=1) & np.all(pts >= 0.0, axis=1)
-        if not finite.any():
-            return None
-        pts = pts[finite]
-        pts[:, 0] *= float(w)
-        pts[:, 1] *= float(h)
-        pmin = np.min(pts, axis=0)
-        pmax = np.max(pts, axis=0)
-        return 0.5 * (pmin + pmax)
+            def pt(idx):
+                return np.array([lm[idx].x * w, lm[idx].y * h], dtype=np.float32)
 
-    @staticmethod
-    def is_extreme_pose(five_pts_px: np.ndarray, five_valid: np.ndarray) -> bool:
-        """Heuristic extreme-pose detector (profile / top-down / bottom-up-like compression)."""
-        pts = five_pts_px[five_valid]
-        if len(pts) < 2:
-            return True
-        extent = float(np.max(np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)))
-        if extent < 1e-6:
-            return True
+            lm6 = np.stack([
+                pt(_MP_RIGHT_EYE), pt(_MP_LEFT_EYE), pt(_MP_NOSE),
+                pt(_MP_RIGHT_MOUTH), pt(_MP_LEFT_MOUTH), pt(_MP_JAW),
+            ], axis=0)
+            return lm6, "mediapipe"
 
-        eye_ratio = 1.0
-        if five_valid[0] and five_valid[1]:
-            eye_dist = float(np.linalg.norm(five_pts_px[0] - five_pts_px[1]))
-            eye_ratio = eye_dist / extent
+        # Fallback to GT landmark pixels
+        if fallback_lm_px is not None:
+            indices = list(_GT_5PT_INDICES) + [_GT_JAW_INDEX]
+            if max(indices) < len(fallback_lm_px):
+                lm6 = fallback_lm_px[indices].astype(np.float32)
+                return lm6, "landmark_gt"
 
-        mouth_ratio = 1.0
-        if five_valid[3] and five_valid[4]:
-            mouth_dist = float(np.linalg.norm(five_pts_px[3] - five_pts_px[4]))
-            mouth_ratio = mouth_dist / extent
+        return None, "none"
 
-        span = np.ptp(pts, axis=0)
-        anis = float(min(span[0], span[1]) / max(max(span[0], span[1]), 1e-6))
-        return (eye_ratio < 0.22) or (mouth_ratio < 0.22) or (anis < 0.18)
+    # ------------------------------------------------------------------
+    # 5 key points for output (drop jaw, keep first 5)
+    # ------------------------------------------------------------------
 
-    @staticmethod
-    def estimate_face_direction(five_pts_px: np.ndarray, five_valid: np.ndarray) -> np.ndarray:
-        """Estimate 2D face direction from 5 points."""
-        if five_pts_px.shape != (5, 2) or five_valid.shape != (5,):
-            return np.zeros((2,), dtype=np.float32)
-        if not five_valid[2]:
-            return np.zeros((2,), dtype=np.float32)
+    def extract_key5_from_lm68(self, lm6: Optional[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """Return (pts [5,2], valid [5]) — first 5 of the 6-pt detection result."""
+        if lm6 is None:
+            return np.zeros((5, 2), dtype=np.float32), np.zeros(5, dtype=np.float32)
+        return lm6[:5].astype(np.float32), np.ones(5, dtype=np.float32)
 
-        context_idx = [0, 1, 3, 4]
-        context = []
-        for i in context_idx:
-            if five_valid[i]:
-                context.append(five_pts_px[i])
-        if len(context) == 0:
-            return np.zeros((2,), dtype=np.float32)
-
-        context = np.asarray(context, dtype=np.float32)
-        center = np.mean(context, axis=0)
-        nose = five_pts_px[2].astype(np.float32)
-
-        valid_pts = five_pts_px[five_valid]
-        if len(valid_pts) >= 2:
-            extent = float(np.max(np.linalg.norm(valid_pts[:, None, :] - valid_pts[None, :, :], axis=2)))
-        else:
-            extent = 1.0
-        extent = max(extent, 1.0)
-
-        d = (nose - center) / extent
-        d = np.clip(d, -1.0, 1.0)
-        return d.astype(np.float32)
+    # ------------------------------------------------------------------
+    # Alignment matrix
+    # ------------------------------------------------------------------
 
     def estimate_alignment_matrix(
         self,
-        five_pts_px: np.ndarray,
-        five_valid: np.ndarray,
+        lm68: Optional[np.ndarray],   # [6, 2] from detect_landmarks
         src_w: int,
         src_h: int,
         split: str,
-        head_center_px: Optional[np.ndarray] = None,
-        is_extreme_pose: bool = False,
-        face_direction: Optional[np.ndarray] = None,
-    ) -> Optional[np.ndarray]:
-        """Estimate similarity transform from sparse anchors to canonical face pose."""
-        def apply_center_scale(m_in: np.ndarray, scale: float) -> np.ndarray:
-            c = np.array([0.5 * float(self.image_size), 0.5 * float(self.image_size)], dtype=np.float32)
-            a = m_in[:, :2]
-            b = m_in[:, 2]
-            m_out = m_in.copy().astype(np.float32)
-            m_out[:, :2] = scale * a
-            m_out[:, 2] = scale * b + (1.0 - scale) * c
-            return m_out
+    ) -> np.ndarray:
+        is_train = split == 'train'
+        image_size = self.image_size
+        c = np.array([image_size * 0.5, image_size * 0.5], dtype=np.float32)
+        lm6 = lm68
 
-        def apply_head_recentering(m_in: np.ndarray) -> np.ndarray:
-            if head_center_px is None or not np.isfinite(head_center_px).all():
-                return m_in
-            c = np.array([0.5 * float(self.image_size), 0.5 * float(self.image_size)], dtype=np.float32)
-            cur = m_in[:, :2] @ head_center_px.astype(np.float32) + m_in[:, 2]
-            shift = c - cur
-            w_shift = 1.0 if is_extreme_pose else 0.35
-            m_out = m_in.copy().astype(np.float32)
-            m_out[:, 2] += w_shift * shift
-            if face_direction is not None:
-                fd = np.asarray(face_direction, dtype=np.float32)
-                if fd.shape == (2,) and np.isfinite(fd).all():
-                    m_out[:, 2] += self.direction_shift * float(self.image_size) * np.clip(fd, -1.0, 1.0)
-            return m_out
+        if lm6 is not None:
+            eye_center   = (lm6[0] + lm6[1]) * 0.5
+            mouth_center = (lm6[3] + lm6[4]) * 0.5
+            jaw          = lm6[5]
 
-        if five_pts_px.shape != (5, 2) or five_valid.shape != (5,):
-            return None
+            # Rotation: align eye→mouth to vertical
+            dx = float(mouth_center[0] - eye_center[0])
+            dy = float(mouth_center[1] - eye_center[1])
+            dist_em = max(math.hypot(dx, dy), 1.0)
+            cos_a = dy / dist_em
+            sin_a = dx / dist_em
 
-        src_all = five_pts_px.astype(np.float32).copy()
-        dst_all = (self.target_norm * float(self.image_size)).astype(np.float32)
+            # Scale: project jaw onto eye→mouth axis for true vertical distance
+            dxj = float(jaw[0] - eye_center[0])
+            dyj = float(jaw[1] - eye_center[1])
+            dist_jaw = max(dxj * sin_a + dyj * cos_a, 1.0)
+            s = FACE_SCALE_RATIO * float(image_size) / dist_jaw
 
-        if five_valid[0] and five_valid[1] and src_all[0, 0] > src_all[1, 0]:
-            src_all[[0, 1]] = src_all[[1, 0]]
-        if five_valid[3] and five_valid[4] and src_all[3, 0] > src_all[4, 0]:
-            src_all[[3, 4]] = src_all[[4, 3]]
-
-        valid_idx = np.where(five_valid)[0]
-        if len(valid_idx) == 0:
-            sx = float(self.image_size) / float(max(1, src_w))
-            sy = float(self.image_size) / float(max(1, src_h))
-            m_no_kp = np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0]], dtype=np.float32)
-            m_no_kp = apply_center_scale(m_no_kp, self.output_scale)
-            return apply_head_recentering(m_no_kp)
-
-        src = src_all[valid_idx].copy()
-        dst = dst_all[valid_idx].copy()
-
-        if five_valid[0] and five_valid[1]:
-            eye_dist = float(np.linalg.norm(src_all[0] - src_all[1]))
-            eye_floor = 0.06 * float(min(src_w, src_h))
-            if eye_dist < eye_floor:
-                kept = [i for i in valid_idx.tolist() if i not in (0, 1)]
-                src_list = [src_all[i] for i in kept]
-                dst_list = [dst_all[i] for i in kept]
-                src_list.append(0.5 * (src_all[0] + src_all[1]))
-                dst_list.append(0.5 * (dst_all[0] + dst_all[1]))
-                src = np.asarray(src_list, dtype=np.float32)
-                dst = np.asarray(dst_list, dtype=np.float32)
-
-        if split == 'train' and self.jitter_std > 0.0:
-            jitter_px = self.jitter_std * float(min(src_w, src_h))
-            src += np.random.normal(0.0, jitter_px, size=src.shape).astype(np.float32)
-
-        src_center = np.mean(src, axis=0)
-        dst_center = np.mean(dst, axis=0)
-
-        if len(src) >= 2:
-            src_extent = float(np.max(np.linalg.norm(src[:, None, :] - src[None, :, :], axis=2)))
-            dst_extent = float(np.max(np.linalg.norm(dst[:, None, :] - dst[None, :, :], axis=2)))
+            # Translation: mean of 5 face landmarks → image center
+            src_center = lm6[:5].mean(axis=0)
         else:
-            src_extent = 0.0
-            dst_extent = 0.0
+            cos_a, sin_a = 1.0, 0.0
+            s = float(image_size) / float(max(src_w, src_h))
+            src_center = np.array([src_w * 0.5, src_h * 0.5], dtype=np.float32)
 
-        extent_floor = 0.18 * float(min(src_w, src_h))
-        src_extent_safe = max(src_extent, extent_floor)
-        if dst_extent <= 1e-6:
-            scale_ref = float(self.image_size) / float(max(1, max(src_w, src_h)))
-        else:
-            scale_ref = dst_extent / src_extent_safe
-        scale_ref = float(np.clip(scale_ref, 0.45, 1.8))
+        r00, r01 = s * cos_a, -s * sin_a
+        r10, r11 = s * sin_a,  s * cos_a
+        tx = c[0] - (r00 * src_center[0] + r01 * src_center[1])
+        ty = c[1] - (r10 * src_center[0] + r11 * src_center[1])
+        m = np.array([[r00, r01, tx], [r10, r11, ty]], dtype=np.float32)
 
-        m = None
-        if len(src) >= 2:
-            m, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.LMEDS)
+        if is_train:
+            if self.scale_jitter > 0.0:
+                js = float(np.clip(1.0 + np.random.normal(0.0, self.scale_jitter), 0.8, 1.2))
+                m[:, :2] *= js
+                m[:, 2] = js * m[:, 2] + (1.0 - js) * c
+            if self.translate_jitter > 0.0:
+                m[:, 2] += np.random.normal(0.0, self.translate_jitter * image_size, 2).astype(np.float32)
 
-        if m is not None and m.shape == (2, 3) and np.isfinite(m).all():
-            a, b = float(m[0, 0]), float(m[0, 1])
-            scale_est = float(np.sqrt(a * a + b * b))
-            if scale_est < 1e-6:
-                scale_final = scale_ref
-                rot = np.eye(2, dtype=np.float32)
-            else:
-                rot = np.array([[a, b], [-b, a]], dtype=np.float32) / scale_est
-                lower = max(0.45, 0.7 * scale_ref)
-                upper = min(1.8, 1.35 * scale_ref)
-                scale_final = float(np.clip(scale_est, lower, upper))
+        return m
 
-            t = dst_center - scale_final * (rot @ src_center)
-            m_final = np.zeros((2, 3), dtype=np.float32)
-            m_final[:, :2] = scale_final * rot
-            m_final[:, 2] = t
-            m_final = apply_center_scale(m_final, self.output_scale)
-            return apply_head_recentering(m_final)
-
-        m_final = np.array(
-            [
-                [scale_ref, 0.0, dst_center[0] - scale_ref * src_center[0]],
-                [0.0, scale_ref, dst_center[1] - scale_ref * src_center[1]],
-            ],
-            dtype=np.float32,
-        )
-        m_final = apply_center_scale(m_final, self.output_scale)
-        return apply_head_recentering(m_final)
+    # ------------------------------------------------------------------
+    # Point / geometry transform helpers (unchanged)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def transform_points_px(points_px: np.ndarray, m: np.ndarray) -> np.ndarray:
-        """Apply affine matrix to point array [N,2] in pixels."""
-        if points_px is None:
-            return None
         out = points_px.copy().astype(np.float32)
         finite_mask = np.isfinite(out).all(axis=1)
         if not finite_mask.any():
@@ -258,7 +191,6 @@ class Align5PtHelper:
         src_w: int,
         src_h: int,
     ) -> Optional[np.ndarray]:
-        """Transform geometry 2D coords with affine; keep 3D coords unchanged."""
         if geom is None:
             return None
         out = geom.copy()

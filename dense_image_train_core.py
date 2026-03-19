@@ -111,7 +111,7 @@ class ModelConfig:
     predict_basecolor: bool = True
     predict_geo: bool = True
     predict_normal: bool = True
-    output_channels: int = 10
+    output_channels: int = 13
     transformer_map_size: int = 32
     backbone_weights: str = "imagenet"
 
@@ -122,7 +122,7 @@ class TrainConfig:
     epochs: int = 50
     amp_dtype: str = "fp16"
     load_model: str = ""
-    save_path: str = "best_dense_image_transformer_ch10.pth"
+    save_path: str = "best_dense_image_transformer_ch13.pth"
     save_preview_every: int = 1
     basecolor_fg_weight: float = 8.0
     basecolor_fg_threshold: float = 0.02
@@ -205,7 +205,7 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--max_train_samples", type=int, default=0)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument(
         "--persistent_workers",
@@ -221,7 +221,7 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--load_model", type=str, default="")
-    parser.add_argument("--save_path", type=str, default="best_dense_image_transformer_ch10.pth")
+    parser.add_argument("--save_path", type=str, default="best_dense_image_transformer_ch13.pth")
     parser.add_argument("--save_preview_every", type=int, default=1)
     parser.add_argument("--basecolor_fg_weight", type=float, default=8.0)
     parser.add_argument("--basecolor_fg_threshold", type=float, default=0.02)
@@ -278,7 +278,8 @@ def _target_summary(predict_basecolor: bool, predict_geo: bool, predict_normal: 
     if predict_geo:
         names.append("geo")
     if predict_normal:
-        names.append("normal")
+        names.append("geometry_normal")
+        names.append("detail_normal")
     names.append("mask")
     return "+".join(names)
 
@@ -472,7 +473,8 @@ def _split_dense_prediction(
     channel_idx = 0
     pred_rgb = None
     pred_geo = None
-    pred_normal = None
+    pred_detail_normal = None
+    pred_geometry_normal = None
     if predict_basecolor:
         pred_rgb = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
@@ -480,13 +482,17 @@ def _split_dense_prediction(
         pred_geo = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
     if predict_normal:
-        pred_normal = pred[:, channel_idx : channel_idx + 3]
+        pred_geometry_normal = pred[:, channel_idx : channel_idx + 3]
+        channel_idx += 3
+        pred_detail_normal = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
 
     return {
         "rgb": pred_rgb,
         "geo": pred_geo,
-        "normal": pred_normal,
+        "geometry_normal": pred_geometry_normal,
+        "detail_normal": pred_detail_normal,
+        "normal": pred_detail_normal,
         "mask_logits": pred[:, channel_idx : channel_idx + 1],
     }
 
@@ -505,9 +511,9 @@ def _prepare_face_mask(
 
 def _build_feature_loss_weight(
     reference: torch.Tensor,
-    target_valid: torch.Tensor | None,
     face_mask: torch.Tensor | None,
     face_mask_valid: torch.Tensor | None,
+    error_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     loss_weight = _prepare_face_mask(face_mask, reference)
     if loss_weight is None:
@@ -524,12 +530,8 @@ def _build_feature_loss_weight(
         )
         loss_weight = loss_weight * mask_valid + (1.0 - mask_valid)
 
-    if target_valid is not None:
-        sample_valid = target_valid.view(-1, 1, 1, 1).to(
-            device=reference.device,
-            dtype=reference.dtype,
-        )
-        loss_weight = loss_weight * sample_valid
+    if error_mask is not None:
+        loss_weight = loss_weight * error_mask.to(device=reference.device, dtype=reference.dtype)
 
     return loss_weight
 
@@ -537,9 +539,9 @@ def _build_feature_loss_weight(
 def _masked_feature_loss(
     pred_feat: torch.Tensor | None,
     gt_feat: torch.Tensor | None,
-    target_valid: torch.Tensor | None,
     face_mask: torch.Tensor | None,
     face_mask_valid: torch.Tensor | None,
+    error_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if pred_feat is None or gt_feat is None:
         reference = pred_feat if pred_feat is not None else gt_feat
@@ -547,9 +549,9 @@ def _masked_feature_loss(
 
     loss_weight = _build_feature_loss_weight(
         reference=pred_feat,
-        target_valid=target_valid,
         face_mask=face_mask,
         face_mask_valid=face_mask_valid,
+        error_mask=error_mask,
     )
     loss_weight = loss_weight.expand_as(pred_feat)
     denom = loss_weight.sum()
@@ -561,9 +563,9 @@ def _masked_feature_loss(
 def _masked_normal_cosine_loss(
     pred_normal: torch.Tensor | None,
     gt_normal: torch.Tensor | None,
-    target_valid: torch.Tensor | None,
     face_mask: torch.Tensor | None,
     face_mask_valid: torch.Tensor | None,
+    error_mask: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     if pred_normal is None or gt_normal is None:
@@ -572,9 +574,9 @@ def _masked_normal_cosine_loss(
 
     loss_weight = _build_feature_loss_weight(
         reference=pred_normal,
-        target_valid=target_valid,
         face_mask=face_mask,
         face_mask_valid=face_mask_valid,
+        error_mask=error_mask,
     )
     denom = loss_weight.sum()
     if denom.detach().item() <= 0:
@@ -596,6 +598,7 @@ def _mask_bce_loss(
     mask_logits: torch.Tensor | None,
     gt_mask: torch.Tensor | None,
     mask_valid: torch.Tensor | None,
+    error_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if mask_logits is None or gt_mask is None:
         reference = mask_logits if mask_logits is not None else gt_mask
@@ -608,6 +611,8 @@ def _mask_bce_loss(
             device=mask_logits.device,
             dtype=mask_logits.dtype,
         )
+    if error_mask is not None:
+        valid_weight = valid_weight * error_mask.to(device=mask_logits.device, dtype=mask_logits.dtype)
 
     denom = valid_weight.sum()
     if denom.detach().item() <= 0:
@@ -621,6 +626,7 @@ def _mask_dice_loss(
     mask_logits: torch.Tensor | None,
     gt_mask: torch.Tensor | None,
     mask_valid: torch.Tensor | None,
+    error_mask: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     if mask_logits is None or gt_mask is None:
@@ -636,6 +642,14 @@ def _mask_dice_loss(
             return torch.zeros((), device=mask_logits.device, dtype=mask_logits.dtype)
         probs = probs[valid_mask]
         target = target[valid_mask]
+        if error_mask is not None:
+            em = error_mask.to(device=mask_logits.device, dtype=mask_logits.dtype)[valid_mask]
+            probs = probs * em
+            target = target * em
+    elif error_mask is not None:
+        em = error_mask.to(device=mask_logits.device, dtype=mask_logits.dtype)
+        probs = probs * em
+        target = target * em
 
     intersection = (probs * target).sum(dim=(1, 2, 3))
     union = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
@@ -649,19 +663,32 @@ def _combined_mask_loss(
     mask_valid: torch.Tensor | None,
     bce_lambda: float,
     dice_lambda: float,
+    error_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if mask_logits is None:
         zero = _zero_scalar_like(gt_mask)
         return zero, zero, zero
 
-    mask_bce = _mask_bce_loss(mask_logits, gt_mask, mask_valid)
-    mask_dice = _mask_dice_loss(mask_logits, gt_mask, mask_valid)
+    mask_bce = _mask_bce_loss(mask_logits, gt_mask, mask_valid, error_mask=error_mask)
+    mask_dice = _mask_dice_loss(mask_logits, gt_mask, mask_valid, error_mask=error_mask)
     mask_total = float(bce_lambda) * mask_bce + float(dice_lambda) * mask_dice
     return mask_total, mask_bce, mask_dice
 
 
-def _to_vis_map(arr: np.ndarray) -> np.ndarray:
+def _get_detail_normal_batch_tensors(batch, device: torch.device) -> torch.Tensor | None:
+    detail_normal = batch.get("detail_normal", batch.get("normal"))
+    return detail_normal.to(device, non_blocking=True) if detail_normal is not None else None
+
+
+def _get_geometry_normal_batch_tensors(batch, device: torch.device) -> torch.Tensor | None:
+    geometry_normal = batch.get("geometry_normal")
+    return geometry_normal.to(device, non_blocking=True) if geometry_normal is not None else None
+
+
+def _to_vis_map(arr: np.ndarray, signed: bool = False) -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float32)
+    if signed:
+        arr = arr * 0.5 + 0.5
     if arr.ndim == 2:
         arr = np.repeat(arr[..., None], 3, axis=2)
     if arr.shape[2] == 1:
@@ -683,10 +710,8 @@ def _save_preview(
     rgb = batch["rgb"][:4].detach().cpu().numpy()
     gt_rgb = batch["basecolor"][:4].detach().cpu().numpy()
     gt_geo = batch["geo"][:4].detach().cpu().numpy()
-    gt_normal = batch["normal"][:4].detach().cpu().numpy()
-    rgb_valid = batch["basecolor_valid"][:4].detach().cpu().numpy()
-    geo_valid = batch["geo_valid"][:4].detach().cpu().numpy()
-    normal_valid = batch["normal_valid"][:4].detach().cpu().numpy()
+    gt_detail_normal = batch.get("detail_normal", batch["normal"])[:4].detach().cpu().numpy()
+    gt_geometry_normal = batch["geometry_normal"][:4].detach().cpu().numpy()
     gt_mask = batch["face_mask"][:4].detach().cpu().numpy()
     mask_valid = batch["face_mask_valid"][:4].detach().cpu().numpy()
 
@@ -696,16 +721,25 @@ def _save_preview(
         predict_geo=predict_geo,
         predict_normal=predict_normal,
     )
-    pred_rgb_np = pred_parts["rgb"].detach().cpu().numpy()
+    pred_rgb_np = (
+        pred_parts["rgb"].detach().cpu().numpy()
+        if pred_parts["rgb"] is not None
+        else np.zeros_like(gt_rgb, dtype=np.float32)
+    )
     pred_geo_np = (
         pred_parts["geo"].detach().cpu().numpy()
         if pred_parts["geo"] is not None
         else np.zeros_like(gt_geo, dtype=np.float32)
     )
-    pred_normal_np = (
-        pred_parts["normal"].detach().cpu().numpy()
-        if pred_parts["normal"] is not None
-        else np.zeros_like(gt_normal, dtype=np.float32)
+    pred_detail_normal_np = (
+        pred_parts["detail_normal"].detach().cpu().numpy()
+        if pred_parts["detail_normal"] is not None
+        else np.zeros_like(gt_detail_normal, dtype=np.float32)
+    )
+    pred_geometry_normal_np = (
+        pred_parts["geometry_normal"].detach().cpu().numpy()
+        if pred_parts["geometry_normal"] is not None
+        else np.zeros_like(gt_geometry_normal, dtype=np.float32)
     )
     if pred_parts["mask_logits"] is not None:
         pred_mask_np = torch.sigmoid(pred_parts["mask_logits"]).detach().cpu().numpy()
@@ -717,26 +751,20 @@ def _save_preview(
         rgb_i = np.clip(np.transpose(rgb[i], (1, 2, 0)), 0.0, 1.0)
         gt_rgb_i = np.clip(np.transpose(gt_rgb[i], (1, 2, 0)), 0.0, 1.0)
         gt_geo_i = np.clip(np.transpose(gt_geo[i], (1, 2, 0)), 0.0, 1.0)
-        gt_normal_i = np.clip(np.transpose(gt_normal[i], (1, 2, 0)), 0.0, 1.0)
+        gt_detail_normal_i = np.clip(np.transpose(gt_detail_normal[i], (1, 2, 0)), -1.0, 1.0)
+        gt_geometry_normal_i = np.clip(np.transpose(gt_geometry_normal[i], (1, 2, 0)), 0.0, 1.0)
         pred_rgb_i = np.clip(np.transpose(pred_rgb_np[i], (1, 2, 0)), 0.0, 1.0)
         pred_geo_i = np.clip(np.transpose(pred_geo_np[i], (1, 2, 0)), 0.0, 1.0)
-        pred_normal_i = np.clip(np.transpose(pred_normal_np[i], (1, 2, 0)), 0.0, 1.0)
+        pred_detail_normal_i = np.clip(np.transpose(pred_detail_normal_np[i], (1, 2, 0)), -1.0, 1.0)
+        pred_geometry_normal_i = np.clip(np.transpose(pred_geometry_normal_np[i], (1, 2, 0)), 0.0, 1.0)
         gt_mask_i = np.clip(gt_mask[i, 0], 0.0, 1.0)
         pred_mask_i = np.clip(pred_mask_np[i, 0], 0.0, 1.0)
         pred_masked_i = pred_rgb_i * pred_mask_i[..., None]
         effective_mask = gt_mask_i if float(mask_valid[i]) > 0.5 else np.ones_like(gt_mask_i)
         rgb_diff_i = np.abs(pred_rgb_i - gt_rgb_i) * effective_mask[..., None]
         geo_diff_i = np.abs(pred_geo_i - gt_geo_i) * effective_mask[..., None]
-        normal_diff_i = np.abs(pred_normal_i - gt_normal_i) * effective_mask[..., None]
-        if float(rgb_valid[i]) <= 0.5:
-            gt_rgb_i = np.zeros_like(gt_rgb_i)
-            rgb_diff_i = np.zeros_like(rgb_diff_i)
-        if float(geo_valid[i]) <= 0.5:
-            gt_geo_i = np.zeros_like(gt_geo_i)
-            geo_diff_i = np.zeros_like(geo_diff_i)
-        if float(normal_valid[i]) <= 0.5:
-            gt_normal_i = np.zeros_like(gt_normal_i)
-            normal_diff_i = np.zeros_like(normal_diff_i)
+        detail_normal_diff_i = np.abs(pred_detail_normal_i - gt_detail_normal_i) * effective_mask[..., None]
+        geometry_normal_diff_i = np.abs(pred_geometry_normal_i - gt_geometry_normal_i) * effective_mask[..., None]
         if float(mask_valid[i]) <= 0.5:
             gt_mask_i = np.zeros_like(gt_mask_i)
         gt_mask_vis = np.repeat(gt_mask_i[..., None], 3, axis=2)
@@ -751,9 +779,12 @@ def _save_preview(
                 _to_vis_map(gt_geo_i),
                 _to_vis_map(pred_geo_i),
                 _to_vis_map(geo_diff_i),
-                _to_vis_map(gt_normal_i),
-                _to_vis_map(pred_normal_i),
-                _to_vis_map(normal_diff_i),
+                _to_vis_map(gt_geometry_normal_i),
+                _to_vis_map(pred_geometry_normal_i),
+                _to_vis_map(geometry_normal_diff_i),
+                _to_vis_map(gt_detail_normal_i, signed=True),
+                _to_vis_map(pred_detail_normal_i, signed=True),
+                _to_vis_map(detail_normal_diff_i),
                 _to_vis_map(gt_mask_vis),
                 _to_vis_map(pred_mask_vis),
             ],
@@ -785,6 +816,8 @@ def train_one_epoch(
     total_loss = 0.0
     total_rgb_loss = 0.0
     total_geo_loss = 0.0
+    total_detail_normal_loss = 0.0
+    total_geometry_normal_loss = 0.0
     total_normal_loss = 0.0
     total_mask_loss = 0.0
     total_mask_bce = 0.0
@@ -805,23 +838,19 @@ def train_one_epoch(
 
         rgb = batch["rgb"].to(device, non_blocking=True)
         
-        # Only load ground truth data that will be used in loss calculation
         gt_rgb = batch["basecolor"].to(device, non_blocking=True) if predict_basecolor else None
-        rgb_valid = batch["basecolor_valid"].to(device, non_blocking=True) if predict_basecolor else None
         gt_geo = batch["geo"].to(device, non_blocking=True) if predict_geo else None
-        geo_valid = batch["geo_valid"].to(device, non_blocking=True) if predict_geo else None
-        gt_normal = batch["normal"].to(device, non_blocking=True) if predict_normal else None
-        normal_valid = batch["normal_valid"].to(device, non_blocking=True) if predict_normal else None
-        
+        gt_detail_normal = _get_detail_normal_batch_tensors(batch, device) if predict_normal else None
+        gt_geometry_normal = _get_geometry_normal_batch_tensors(batch, device) if predict_normal else None
         face_mask = batch["face_mask"].to(device, non_blocking=True)
         face_mask_valid = batch["face_mask_valid"].to(device, non_blocking=True)
+        error_mask = batch["error_mask"].to(device, non_blocking=True)
 
         rgb_in = _normalize_imagenet(rgb)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype):
             pred = model(rgb_in)
-            # Use face_mask as reference for output size (always available)
             target_size = face_mask.shape[-2:]
             if pred.shape[-2:] != target_size:
                 pred = F.interpolate(pred, size=target_size, mode="bilinear", align_corners=False)
@@ -833,31 +862,40 @@ def train_one_epoch(
         )
         rgb_loss = _masked_feature_loss(
             pred_parts["rgb"].float() if pred_parts["rgb"] is not None else None,
-            gt_rgb.float(),
-            rgb_valid,
+            gt_rgb.float() if gt_rgb is not None else None,
             face_mask=face_mask.float(),
             face_mask_valid=face_mask_valid,
+            error_mask=error_mask.float(),
         )
         geo_loss = _masked_feature_loss(
             pred_parts["geo"].float() if pred_parts["geo"] is not None else None,
-            gt_geo.float(),
-            geo_valid,
+            gt_geo.float() if gt_geo is not None else None,
             face_mask=face_mask.float(),
             face_mask_valid=face_mask_valid,
+            error_mask=error_mask.float(),
         )
-        normal_loss = _masked_normal_cosine_loss(
-            pred_parts["normal"].float() if pred_parts["normal"] is not None else None,
-            gt_normal.float(),
-            normal_valid,
+        detail_normal_loss = _masked_feature_loss(
+            pred_parts["detail_normal"].float() if pred_parts["detail_normal"] is not None else None,
+            gt_detail_normal.float() if gt_detail_normal is not None else None,
             face_mask=face_mask.float(),
             face_mask_valid=face_mask_valid,
+            error_mask=error_mask.float(),
         )
+        geometry_normal_loss = _masked_normal_cosine_loss(
+            pred_parts["geometry_normal"].float() if pred_parts["geometry_normal"] is not None else None,
+            gt_geometry_normal.float() if gt_geometry_normal is not None else None,
+            face_mask=face_mask.float(),
+            face_mask_valid=face_mask_valid,
+            error_mask=error_mask.float(),
+        )
+        normal_loss = detail_normal_loss + geometry_normal_loss
         mask_loss, mask_bce, mask_dice = _combined_mask_loss(
             pred_parts["mask_logits"].float() if pred_parts["mask_logits"] is not None else None,
             face_mask.float(),
             face_mask_valid,
             bce_lambda=train_cfg.mask_bce_lambda,
             dice_lambda=train_cfg.mask_dice_lambda,
+            error_mask=error_mask.float(),
         )
         loss = rgb_loss + geo_loss + normal_loss + mask_loss
 
@@ -886,6 +924,8 @@ def train_one_epoch(
         total_loss += float(loss.item())
         total_rgb_loss += float(rgb_loss.item())
         total_geo_loss += float(geo_loss.item())
+        total_detail_normal_loss += float(detail_normal_loss.item())
+        total_geometry_normal_loss += float(geometry_normal_loss.item())
         total_normal_loss += float(normal_loss.item())
         total_mask_loss += float(mask_loss.item())
         total_mask_bce += float(mask_bce.item())
@@ -910,6 +950,8 @@ def train_one_epoch(
                 total_loss,
                 total_rgb_loss,
                 total_geo_loss,
+                total_detail_normal_loss,
+                total_geometry_normal_loss,
                 total_normal_loss,
                 total_mask_loss,
                 total_mask_bce,
@@ -923,17 +965,21 @@ def train_one_epoch(
         total_loss = loss_tensor[0].item()
         total_rgb_loss = loss_tensor[1].item()
         total_geo_loss = loss_tensor[2].item()
-        total_normal_loss = loss_tensor[3].item()
-        total_mask_loss = loss_tensor[4].item()
-        total_mask_bce = loss_tensor[5].item()
-        total_mask_dice = loss_tensor[6].item()
-        n = loss_tensor[7].item()
+        total_detail_normal_loss = loss_tensor[3].item()
+        total_geometry_normal_loss = loss_tensor[4].item()
+        total_normal_loss = loss_tensor[5].item()
+        total_mask_loss = loss_tensor[6].item()
+        total_mask_bce = loss_tensor[7].item()
+        total_mask_dice = loss_tensor[8].item()
+        n = loss_tensor[9].item()
 
     denom = max(n, 1)
     return {
         "avg_loss": total_loss / denom,
         "avg_rgb_loss": total_rgb_loss / denom,
         "avg_geo_loss": total_geo_loss / denom,
+        "avg_detail_normal_loss": total_detail_normal_loss / denom,
+        "avg_geometry_normal_loss": total_geometry_normal_loss / denom,
         "avg_normal_loss": total_normal_loss / denom,
         "avg_mask_loss": total_mask_loss / denom,
         "avg_mask_bce": total_mask_bce / denom,
@@ -956,6 +1002,8 @@ def validate_one_epoch(
     total_loss = 0.0
     total_rgb_loss = 0.0
     total_geo_loss = 0.0
+    total_detail_normal_loss = 0.0
+    total_geometry_normal_loss = 0.0
     total_normal_loss = 0.0
     total_mask_loss = 0.0
     total_mask_bce = 0.0
@@ -964,20 +1012,16 @@ def validate_one_epoch(
     for batch in loader:
         rgb = batch["rgb"].to(device, non_blocking=True)
         
-        # Only load ground truth data that will be used in loss calculation
         gt_rgb = batch["basecolor"].to(device, non_blocking=True) if predict_basecolor else None
-        rgb_valid = batch["basecolor_valid"].to(device, non_blocking=True) if predict_basecolor else None
         gt_geo = batch["geo"].to(device, non_blocking=True) if predict_geo else None
-        geo_valid = batch["geo_valid"].to(device, non_blocking=True) if predict_geo else None
-        gt_normal = batch["normal"].to(device, non_blocking=True) if predict_normal else None
-        normal_valid = batch["normal_valid"].to(device, non_blocking=True) if predict_normal else None
-        
+        gt_detail_normal = _get_detail_normal_batch_tensors(batch, device) if predict_normal else None
+        gt_geometry_normal = _get_geometry_normal_batch_tensors(batch, device) if predict_normal else None
         face_mask = batch["face_mask"].to(device, non_blocking=True)
         face_mask_valid = batch["face_mask_valid"].to(device, non_blocking=True)
+        error_mask = batch["error_mask"].to(device, non_blocking=True)
 
         rgb_in = _normalize_imagenet(rgb)
         pred = model(rgb_in)
-        # Use face_mask as reference for output size (always available)
         target_size = face_mask.shape[-2:]
         if pred.shape[-2:] != target_size:
             pred = F.interpolate(pred, size=target_size, mode="bilinear", align_corners=False)
@@ -989,37 +1033,48 @@ def validate_one_epoch(
         )
         rgb_loss = _masked_feature_loss(
             pred_parts["rgb"].float() if pred_parts["rgb"] is not None else None,
-            gt_rgb.float(),
-            rgb_valid,
+            gt_rgb.float() if gt_rgb is not None else None,
             face_mask=face_mask.float(),
             face_mask_valid=face_mask_valid,
+            error_mask=error_mask.float(),
         )
         geo_loss = _masked_feature_loss(
             pred_parts["geo"].float() if pred_parts["geo"] is not None else None,
-            gt_geo.float(),
-            geo_valid,
+            gt_geo.float() if gt_geo is not None else None,
             face_mask=face_mask.float(),
             face_mask_valid=face_mask_valid,
+            error_mask=error_mask.float(),
         )
-        normal_loss = _masked_normal_cosine_loss(
-            pred_parts["normal"].float() if pred_parts["normal"] is not None else None,
-            gt_normal.float(),
-            normal_valid,
+        detail_normal_loss = _masked_feature_loss(
+            pred_parts["detail_normal"].float() if pred_parts["detail_normal"] is not None else None,
+            gt_detail_normal.float() if gt_detail_normal is not None else None,
             face_mask=face_mask.float(),
             face_mask_valid=face_mask_valid,
+            error_mask=error_mask.float(),
         )
+        geometry_normal_loss = _masked_normal_cosine_loss(
+            pred_parts["geometry_normal"].float() if pred_parts["geometry_normal"] is not None else None,
+            gt_geometry_normal.float() if gt_geometry_normal is not None else None,
+            face_mask=face_mask.float(),
+            face_mask_valid=face_mask_valid,
+            error_mask=error_mask.float(),
+        )
+        normal_loss = detail_normal_loss + geometry_normal_loss
         mask_loss, mask_bce, mask_dice = _combined_mask_loss(
             pred_parts["mask_logits"].float() if pred_parts["mask_logits"] is not None else None,
             face_mask.float(),
             face_mask_valid,
             bce_lambda=train_cfg.mask_bce_lambda,
             dice_lambda=train_cfg.mask_dice_lambda,
+            error_mask=error_mask.float(),
         )
         loss = rgb_loss + geo_loss + normal_loss + mask_loss
         if torch.isfinite(loss):
             total_loss += float(loss.item())
             total_rgb_loss += float(rgb_loss.item())
             total_geo_loss += float(geo_loss.item())
+            total_detail_normal_loss += float(detail_normal_loss.item())
+            total_geometry_normal_loss += float(geometry_normal_loss.item())
             total_normal_loss += float(normal_loss.item())
             total_mask_loss += float(mask_loss.item())
             total_mask_bce += float(mask_bce.item())
@@ -1033,6 +1088,8 @@ def validate_one_epoch(
                 total_loss,
                 total_rgb_loss,
                 total_geo_loss,
+                total_detail_normal_loss,
+                total_geometry_normal_loss,
                 total_normal_loss,
                 total_mask_loss,
                 total_mask_bce,
@@ -1046,17 +1103,21 @@ def validate_one_epoch(
         total_loss = loss_tensor[0].item()
         total_rgb_loss = loss_tensor[1].item()
         total_geo_loss = loss_tensor[2].item()
-        total_normal_loss = loss_tensor[3].item()
-        total_mask_loss = loss_tensor[4].item()
-        total_mask_bce = loss_tensor[5].item()
-        total_mask_dice = loss_tensor[6].item()
-        n = loss_tensor[7].item()
+        total_detail_normal_loss = loss_tensor[3].item()
+        total_geometry_normal_loss = loss_tensor[4].item()
+        total_normal_loss = loss_tensor[5].item()
+        total_mask_loss = loss_tensor[6].item()
+        total_mask_bce = loss_tensor[7].item()
+        total_mask_dice = loss_tensor[8].item()
+        n = loss_tensor[9].item()
 
     denom = max(n, 1)
     return {
         "avg_loss": total_loss / denom,
         "avg_rgb_loss": total_rgb_loss / denom,
         "avg_geo_loss": total_geo_loss / denom,
+        "avg_detail_normal_loss": total_detail_normal_loss / denom,
+        "avg_geometry_normal_loss": total_geometry_normal_loss / denom,
         "avg_normal_loss": total_normal_loss / denom,
         "avg_mask_loss": total_mask_loss / denom,
         "avg_mask_bce": total_mask_bce / denom,
@@ -1160,9 +1221,13 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
         print(
             f"Train Loss: {train_out['avg_loss']:.6f} | Val Loss: {val_out['avg_loss']:.6f} "
             f"| Train RGB: {train_out['avg_rgb_loss']:.6f} | Train Geo: {train_out['avg_geo_loss']:.6f} "
-            f"| Train Normal: {train_out['avg_normal_loss']:.6f} | Train Mask: {train_out['avg_mask_loss']:.6f} "
+            f"| Train Normal: {train_out['avg_normal_loss']:.6f} "
+            f"(detail {train_out['avg_detail_normal_loss']:.6f} + geom {train_out['avg_geometry_normal_loss']:.6f}) "
+            f"| Train Mask: {train_out['avg_mask_loss']:.6f} "
             f"| Val RGB: {val_out['avg_rgb_loss']:.6f} | Val Geo: {val_out['avg_geo_loss']:.6f} "
-            f"| Val Normal: {val_out['avg_normal_loss']:.6f} | Val Mask: {val_out['avg_mask_loss']:.6f}"
+            f"| Val Normal: {val_out['avg_normal_loss']:.6f} "
+            f"(detail {val_out['avg_detail_normal_loss']:.6f} + geom {val_out['avg_geometry_normal_loss']:.6f}) "
+            f"| Val Mask: {val_out['avg_mask_loss']:.6f}"
         )
         writer.add_scalar("Loss/Train", train_out["avg_loss"], epoch)
         writer.add_scalar("Loss/Val", val_out["avg_loss"], epoch)
@@ -1170,6 +1235,10 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
         writer.add_scalar("Loss/RGB_Val", val_out["avg_rgb_loss"], epoch)
         writer.add_scalar("Loss/Geo_Train", train_out["avg_geo_loss"], epoch)
         writer.add_scalar("Loss/Geo_Val", val_out["avg_geo_loss"], epoch)
+        writer.add_scalar("Loss/DetailNormal_Train", train_out["avg_detail_normal_loss"], epoch)
+        writer.add_scalar("Loss/DetailNormal_Val", val_out["avg_detail_normal_loss"], epoch)
+        writer.add_scalar("Loss/GeometryNormal_Train", train_out["avg_geometry_normal_loss"], epoch)
+        writer.add_scalar("Loss/GeometryNormal_Val", val_out["avg_geometry_normal_loss"], epoch)
         writer.add_scalar("Loss/Normal_Train", train_out["avg_normal_loss"], epoch)
         writer.add_scalar("Loss/Normal_Val", val_out["avg_normal_loss"], epoch)
         writer.add_scalar("Loss/Mask_Train", train_out["avg_mask_loss"], epoch)
@@ -1368,9 +1437,13 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
             print(
                 f"Train Loss: {train_out['avg_loss']:.6f} | Val Loss: {val_out['avg_loss']:.6f} "
                 f"| Train RGB: {train_out['avg_rgb_loss']:.6f} | Train Geo: {train_out['avg_geo_loss']:.6f} "
-                f"| Train Normal: {train_out['avg_normal_loss']:.6f} | Train Mask: {train_out['avg_mask_loss']:.6f} "
+                f"| Train Normal: {train_out['avg_normal_loss']:.6f} "
+                f"(detail {train_out['avg_detail_normal_loss']:.6f} + geom {train_out['avg_geometry_normal_loss']:.6f}) "
+                f"| Train Mask: {train_out['avg_mask_loss']:.6f} "
                 f"| Val RGB: {val_out['avg_rgb_loss']:.6f} | Val Geo: {val_out['avg_geo_loss']:.6f} "
-                f"| Val Normal: {val_out['avg_normal_loss']:.6f} | Val Mask: {val_out['avg_mask_loss']:.6f}"
+                f"| Val Normal: {val_out['avg_normal_loss']:.6f} "
+                f"(detail {val_out['avg_detail_normal_loss']:.6f} + geom {val_out['avg_geometry_normal_loss']:.6f}) "
+                f"| Val Mask: {val_out['avg_mask_loss']:.6f}"
             )
             writer.add_scalar("Loss/Train", train_out["avg_loss"], epoch)
             writer.add_scalar("Loss/Val", val_out["avg_loss"], epoch)
@@ -1378,6 +1451,10 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
             writer.add_scalar("Loss/RGB_Val", val_out["avg_rgb_loss"], epoch)
             writer.add_scalar("Loss/Geo_Train", train_out["avg_geo_loss"], epoch)
             writer.add_scalar("Loss/Geo_Val", val_out["avg_geo_loss"], epoch)
+            writer.add_scalar("Loss/DetailNormal_Train", train_out["avg_detail_normal_loss"], epoch)
+            writer.add_scalar("Loss/DetailNormal_Val", val_out["avg_detail_normal_loss"], epoch)
+            writer.add_scalar("Loss/GeometryNormal_Train", train_out["avg_geometry_normal_loss"], epoch)
+            writer.add_scalar("Loss/GeometryNormal_Val", val_out["avg_geometry_normal_loss"], epoch)
             writer.add_scalar("Loss/Normal_Train", train_out["avg_normal_loss"], epoch)
             writer.add_scalar("Loss/Normal_Val", val_out["avg_normal_loss"], epoch)
             writer.add_scalar("Loss/Mask_Train", train_out["avg_mask_loss"], epoch)
