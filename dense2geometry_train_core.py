@@ -17,10 +17,13 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import numpy as np
 
+import cv2
+from pathlib import Path
+
 from dense2geometry import Dense2Geometry, DenseStageConfig
 from dense2geometry_dataset import Dense2GeometryDataset, dense2geometry_collate_fn
 from train_loss_helper import MetricAccumulator, compute_weighted_l1
-from train_visualize_helper import load_mesh_topology, save_dense2geometry_visualizations
+from train_visualize_helper import load_mesh_topology, save_dense2geometry_visualizations, create_combined_overlay
 
 
 @dataclass
@@ -453,6 +456,10 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
             outputs = model(rgb)
             mesh_pred = outputs["mesh"].float()
             loss = compute_weighted_l1(mesh_pred, mesh_gt, mesh_w6)
+            # Deep supervision: auxiliary losses from intermediate layers
+            aux_weight = 0.3
+            for aux_mesh in outputs.get("intermediate_meshes", []):
+                loss = loss + aux_weight * compute_weighted_l1(aux_mesh.float(), mesh_gt, mesh_w6)
 
         loss_finite_local = torch.isfinite(loss).to(device=device, dtype=torch.int32)
         if world_size > 1 and dist.is_available() and dist.is_initialized():
@@ -599,6 +606,266 @@ def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, 
     }
 
 
+SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+ALIGN_5PT_TARGET_NORM = np.array(
+    [
+        [0.35, 0.38],
+        [0.65, 0.38],
+        [0.50, 0.56],
+        [0.40, 0.72],
+        [0.60, 0.72],
+    ],
+    dtype=np.float32,
+)
+
+
+def _detect_five_points_dlib(img_bgr: np.ndarray, dlib_mod, predictor) -> np.ndarray | None:
+    """Detect 5 face landmarks using dlib (eyes, nose, mouth corners)."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    detector = dlib_mod.get_frontal_face_detector()
+    faces = detector(gray, 1)
+    if len(faces) == 0:
+        return None
+    face = max(faces, key=lambda r: float(r.width() * r.height()))
+    shape = predictor(gray, face)
+
+    def _pt(i: int) -> np.ndarray:
+        return np.array([shape.part(i).x, shape.part(i).y], dtype=np.float32)
+
+    right_eye = np.mean([_pt(i) for i in range(36, 42)], axis=0)
+    left_eye = np.mean([_pt(i) for i in range(42, 48)], axis=0)
+    nose = _pt(30)
+    mouth_right = _pt(48)
+    mouth_left = _pt(54)
+    return np.stack([right_eye, left_eye, nose, mouth_right, mouth_left], axis=0).astype(np.float32)
+
+
+def predict_test_folder(
+    epoch: int,
+    model: nn.Module,
+    device: torch.device,
+    test_folder: str,
+    output_dir: str,
+    mesh_topology: dict | None,
+    mesh_restore_indices: np.ndarray | None,
+    image_size: int = 1024,
+    amp_dtype: torch.dtype = torch.float16,
+) -> None:
+    """Run model prediction on test images (no GT) with dlib 5pt alignment and save visualizations."""
+    from align_5pt_helper import Align5PtHelper
+
+    test_path = Path(test_folder)
+    if not test_path.exists():
+        return
+    image_files = sorted(
+        p for p in test_path.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
+    )
+    if not image_files:
+        return
+
+    # Initialize dlib face detector
+    dlib_mod = None
+    dlib_predictor = None
+    predictor_candidates = [
+        os.path.join("models", "shape_predictor_68_face_landmarks.dat"),
+        os.path.join("model", "shape_predictor_68_face_landmarks.dat"),
+    ]
+    try:
+        import dlib as dlib_mod
+        for ppath in predictor_candidates:
+            if os.path.exists(ppath):
+                dlib_predictor = dlib_mod.shape_predictor(ppath)
+                print(f"[TestPredict] Using dlib predictor: {ppath}")
+                break
+        if dlib_predictor is None:
+            print("[TestPredict] Warning: dlib predictor .dat not found, will use bbox fallback")
+    except ImportError:
+        print("[TestPredict] Warning: dlib not available, will use bbox fallback")
+
+    # Initialize alignment helper (no jitter for inference)
+    align_helper = Align5PtHelper(
+        image_size=image_size,
+        indices=np.arange(5, dtype=np.int64),
+        target_norm=ALIGN_5PT_TARGET_NORM,
+        jitter_std=0.0,
+        output_scale=0.75,
+        direction_shift=0.08,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    raw_model = _unwrap_model(model)
+    raw_model.eval()
+    vis_size = 512
+
+    def _restore(values: np.ndarray) -> np.ndarray:
+        out = np.asarray(values).copy()
+        if mesh_restore_indices is not None:
+            out = out[mesh_restore_indices]
+        return out
+
+    def _prepare_overlay_points(coords_uv: np.ndarray, w: int, h: int) -> np.ndarray:
+        pts = np.asarray(coords_uv, dtype=np.float32).copy()
+        invalid = ~np.isfinite(pts).all(axis=1)
+        invalid |= (pts[:, 0] < 0.0) | (pts[:, 1] < 0.0)
+        pts[invalid] = np.nan
+        pts[:, 0] *= float(w)
+        pts[:, 1] *= float(h)
+        return pts
+
+    def _approximate_points_from_bbox(w: float, h: float) -> np.ndarray:
+        return np.array(
+            [
+                [0.35 * w, 0.38 * h],
+                [0.65 * w, 0.38 * h],
+                [0.50 * w, 0.56 * h],
+                [0.42 * w, 0.74 * h],
+                [0.58 * w, 0.74 * h],
+            ],
+            dtype=np.float32,
+        )
+
+    for img_path in image_files:
+        basename = img_path.stem
+        img_bgr = cv2.imread(str(img_path))
+        if img_bgr is None:
+            print(f"[TestPredict] Failed to read: {img_path}")
+            continue
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        h_orig, w_orig = img_rgb.shape[:2]
+
+        # Resize to image_size for face detection if needed
+        if h_orig != image_size or w_orig != image_size:
+            detect_rgb = cv2.resize(img_rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            detect_bgr = cv2.cvtColor(detect_rgb, cv2.COLOR_RGB2BGR)
+        else:
+            detect_rgb = img_rgb
+            detect_bgr = img_bgr
+
+        # Detect 5 face landmarks
+        five_pts = None
+        if dlib_mod is not None and dlib_predictor is not None:
+            five_pts = _detect_five_points_dlib(detect_bgr, dlib_mod, dlib_predictor)
+        if five_pts is None:
+            five_pts = _approximate_points_from_bbox(float(image_size), float(image_size))
+        five_valid = np.ones((5,), dtype=bool)
+
+        # Estimate alignment and warp
+        face_dir = Align5PtHelper.estimate_face_direction(five_pts, five_valid)
+        is_extreme = Align5PtHelper.is_extreme_pose(five_pts, five_valid)
+        m = align_helper.estimate_alignment_matrix(
+            five_pts_px=five_pts,
+            five_valid=five_valid,
+            src_w=image_size,
+            src_h=image_size,
+            split="val",
+            head_center_px=None,
+            is_extreme_pose=is_extreme,
+            face_direction=face_dir,
+        )
+        if m is None:
+            print(f"[TestPredict] Failed to align: {img_path}")
+            continue
+
+        img_aligned = cv2.warpAffine(
+            detect_rgb,
+            m,
+            (image_size, image_size),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+
+        # Draw 5pt on aligned image for visualization
+        ones = np.ones((five_pts.shape[0], 1), dtype=np.float32)
+        five_pts_aligned = (m @ np.concatenate([five_pts.astype(np.float32), ones], axis=1).T).T
+        aligned_5pt_vis = img_aligned.copy()
+        _5pt_colors = [(255, 80, 80), (80, 200, 80), (80, 150, 255), (255, 200, 50), (220, 80, 220)]
+        for pt, color in zip(five_pts_aligned, _5pt_colors):
+            x, y = int(round(float(pt[0]))), int(round(float(pt[1])))
+            cv2.circle(aligned_5pt_vis, (x, y), 8, color, -1, cv2.LINE_AA)
+            cv2.circle(aligned_5pt_vis, (x, y), 10, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Convert to tensor [1, 3, H, W] in [0, 1]
+        rgb_tensor = torch.from_numpy(
+            img_aligned.astype(np.float32).transpose(2, 0, 1) / 255.0
+        ).unsqueeze(0).to(device)
+
+        with torch.inference_mode():
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
+                outputs = raw_model(rgb_tensor)
+
+        # Extract predictions
+        pred_mesh = outputs["mesh"][0].detach().cpu().float().numpy()
+        searched_uv = outputs["searched_uv"][0].detach().cpu().float().numpy()
+        match_mask = outputs["match_mask"][0].detach().cpu().float().numpy()
+        pred_geo = outputs["pred_geo"][0].detach().cpu().float().numpy()
+        pred_mask_logits = outputs["pred_mask_logits"][0].detach().cpu()
+        pred_mask = torch.sigmoid(pred_mask_logits[0]).numpy()
+
+        # Build visualization panels
+        src_vis = cv2.resize(detect_rgb, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+        aligned_5pt_vis = cv2.resize(aligned_5pt_vis, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+
+        # Geo map
+        geo_vis = np.transpose(pred_geo, (1, 2, 0))
+        geo_vis = np.nan_to_num(geo_vis, nan=0.0, posinf=1.0, neginf=0.0)
+        geo_vis = np.clip(geo_vis, 0.0, 1.0)
+        mask_resized = cv2.resize(np.clip(pred_mask, 0.0, 1.0), (geo_vis.shape[1], geo_vis.shape[0]), interpolation=cv2.INTER_LINEAR)
+        geo_vis = geo_vis * mask_resized[..., None]
+        geo_vis = cv2.resize((geo_vis * 255.0).astype(np.uint8), (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+
+        # Basecolor map
+        pred_basecolor = outputs["pred_basecolor"][0].detach().cpu().float().numpy()
+        base_vis = np.transpose(pred_basecolor, (1, 2, 0))
+        base_vis = np.nan_to_num(base_vis, nan=0.0, posinf=1.0, neginf=0.0)
+        base_vis = np.clip(base_vis, 0.0, 1.0) * mask_resized[..., None]
+        base_vis = cv2.resize((base_vis * 255.0).astype(np.uint8), (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+
+        # Normal map
+        pred_normal = outputs["pred_normal"][0].detach().cpu().float().numpy()
+        normal_vis = np.transpose(pred_normal, (1, 2, 0))
+        normal_vis = np.nan_to_num(normal_vis, nan=0.0, posinf=1.0, neginf=0.0)
+        normal_vis = np.clip(normal_vis, 0.0, 1.0) * mask_resized[..., None]
+        normal_vis = cv2.resize((normal_vis * 255.0).astype(np.uint8), (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+
+        # Searched points overlay on aligned image
+        searched_uv_r = _restore(searched_uv.copy())
+        match_mask_r = _restore(match_mask > 0.5)
+        searched_uv_r[~match_mask_r] = -1.0
+
+        searched_pts = _prepare_overlay_points(searched_uv_r, image_size, image_size)
+        searched_overlay = img_aligned.copy()
+        for idx in range(searched_pts.shape[0]):
+            px, py = searched_pts[idx]
+            if not np.isfinite(px) or not np.isfinite(py):
+                continue
+            color = (0, 220, 0) if match_mask_r[idx] else (0, 80, 255)
+            cv2.circle(searched_overlay, (int(round(px)), int(round(py))), 1, color, -1, cv2.LINE_AA)
+        searched_overlay = cv2.resize(searched_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+
+        # Predicted mesh overlay on aligned image
+        pred_uv = _restore(pred_mesh[:, 3:5])
+        pred_pts = _prepare_overlay_points(pred_uv, image_size, image_size)
+        if mesh_topology:
+            pred_overlay = create_combined_overlay(img_aligned, pred_pts, mesh_topology)
+        else:
+            pred_overlay = img_aligned.copy()
+            for idx in range(pred_pts.shape[0]):
+                px, py = pred_pts[idx]
+                if np.isfinite(px) and np.isfinite(py):
+                    cv2.circle(pred_overlay, (int(round(px)), int(round(py))), 1, (80, 255, 255), -1, cv2.LINE_AA)
+        pred_overlay = cv2.resize(pred_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+
+        # Compose: src | aligned+5pt | geo | basecolor | normal | searched | mesh overlay
+        row = np.concatenate([src_vis, aligned_5pt_vis, geo_vis, base_vis, normal_vis, searched_overlay, pred_overlay], axis=1)
+        out_path = os.path.join(output_dir, f"{basename}.png")
+        cv2.imwrite(out_path, cv2.cvtColor(row, cv2.COLOR_RGB2BGR))
+
+    print(f"[TestPredict] Saved epoch {epoch + 1} test predictions to {output_dir}")
+
+
 def log_and_checkpoint(epoch: int, rank: int, built, train_out, val_out, writer, train_cfg: TrainConfig, mesh_topology, mesh_restore_indices):
     if rank != 0:
         return
@@ -693,6 +960,21 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
             train_out = train_one_epoch(epoch, rank, world_size, data_cfg, built, train_loader, train_sampler)
             val_out = validate_one_epoch(rank, world_size, data_cfg, built, val_loader)
             log_and_checkpoint(epoch, rank, built, train_out, val_out, writer, train_cfg, mesh_topology, mesh_restore_indices)
+            if rank == 0:
+                try:
+                    predict_test_folder(
+                        epoch=epoch,
+                        model=built["model"],
+                        device=torch.device("cuda:0"),
+                        test_folder="test",
+                        output_dir="test_predictions",
+                        mesh_topology=mesh_topology,
+                        mesh_restore_indices=mesh_restore_indices,
+                        image_size=data_cfg.image_size,
+                        amp_dtype=built["amp_dtype"],
+                    )
+                except Exception as exc:
+                    print(f"[TestPredict] Warning: {exc}")
             built["scheduler"].step()
     finally:
         if writer:

@@ -13,10 +13,32 @@ def compute_dense_output_channels(
     predict_geo: bool,
     predict_normal: bool,
 ) -> int:
-    dense_target_count = int(bool(predict_basecolor)) + int(bool(predict_geo)) + int(bool(predict_normal))
+    dense_target_count = int(bool(predict_basecolor)) + int(bool(predict_geo))
+    if predict_normal:
+        dense_target_count += 2  # detail screen normal + geometry normal
     if dense_target_count <= 0:
         raise ValueError("At least one of predict_basecolor, predict_geo, or predict_normal must be enabled.")
     return dense_target_count * 3 + 1
+
+
+def _activate_detail_normal(detail_raw: torch.Tensor) -> torch.Tensor:
+    # Detail screen normal is a signed residual in [-1, 1].
+    return detail_raw.tanh()
+
+
+def _activate_geometry_normal(normal_raw: torch.Tensor) -> torch.Tensor:
+    # Geometry normal remains a unit vector encoded in [0, 1].
+    normal_unnorm = normal_raw.tanh()
+    normal_normalized = F.normalize(normal_unnorm, dim=1, eps=1e-6)
+    normal_01 = normal_normalized * 0.5 + 0.5
+    return torch.cat(
+        [
+            1.0 - normal_01[:, 0:1],
+            1.0 - normal_01[:, 1:2],
+            normal_01[:, 2:3],
+        ],
+        dim=1,
+    )
 
 
 class PositionalEncoding2D(nn.Module):
@@ -231,8 +253,10 @@ class MultiTaskFPNDecoder(nn.Module):
             self.geo_branch = None
             
         if predict_normal:
+            self.geometry_normal_branch = IntegratedTaskBranch(self.ch4, 3, output_size)
             self.normal_branch = IntegratedTaskBranch(self.ch4, 3, output_size)
         else:
+            self.geometry_normal_branch = None
             self.normal_branch = None
         
         # Mask always trained
@@ -276,12 +300,8 @@ class MultiTaskFPNDecoder(nn.Module):
             outputs.append(geo_out)
         
         if self.normal_branch is not None:
-            # Output unit-length normals encoded in [0,1] range
-            normal_raw = self.normal_branch(p4)  # [B, 3, H, W] raw logits
-            normal_unnorm = normal_raw.tanh()  # [-1, 1] range
-            normal_normalized = F.normalize(normal_unnorm, dim=1, eps=1e-6)  # Unit length
-            normal_out = normal_normalized * 0.5 + 0.5  # [0, 1] range for output
-            outputs.append(normal_out)
+            outputs.append(_activate_geometry_normal(self.geometry_normal_branch(p4)))
+            outputs.append(_activate_detail_normal(self.normal_branch(p4)))
         
         mask_logits = self.mask_branch(p4)  # [B, 1, H, W]
         outputs.append(mask_logits)
@@ -351,6 +371,7 @@ class DenseImageDecoder(nn.Module):
 
         self.rgb_head = PredictionHead(self.ch1, 3) if self.predict_basecolor else None
         self.geo_head = PredictionHead(self.ch1, 3) if self.predict_geo else None
+        self.geometry_normal_head = PredictionHead(self.ch1, 3) if self.predict_normal else None
         self.normal_head = PredictionHead(self.ch1, 3) if self.predict_normal else None
         self.mask_head = PredictionHead(self.ch1, 1)
 
@@ -397,12 +418,8 @@ class DenseImageDecoder(nn.Module):
         if self.geo_head is not None:
             outputs.append(torch.sigmoid(self.geo_head(x)))
         if self.normal_head is not None:
-            # Output unit-length normals encoded in [0,1] range
-            normal_raw = self.normal_head(x)  # [B, 3, H, W] raw logits
-            normal_unnorm = normal_raw.tanh()  # [-1, 1] range
-            normal_normalized = F.normalize(normal_unnorm, dim=1, eps=1e-6)  # Unit length
-            normal_out = normal_normalized * 0.5 + 0.5  # [0, 1] range for output
-            outputs.append(normal_out)
+            outputs.append(_activate_geometry_normal(self.geometry_normal_head(x)))
+            outputs.append(_activate_detail_normal(self.normal_head(x)))
         outputs.append(self.mask_head(x))
         return torch.cat(outputs, dim=1)
 
@@ -410,7 +427,7 @@ class DenseImageDecoder(nn.Module):
 class DenseImageTransformer(nn.Module):
     """
     ConvNeXt feature extractor + transformer + CNN decoder for
-    basecolor + geo + normal + mandatory mask prediction.
+    basecolor + geo + geometry normal + detail normal + mandatory mask prediction.
     
     Supports two decoder types:
     - "shared": DenseImageDecoder (memory efficient, shared features)
@@ -520,7 +537,8 @@ class DenseImageTransformer(nn.Module):
         """
         Returns:
             [B, C, H, W], where C = 3 * (#enabled dense targets) + 1.
-            Dense targets are emitted in this order: basecolor, geo, normal, then raw mask logit.
+            Dense targets are emitted in this order:
+            basecolor, geo, geometry normal, detail normal, then raw mask logit.
         """
         features = self.backbone(rgb)
         f4 = features["stride4"]

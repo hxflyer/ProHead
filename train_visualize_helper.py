@@ -556,6 +556,22 @@ def create_combined_overlay(rgb_image, landmarks, topology):
     combined = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
     return cv2.cvtColor(combined, cv2.COLOR_BGR2RGB)
 
+
+def add_panel_title(image_rgb: np.ndarray, title: str) -> np.ndarray:
+    out = image_rgb.copy()
+    cv2.rectangle(out, (0, 0), (out.shape[1], 36), (0, 0, 0), thickness=-1)
+    cv2.putText(
+        out,
+        title,
+        (12, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return out
+
 def save_landmark_visualizations(landmark_model, batch, epoch, device, output_dir, topology, output_dim=2, restore_indices=None):
     """Save visualizations including wireframe overlay."""
     os.makedirs(output_dir, exist_ok=True)
@@ -1032,7 +1048,7 @@ def save_dense2geometry_visualizations(
         searched_overlay = _draw_points_only(img_np, searched_uv_i, match_mask_i)
         pred_overlay = create_combined_overlay(img_np, _prepare_overlay_points(pred_uv, W, H), mesh_topology)
 
-        rgb_vis = cv2.resize(img_np, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+        aligned_rgb_vis = cv2.resize(img_np, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
         geo_vis = np.transpose(pred_geo[i], (1, 2, 0))
         geo_vis = np.nan_to_num(geo_vis, nan=0.0, posinf=1.0, neginf=0.0)
         geo_vis = np.clip(geo_vis, 0.0, 1.0)
@@ -1045,7 +1061,14 @@ def save_dense2geometry_visualizations(
         searched_overlay = cv2.resize(searched_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
         pred_overlay = cv2.resize(pred_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
 
-        row = np.concatenate([rgb_vis, geo_vis, gt_overlay, searched_overlay, pred_overlay], axis=1)
+        panels = [
+            add_panel_title(aligned_rgb_vis, "Aligned RGB"),
+            add_panel_title(geo_vis, "Pred Geo"),
+            add_panel_title(gt_overlay, "GT Mesh Overlay"),
+            add_panel_title(searched_overlay, "Searched 2D"),
+            add_panel_title(pred_overlay, "Aligned Pred Mesh"),
+        ]
+        row = np.concatenate(panels, axis=1)
         rows.append(row)
 
     if rows:

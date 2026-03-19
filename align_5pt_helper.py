@@ -9,10 +9,12 @@ import math
 import os
 from typing import Optional
 
+os.environ.setdefault("GLOG_minloglevel", "3")  # suppress MediaPipe/TFLite noise
+
 import numpy as np
 
 # eye_center → bottom_jaw = 30% of image height after alignment
-FACE_SCALE_RATIO = 0.30
+FACE_SCALE_RATIO = 0.40
 
 # MediaPipe Face Landmarker 478-pt model indices (with iris)
 _MP_RIGHT_EYE   = 468   # right iris center
@@ -26,7 +28,7 @@ _MP_JAW         = 152   # chin bottom
 _GT_5PT_INDICES = (2219, 2194, 1993, 1896, 1839)  # eye_r, eye_l, nose, mouth_r, mouth_l
 _GT_JAW_INDEX   = 1788
 
-_MODEL_PATH = os.path.join("models", "face_landmarker.task")
+_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_landmarker.task")
 
 _mp_landmarker = None
 
@@ -56,10 +58,14 @@ class Align5PtHelper:
         jitter_std: float = 0.0,  # unused
         scale_jitter: float = 0.0,
         translate_jitter: float = 0.0,
+        lm_jitter: float = 0.01,
+        y_offset: float = 0.0,
     ):
         self.image_size = int(image_size)
         self.scale_jitter = float(max(0.0, scale_jitter))
         self.translate_jitter = float(max(0.0, translate_jitter))
+        self.lm_jitter = float(max(0.0, lm_jitter))
+        self.y_offset = float(y_offset)
 
     # ------------------------------------------------------------------
     # MediaPipe detection → 6 key points, with GT fallback
@@ -77,6 +83,14 @@ class Align5PtHelper:
           source: 'mediapipe', 'landmark_gt', or 'none'
         fallback_lm_px: [N, 2] float32 GT pixel coords used when MediaPipe fails.
         """
+        # Prefer GT landmark file
+        if fallback_lm_px is not None:
+            indices = list(_GT_5PT_INDICES) + [_GT_JAW_INDEX]
+            if max(indices) < len(fallback_lm_px):
+                lm6 = fallback_lm_px[indices].astype(np.float32)
+                return lm6, "landmark_gt"
+
+        # Fallback to MediaPipe
         import mediapipe as mp
         h, w = image_rgb.shape[:2]
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
@@ -92,13 +106,6 @@ class Align5PtHelper:
                 pt(_MP_RIGHT_MOUTH), pt(_MP_LEFT_MOUTH), pt(_MP_JAW),
             ], axis=0)
             return lm6, "mediapipe"
-
-        # Fallback to GT landmark pixels
-        if fallback_lm_px is not None:
-            indices = list(_GT_5PT_INDICES) + [_GT_JAW_INDEX]
-            if max(indices) < len(fallback_lm_px):
-                lm6 = fallback_lm_px[indices].astype(np.float32)
-                return lm6, "landmark_gt"
 
         return None, "none"
 
@@ -129,6 +136,8 @@ class Align5PtHelper:
         lm6 = lm68
 
         if lm6 is not None:
+            if is_train and self.lm_jitter > 0.0:
+                lm6 = lm6 + np.random.normal(0.0, self.lm_jitter * max(src_w, src_h), lm6.shape).astype(np.float32)
             eye_center   = (lm6[0] + lm6[1]) * 0.5
             mouth_center = (lm6[3] + lm6[4]) * 0.5
             jaw          = lm6[5]
@@ -146,8 +155,12 @@ class Align5PtHelper:
             dist_jaw = max(dxj * sin_a + dyj * cos_a, 1.0)
             s = FACE_SCALE_RATIO * float(image_size) / dist_jaw
 
-            # Translation: mean of 5 face landmarks → image center
-            src_center = lm6[:5].mean(axis=0)
+            # Translation: x = -(nose - (eye_center + mouth_center)), y = (eye_center + jaw) / 2 + 100
+            nose = lm6[2]
+            src_center = np.array([
+                eye_center[0] + mouth_center[0] - nose[0],
+                (eye_center[1] + jaw[1]) * 0.5 - 100.0,
+            ], dtype=np.float32)
         else:
             cos_a, sin_a = 1.0, 0.0
             s = float(image_size) / float(max(src_w, src_h))
@@ -156,7 +169,7 @@ class Align5PtHelper:
         r00, r01 = s * cos_a, -s * sin_a
         r10, r11 = s * sin_a,  s * cos_a
         tx = c[0] - (r00 * src_center[0] + r01 * src_center[1])
-        ty = c[1] - (r10 * src_center[0] + r11 * src_center[1])
+        ty = c[1] - (r10 * src_center[0] + r11 * src_center[1]) + self.y_offset
         m = np.array([[r00, r01, tx], [r10, r11, ty]], dtype=np.float32)
 
         if is_train:

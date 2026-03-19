@@ -112,6 +112,32 @@ def load_matrix_data(file_path):
     
     return data
 
+def get_world_to_view_rotation(matrix_data) -> np.ndarray:
+    """Return the 3x3 rotation matrix that maps world-space direction vectors to view/camera space.
+
+    Uses row-vector convention (same as the rest of the projection pipeline):
+        N_view = N_world @ R   (shape [N, 3] @ [3, 3])
+
+    This is purely rotational — no translation, no perspective — so it is correct
+    for transforming surface normals from world space to screen/camera space.
+    """
+    camera_location = matrix_data['camera_location']
+    camera_rotation = matrix_data['camera_rotation']
+    camera_scale = np.array([1.0, 1.0, 1.0])
+
+    camera_matrix = create_transform_matrix(camera_location, camera_rotation, camera_scale)
+    view_matrix = np.linalg.inv(camera_matrix)
+
+    coord_conversion_matrix = np.array([
+        [0, 0, 1, 0],
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 0, 1],
+    ])
+    view_matrix = view_matrix @ coord_conversion_matrix
+    return view_matrix[:3, :3].astype(np.float32)
+
+
 def create_view_projection_matrices_from_cpp(matrix_data):
     """Create view and projection matrices matching C++ SaveLandmarks function"""
     camera_location = matrix_data['camera_location']

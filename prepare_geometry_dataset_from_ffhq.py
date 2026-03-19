@@ -57,8 +57,8 @@ def _split_dense_prediction(
     predict_basecolor: bool = True,
     predict_geo: bool = True,
     predict_normal: bool = True,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
-    """Split dense prediction into basecolor, geo, normal, and mask components."""
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    """Split dense prediction into basecolor, geo, detail normal, geometry normal, and mask."""
     if pred.ndim != 4:
         raise ValueError(f"Expected model output [B, C, H, W], got {tuple(pred.shape)}")
     expected_channels = compute_dense_output_channels(
@@ -74,7 +74,8 @@ def _split_dense_prediction(
     channel_idx = 0
     pred_basecolor = None
     pred_geo = None
-    pred_normal = None
+    pred_detail_normal = None
+    pred_geometry_normal = None
 
     if predict_basecolor:
         pred_basecolor = pred[:, channel_idx : channel_idx + 3]
@@ -83,11 +84,13 @@ def _split_dense_prediction(
         pred_geo = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
     if predict_normal:
-        pred_normal = pred[:, channel_idx : channel_idx + 3]
+        pred_geometry_normal = pred[:, channel_idx : channel_idx + 3]
+        channel_idx += 3
+        pred_detail_normal = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
     pred_mask_logits = pred[:, channel_idx : channel_idx + 1]
 
-    return pred_basecolor, pred_geo, pred_normal, pred_mask_logits
+    return pred_basecolor, pred_geo, pred_detail_normal, pred_geometry_normal, pred_mask_logits
 
 
 def _infer_model_config(
@@ -521,7 +524,7 @@ def _gpu_worker(rank: int, num_gpus: int, args, image_files: list) -> None:
             with torch.no_grad():
                 preds = model(batch_tensor)
 
-            pred_bc, pred_geo, pred_norm, pred_mask_logits = _split_dense_prediction(
+            pred_bc, pred_geo, pred_detail_norm, pred_geometry_norm, pred_mask_logits = _split_dense_prediction(
                 preds, predict_basecolor, predict_geo, predict_normal
             )
             pred_mask = torch.sigmoid(pred_mask_logits)
@@ -532,7 +535,12 @@ def _gpu_worker(rank: int, num_gpus: int, args, image_files: list) -> None:
                 mask_np  = _tensor_to_numpy_hwc(pred_mask[i:i+1],     orig_h, orig_w)
                 bc_np    = _tensor_to_numpy_hwc(pred_bc[i:i+1],       orig_h, orig_w) if pred_bc   is not None else None
                 geo_np   = _tensor_to_numpy_hwc(pred_geo[i:i+1],      orig_h, orig_w) if pred_geo  is not None else None
-                norm_np  = _tensor_to_numpy_hwc(pred_norm[i:i+1],     orig_h, orig_w) if pred_norm is not None else None
+                if pred_detail_norm is not None and pred_geometry_norm is not None:
+                    detail_np = _tensor_to_numpy_hwc(pred_detail_norm[i:i+1], orig_h, orig_w)
+                    geometry_np = _tensor_to_numpy_hwc(pred_geometry_norm[i:i+1], orig_h, orig_w)
+                    norm_np = np.clip(detail_np + geometry_np, 0.0, 1.0)
+                else:
+                    norm_np = None
                 pending_saves.append(
                     save_pool.submit(_save_item, out_dir, image_id, bc_np, geo_np, norm_np, mask_np)
                 )

@@ -3,10 +3,8 @@ from dense_image_train_core import create_arg_parser, launch_windows, _resolve_p
 # Dataset configuration: list of (path, type) tuples
 # type field is informational for this task; training uses basecolor supervision.
 DATA_FOLDERS = [
-    # ("G:/CapturedFrames_final1_processed", "synthetic"),
-    # ("G:/CapturedFrames_final7_processed", "synthetic"),
+    ("G:/CapturedFrames_final1_processed", "synthetic"),
     ("G:/CapturedFrames_final8_processed", "synthetic"),
-    ("G:/CapturedFrames_final9_processed", "real"),
 ]
 
 

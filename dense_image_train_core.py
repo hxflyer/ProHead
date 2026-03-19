@@ -512,7 +512,6 @@ def _prepare_face_mask(
 def _build_feature_loss_weight(
     reference: torch.Tensor,
     face_mask: torch.Tensor | None,
-    face_mask_valid: torch.Tensor | None,
     error_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     loss_weight = _prepare_face_mask(face_mask, reference)
@@ -522,13 +521,6 @@ def _build_feature_loss_weight(
             device=reference.device,
             dtype=reference.dtype,
         )
-
-    if face_mask_valid is not None:
-        mask_valid = face_mask_valid.view(-1, 1, 1, 1).to(
-            device=reference.device,
-            dtype=reference.dtype,
-        )
-        loss_weight = loss_weight * mask_valid + (1.0 - mask_valid)
 
     if error_mask is not None:
         loss_weight = loss_weight * error_mask.to(device=reference.device, dtype=reference.dtype)
@@ -540,7 +532,6 @@ def _masked_feature_loss(
     pred_feat: torch.Tensor | None,
     gt_feat: torch.Tensor | None,
     face_mask: torch.Tensor | None,
-    face_mask_valid: torch.Tensor | None,
     error_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if pred_feat is None or gt_feat is None:
@@ -550,7 +541,6 @@ def _masked_feature_loss(
     loss_weight = _build_feature_loss_weight(
         reference=pred_feat,
         face_mask=face_mask,
-        face_mask_valid=face_mask_valid,
         error_mask=error_mask,
     )
     loss_weight = loss_weight.expand_as(pred_feat)
@@ -564,7 +554,6 @@ def _masked_normal_cosine_loss(
     pred_normal: torch.Tensor | None,
     gt_normal: torch.Tensor | None,
     face_mask: torch.Tensor | None,
-    face_mask_valid: torch.Tensor | None,
     error_mask: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
@@ -575,7 +564,6 @@ def _masked_normal_cosine_loss(
     loss_weight = _build_feature_loss_weight(
         reference=pred_normal,
         face_mask=face_mask,
-        face_mask_valid=face_mask_valid,
         error_mask=error_mask,
     )
     denom = loss_weight.sum()
@@ -597,7 +585,6 @@ def _masked_normal_cosine_loss(
 def _mask_bce_loss(
     mask_logits: torch.Tensor | None,
     gt_mask: torch.Tensor | None,
-    mask_valid: torch.Tensor | None,
     error_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if mask_logits is None or gt_mask is None:
@@ -606,11 +593,6 @@ def _mask_bce_loss(
 
     target = _prepare_face_mask(gt_mask, mask_logits)
     valid_weight = torch.ones_like(mask_logits, dtype=mask_logits.dtype, device=mask_logits.device)
-    if mask_valid is not None:
-        valid_weight = valid_weight * mask_valid.view(-1, 1, 1, 1).to(
-            device=mask_logits.device,
-            dtype=mask_logits.dtype,
-        )
     if error_mask is not None:
         valid_weight = valid_weight * error_mask.to(device=mask_logits.device, dtype=mask_logits.dtype)
 
@@ -625,7 +607,6 @@ def _mask_bce_loss(
 def _mask_dice_loss(
     mask_logits: torch.Tensor | None,
     gt_mask: torch.Tensor | None,
-    mask_valid: torch.Tensor | None,
     error_mask: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
@@ -636,17 +617,7 @@ def _mask_dice_loss(
     target = _prepare_face_mask(gt_mask, mask_logits)
     probs = torch.sigmoid(mask_logits)
 
-    if mask_valid is not None:
-        valid_mask = mask_valid > 0.5
-        if not bool(valid_mask.any().item()):
-            return torch.zeros((), device=mask_logits.device, dtype=mask_logits.dtype)
-        probs = probs[valid_mask]
-        target = target[valid_mask]
-        if error_mask is not None:
-            em = error_mask.to(device=mask_logits.device, dtype=mask_logits.dtype)[valid_mask]
-            probs = probs * em
-            target = target * em
-    elif error_mask is not None:
+    if error_mask is not None:
         em = error_mask.to(device=mask_logits.device, dtype=mask_logits.dtype)
         probs = probs * em
         target = target * em
@@ -660,7 +631,6 @@ def _mask_dice_loss(
 def _combined_mask_loss(
     mask_logits: torch.Tensor | None,
     gt_mask: torch.Tensor | None,
-    mask_valid: torch.Tensor | None,
     bce_lambda: float,
     dice_lambda: float,
     error_mask: torch.Tensor | None = None,
@@ -669,8 +639,8 @@ def _combined_mask_loss(
         zero = _zero_scalar_like(gt_mask)
         return zero, zero, zero
 
-    mask_bce = _mask_bce_loss(mask_logits, gt_mask, mask_valid, error_mask=error_mask)
-    mask_dice = _mask_dice_loss(mask_logits, gt_mask, mask_valid, error_mask=error_mask)
+    mask_bce = _mask_bce_loss(mask_logits, gt_mask, error_mask=error_mask)
+    mask_dice = _mask_dice_loss(mask_logits, gt_mask, error_mask=error_mask)
     mask_total = float(bce_lambda) * mask_bce + float(dice_lambda) * mask_dice
     return mask_total, mask_bce, mask_dice
 
@@ -713,7 +683,6 @@ def _save_preview(
     gt_detail_normal = batch.get("detail_normal", batch["normal"])[:4].detach().cpu().numpy()
     gt_geometry_normal = batch["geometry_normal"][:4].detach().cpu().numpy()
     gt_mask = batch["face_mask"][:4].detach().cpu().numpy()
-    mask_valid = batch["face_mask_valid"][:4].detach().cpu().numpy()
 
     pred_parts = _split_dense_prediction(
         pred[:4],
@@ -760,13 +729,10 @@ def _save_preview(
         gt_mask_i = np.clip(gt_mask[i, 0], 0.0, 1.0)
         pred_mask_i = np.clip(pred_mask_np[i, 0], 0.0, 1.0)
         pred_masked_i = pred_rgb_i * pred_mask_i[..., None]
-        effective_mask = gt_mask_i if float(mask_valid[i]) > 0.5 else np.ones_like(gt_mask_i)
-        rgb_diff_i = np.abs(pred_rgb_i - gt_rgb_i) * effective_mask[..., None]
-        geo_diff_i = np.abs(pred_geo_i - gt_geo_i) * effective_mask[..., None]
-        detail_normal_diff_i = np.abs(pred_detail_normal_i - gt_detail_normal_i) * effective_mask[..., None]
-        geometry_normal_diff_i = np.abs(pred_geometry_normal_i - gt_geometry_normal_i) * effective_mask[..., None]
-        if float(mask_valid[i]) <= 0.5:
-            gt_mask_i = np.zeros_like(gt_mask_i)
+        rgb_diff_i = np.abs(pred_rgb_i - gt_rgb_i) * gt_mask_i[..., None]
+        geo_diff_i = np.abs(pred_geo_i - gt_geo_i) * gt_mask_i[..., None]
+        detail_normal_diff_i = np.abs(pred_detail_normal_i - gt_detail_normal_i) * gt_mask_i[..., None]
+        geometry_normal_diff_i = np.abs(pred_geometry_normal_i - gt_geometry_normal_i) * gt_mask_i[..., None]
         gt_mask_vis = np.repeat(gt_mask_i[..., None], 3, axis=2)
         pred_mask_vis = np.repeat(pred_mask_i[..., None], 3, axis=2)
         row = np.concatenate(
@@ -843,7 +809,6 @@ def train_one_epoch(
         gt_detail_normal = _get_detail_normal_batch_tensors(batch, device) if predict_normal else None
         gt_geometry_normal = _get_geometry_normal_batch_tensors(batch, device) if predict_normal else None
         face_mask = batch["face_mask"].to(device, non_blocking=True)
-        face_mask_valid = batch["face_mask_valid"].to(device, non_blocking=True)
         error_mask = batch["error_mask"].to(device, non_blocking=True)
 
         rgb_in = _normalize_imagenet(rgb)
@@ -864,35 +829,30 @@ def train_one_epoch(
             pred_parts["rgb"].float() if pred_parts["rgb"] is not None else None,
             gt_rgb.float() if gt_rgb is not None else None,
             face_mask=face_mask.float(),
-            face_mask_valid=face_mask_valid,
             error_mask=error_mask.float(),
         )
         geo_loss = _masked_feature_loss(
             pred_parts["geo"].float() if pred_parts["geo"] is not None else None,
             gt_geo.float() if gt_geo is not None else None,
             face_mask=face_mask.float(),
-            face_mask_valid=face_mask_valid,
             error_mask=error_mask.float(),
         )
         detail_normal_loss = _masked_feature_loss(
             pred_parts["detail_normal"].float() if pred_parts["detail_normal"] is not None else None,
             gt_detail_normal.float() if gt_detail_normal is not None else None,
             face_mask=face_mask.float(),
-            face_mask_valid=face_mask_valid,
             error_mask=error_mask.float(),
         )
         geometry_normal_loss = _masked_normal_cosine_loss(
             pred_parts["geometry_normal"].float() if pred_parts["geometry_normal"] is not None else None,
             gt_geometry_normal.float() if gt_geometry_normal is not None else None,
             face_mask=face_mask.float(),
-            face_mask_valid=face_mask_valid,
             error_mask=error_mask.float(),
         )
         normal_loss = detail_normal_loss + geometry_normal_loss
         mask_loss, mask_bce, mask_dice = _combined_mask_loss(
             pred_parts["mask_logits"].float() if pred_parts["mask_logits"] is not None else None,
             face_mask.float(),
-            face_mask_valid,
             bce_lambda=train_cfg.mask_bce_lambda,
             dice_lambda=train_cfg.mask_dice_lambda,
             error_mask=error_mask.float(),
@@ -1017,7 +977,6 @@ def validate_one_epoch(
         gt_detail_normal = _get_detail_normal_batch_tensors(batch, device) if predict_normal else None
         gt_geometry_normal = _get_geometry_normal_batch_tensors(batch, device) if predict_normal else None
         face_mask = batch["face_mask"].to(device, non_blocking=True)
-        face_mask_valid = batch["face_mask_valid"].to(device, non_blocking=True)
         error_mask = batch["error_mask"].to(device, non_blocking=True)
 
         rgb_in = _normalize_imagenet(rgb)
@@ -1035,35 +994,30 @@ def validate_one_epoch(
             pred_parts["rgb"].float() if pred_parts["rgb"] is not None else None,
             gt_rgb.float() if gt_rgb is not None else None,
             face_mask=face_mask.float(),
-            face_mask_valid=face_mask_valid,
             error_mask=error_mask.float(),
         )
         geo_loss = _masked_feature_loss(
             pred_parts["geo"].float() if pred_parts["geo"] is not None else None,
             gt_geo.float() if gt_geo is not None else None,
             face_mask=face_mask.float(),
-            face_mask_valid=face_mask_valid,
             error_mask=error_mask.float(),
         )
         detail_normal_loss = _masked_feature_loss(
             pred_parts["detail_normal"].float() if pred_parts["detail_normal"] is not None else None,
             gt_detail_normal.float() if gt_detail_normal is not None else None,
             face_mask=face_mask.float(),
-            face_mask_valid=face_mask_valid,
             error_mask=error_mask.float(),
         )
         geometry_normal_loss = _masked_normal_cosine_loss(
             pred_parts["geometry_normal"].float() if pred_parts["geometry_normal"] is not None else None,
             gt_geometry_normal.float() if gt_geometry_normal is not None else None,
             face_mask=face_mask.float(),
-            face_mask_valid=face_mask_valid,
             error_mask=error_mask.float(),
         )
         normal_loss = detail_normal_loss + geometry_normal_loss
         mask_loss, mask_bce, mask_dice = _combined_mask_loss(
             pred_parts["mask_logits"].float() if pred_parts["mask_logits"] is not None else None,
             face_mask.float(),
-            face_mask_valid,
             bce_lambda=train_cfg.mask_bce_lambda,
             dice_lambda=train_cfg.mask_dice_lambda,
             error_mask=error_mask.float(),

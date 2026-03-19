@@ -54,7 +54,7 @@ def _split_dense_prediction(
     if predict_geo:
         channel_idx += 3
     if predict_normal:
-        channel_idx += 3
+        channel_idx += 6
     return pred_rgb, pred[:, channel_idx : channel_idx + 1]
 
 

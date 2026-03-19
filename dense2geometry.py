@@ -255,6 +255,9 @@ class Dense2Geometry(nn.Module):
         search_mask_threshold: float = 0.30,
         search_min_geo_magnitude: float = 0.02,
         min_search_candidates: int = 512,
+        subpixel_radius: int = 2,
+        subpixel_temperature: float = 1e-7,
+        subpixel_max_drift: float = 3.0,
         model_dir: str = "model",
     ):
         super().__init__()
@@ -273,6 +276,9 @@ class Dense2Geometry(nn.Module):
         self.search_min_geo_magnitude = float(search_min_geo_magnitude)
         self.min_search_candidates = int(max(8, min_search_candidates))
         self.freeze_dense_stage = bool(freeze_dense_stage)
+        self.subpixel_radius = int(max(1, subpixel_radius))
+        self.subpixel_temperature = float(max(1e-6, subpixel_temperature))
+        self.subpixel_max_drift = float(max(0.5, subpixel_max_drift))
 
         template_mesh, template_mesh_uv, template_mesh_faces = _load_filtered_template_mesh(model_dir=model_dir)
         self.num_mesh = int(template_mesh.shape[0])
@@ -288,6 +294,24 @@ class Dense2Geometry(nn.Module):
         self.num_landmarks = int(mesh2landmark_idx.max()) + 1
         self.register_buffer("mesh2landmark_knn_indices", torch.from_numpy(mesh2landmark_idx))
         self.register_buffer("mesh2landmark_knn_weights", torch.from_numpy(mesh2landmark_w))
+
+        landmark2keypoint_idx_path = os.path.join(model_dir, "landmark2keypoint_knn_indices.npy")
+        landmark2keypoint_w_path = os.path.join(model_dir, "landmark2keypoint_knn_weights.npy")
+        if os.path.exists(landmark2keypoint_idx_path) and os.path.exists(landmark2keypoint_w_path):
+            landmark2keypoint_idx = np.load(landmark2keypoint_idx_path).astype(np.int64)
+            landmark2keypoint_w = np.load(landmark2keypoint_w_path).astype(np.float32)
+            if landmark2keypoint_idx.shape[0] != self.num_landmarks or landmark2keypoint_w.shape != landmark2keypoint_idx.shape:
+                raise ValueError(
+                    "landmark2keypoint KNN shape mismatch: "
+                    f"indices={tuple(landmark2keypoint_idx.shape)} weights={tuple(landmark2keypoint_w.shape)} "
+                    f"num_landmarks={self.num_landmarks}"
+                )
+        else:
+            landmark2keypoint_idx = np.arange(self.num_landmarks, dtype=np.int64)[:, None]
+            landmark2keypoint_w = np.ones((self.num_landmarks, 1), dtype=np.float32)
+        self.num_keypoints = int(landmark2keypoint_idx.max()) + 1
+        self.register_buffer("landmark2keypoint_knn_indices", torch.from_numpy(landmark2keypoint_idx))
+        self.register_buffer("landmark2keypoint_knn_weights", torch.from_numpy(landmark2keypoint_w))
 
         geo_atlas = np.load(os.path.join(model_dir, "geo_feature_atlas.npy")).astype(np.float32)
         if geo_atlas.ndim != 3 or geo_atlas.shape[0] != 3:
@@ -630,6 +654,108 @@ class Dense2Geometry(nn.Module):
         )
         return searched_uv, accept.float(), distances
 
+    def _subpixel_refine_mesh_search(
+        self,
+        pred_geo: torch.Tensor,
+        searched_uv: torch.Tensor,
+        accept: torch.Tensor,
+        distances: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Stage 3: re-search at native 1024 resolution + subpixel refinement.
+
+        Stage 2 searched a downsampled 512 grid, so its UV has 1/512 quantization.
+        This stage:
+          1) Re-searches a local patch at native 1024 resolution (hard best-pixel)
+          2) Applies soft-argmin around that best pixel for subpixel precision
+        """
+        H = pred_geo.shape[1]
+        W = pred_geo.shape[2]
+        geo_hw = pred_geo.permute(1, 2, 0).contiguous()  # [H, W, 3]
+
+        accept_bool = accept > 0.5
+        out_uv = searched_uv.clone()
+        out_dist = distances.clone()
+
+        # --- Step 1: hard re-search at 1024 resolution ---
+        # Stage-2 UV has 1/512 quantization. At 1024, each 512-pixel spans ~2 pixels.
+        # Use subpixel_radius to define the search patch (default radius=2 -> 5x5).
+        center_x = torch.round(searched_uv[:, 0] * float(W) - 0.5).long().clamp(0, W - 1)
+        center_y = torch.round(searched_uv[:, 1] * float(H) - 0.5).long().clamp(0, H - 1)
+
+        r = self.subpixel_radius
+        offsets_y, offsets_x = torch.meshgrid(
+            torch.arange(-r, r + 1, device=pred_geo.device),
+            torch.arange(-r, r + 1, device=pred_geo.device),
+            indexing="ij",
+        )
+        offsets_y = offsets_y.reshape(1, -1)
+        offsets_x = offsets_x.reshape(1, -1)
+
+        patch_x = (center_x.unsqueeze(1) + offsets_x).clamp(0, W - 1)
+        patch_y = (center_y.unsqueeze(1) + offsets_y).clamp(0, H - 1)
+
+        # Sample geo codes at all patch locations [N, num_patch, 3]
+        patch_geo = geo_hw[patch_y, patch_x]
+        query_codes = self.mesh_geo_codes.float()  # [N, 3]
+
+        # Find best discrete pixel in the patch
+        diff = patch_geo.float() - query_codes.unsqueeze(1)  # [N, num_patch, 3]
+        dist2 = (diff * diff).sum(dim=-1)  # [N, num_patch]
+        best_dist2, best_idx = dist2.min(dim=1)
+
+        # Best pixel UV at 1024 resolution
+        row_idx = torch.arange(patch_x.shape[0], device=pred_geo.device)
+        best_px_x = patch_x[row_idx, best_idx]
+        best_px_y = patch_y[row_idx, best_idx]
+        hard_uv = torch.stack(
+            [(best_px_x.float() + 0.5) / float(W), (best_px_y.float() + 0.5) / float(H)],
+            dim=-1,
+        )
+        hard_dist = best_dist2.clamp_min(0.0).sqrt()
+
+        # --- Step 2: soft-argmin subpixel refinement around the best pixel ---
+        # Small patch (3x3) centered on the best 1024-pixel for subpixel interpolation
+        sub_offsets_y, sub_offsets_x = torch.meshgrid(
+            torch.arange(-1, 2, device=pred_geo.device),
+            torch.arange(-1, 2, device=pred_geo.device),
+            indexing="ij",
+        )
+        sub_offsets_y = sub_offsets_y.reshape(1, -1)
+        sub_offsets_x = sub_offsets_x.reshape(1, -1)
+
+        sub_patch_x = (best_px_x.unsqueeze(1) + sub_offsets_x).clamp(0, W - 1)
+        sub_patch_y = (best_px_y.unsqueeze(1) + sub_offsets_y).clamp(0, H - 1)
+
+        sub_geo = geo_hw[sub_patch_y, sub_patch_x]  # [N, 9, 3]
+        sub_diff = sub_geo.float() - query_codes.unsqueeze(1)
+        sub_dist2 = (sub_diff * sub_diff).sum(dim=-1)  # [N, 9]
+
+        # Soft-argmin weights
+        weights = torch.exp(-sub_dist2 / self.subpixel_temperature)  # [N, 9]
+        w_sum = weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+        sub_uv = torch.stack(
+            [(sub_patch_x.float() + 0.5) / float(W), (sub_patch_y.float() + 0.5) / float(H)],
+            dim=-1,
+        )  # [N, 9, 2]
+        refined_uv = (sub_uv * weights.unsqueeze(-1)).sum(dim=1) / w_sum  # [N, 2]
+        refined_dist = (sub_dist2.sqrt() * weights).sum(dim=1) / w_sum.squeeze(-1)
+
+        # Drift check: reject if refined UV moved too far from stage-2
+        drift_px = (refined_uv - searched_uv) * torch.tensor([float(W), float(H)], device=pred_geo.device)
+        drift = torch.linalg.norm(drift_px, dim=1)
+        drift_ok = drift <= self.subpixel_max_drift
+
+        # Apply: use subpixel result where drift is ok, else hard result
+        update_mask = accept_bool & drift_ok
+        hard_only_mask = accept_bool & ~drift_ok
+        out_uv[update_mask] = refined_uv[update_mask]
+        out_dist[update_mask] = refined_dist[update_mask]
+        out_uv[hard_only_mask] = hard_uv[hard_only_mask]
+        out_dist[hard_only_mask] = hard_dist[hard_only_mask]
+
+        return out_uv, accept, out_dist
+
     def _search_single_sample(
         self,
         pred_geo: torch.Tensor,
@@ -654,11 +780,17 @@ class Dense2Geometry(nn.Module):
         landmark_uv = candidate_uv[nearest_idx].to(dtype=torch.float32)
         landmark_uv[~landmark_accept] = -1.0
         coarse_uv, coarse_valid = self._broadcast_landmark_uv_to_mesh(landmark_uv, landmark_accept.float())
-        return self._local_refine_mesh_search(
+        searched_uv, accept, distances = self._local_refine_mesh_search(
             pred_geo=pred_geo,
             pred_mask_logits=pred_mask_logits,
             coarse_uv=coarse_uv,
             coarse_valid=coarse_valid,
+        )
+        return self._subpixel_refine_mesh_search(
+            pred_geo=pred_geo,
+            searched_uv=searched_uv,
+            accept=accept,
+            distances=distances,
         )
 
     def _search_mesh_positions(
@@ -746,11 +878,300 @@ class Dense2Geometry(nn.Module):
         landmark_valid = (uv_denom.squeeze(-1) > 1e-6).float()
         return landmark_tokens, landmark_uv, landmark_valid
 
+    def _pool_landmarks_to_keypoints(
+        self,
+        landmark_values: torch.Tensor,
+        landmark_confidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        idx = self.landmark2keypoint_knn_indices.to(device=landmark_values.device)
+        w = self.landmark2keypoint_knn_weights.to(device=landmark_values.device, dtype=landmark_values.dtype)
+        w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        keypoint_values = torch.zeros(
+            (landmark_values.shape[0], self.num_keypoints, landmark_values.shape[-1]),
+            device=landmark_values.device,
+            dtype=landmark_values.dtype,
+        )
+        keypoint_conf_sum = torch.zeros(
+            (landmark_values.shape[0], self.num_keypoints, 1),
+            device=landmark_values.device,
+            dtype=landmark_values.dtype,
+        )
+        keypoint_weight_sum = torch.zeros(
+            (landmark_values.shape[0], self.num_keypoints, 1),
+            device=landmark_values.device,
+            dtype=landmark_values.dtype,
+        )
+        conf = landmark_confidence.to(device=landmark_values.device, dtype=landmark_values.dtype).unsqueeze(-1)
+
+        for k in range(idx.shape[1]):
+            idx_k = idx[:, k]
+            w_k = w[:, k].view(1, -1, 1)
+            weighted_conf = w_k * conf
+            keypoint_values.index_add_(1, idx_k, landmark_values * weighted_conf)
+            keypoint_conf_sum.index_add_(1, idx_k, weighted_conf)
+            keypoint_weight_sum.index_add_(1, idx_k, w_k.expand(landmark_values.shape[0], -1, -1))
+
+        keypoint_values = keypoint_values / keypoint_conf_sum.clamp_min(1e-6)
+        keypoint_conf = (keypoint_conf_sum / keypoint_weight_sum.clamp_min(1e-6)).squeeze(-1).clamp(0.0, 1.0)
+        return keypoint_values, keypoint_conf
+
+    def _pool_mesh_values_to_landmarks(
+        self,
+        mesh_values: torch.Tensor,
+        mesh_confidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        idx = self.mesh2landmark_knn_indices.to(device=mesh_values.device)
+        w = self.mesh2landmark_knn_weights.to(device=mesh_values.device, dtype=mesh_values.dtype)
+        w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        landmark_values = torch.zeros(
+            (mesh_values.shape[0], self.num_landmarks, mesh_values.shape[-1]),
+            device=mesh_values.device,
+            dtype=mesh_values.dtype,
+        )
+        landmark_conf_sum = torch.zeros(
+            (mesh_values.shape[0], self.num_landmarks, 1),
+            device=mesh_values.device,
+            dtype=mesh_values.dtype,
+        )
+        landmark_weight_sum = torch.zeros(
+            (mesh_values.shape[0], self.num_landmarks, 1),
+            device=mesh_values.device,
+            dtype=mesh_values.dtype,
+        )
+        conf = mesh_confidence.to(device=mesh_values.device, dtype=mesh_values.dtype).unsqueeze(-1)
+
+        for k in range(idx.shape[1]):
+            idx_k = idx[:, k]
+            w_k = w[:, k].view(1, -1, 1)
+            weighted_conf = w_k * conf
+            landmark_values.index_add_(1, idx_k, mesh_values * weighted_conf)
+            landmark_conf_sum.index_add_(1, idx_k, weighted_conf)
+            landmark_weight_sum.index_add_(1, idx_k, w_k.expand(mesh_values.shape[0], -1, -1))
+
+        landmark_values = landmark_values / landmark_conf_sum.clamp_min(1e-6)
+        landmark_conf = (landmark_conf_sum / landmark_weight_sum.clamp_min(1e-6)).squeeze(-1).clamp(0.0, 1.0)
+        return landmark_values, landmark_conf
+
+    def _pool_mesh_values_to_keypoints(
+        self,
+        mesh_values: torch.Tensor,
+        mesh_confidence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        landmark_values, landmark_conf = self._pool_mesh_values_to_landmarks(mesh_values, mesh_confidence)
+        return self._pool_landmarks_to_keypoints(landmark_values, landmark_conf)
+
+    def _broadcast_keypoints_to_landmarks(self, keypoint_values: torch.Tensor) -> torch.Tensor:
+        idx = self.landmark2keypoint_knn_indices.to(device=keypoint_values.device)
+        w = self.landmark2keypoint_knn_weights.to(device=keypoint_values.device, dtype=keypoint_values.dtype)
+        w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        neighbor_values = keypoint_values[:, idx, :]
+        return (neighbor_values * w.unsqueeze(0).unsqueeze(-1)).sum(dim=2)
+
     def _broadcast_landmarks_to_mesh(self, landmark_tokens: torch.Tensor) -> torch.Tensor:
         idx = self.mesh2landmark_knn_indices.to(device=landmark_tokens.device)
         w = self.mesh2landmark_knn_weights.to(device=landmark_tokens.device, dtype=landmark_tokens.dtype)
         neighbor_tokens = landmark_tokens[:, idx, :]
         return (neighbor_tokens * w.unsqueeze(0).unsqueeze(-1)).sum(dim=2)
+
+    def refine_mesh_uv_with_search(
+        self,
+        mesh_coords: torch.Tensor,
+        searched_uv: torch.Tensor,
+        match_mask: torch.Tensor,
+        search_distance: torch.Tensor,
+        image_size: int,
+        num_iters: int = 3,
+        step_size: float = 0.9,
+        max_step_px: float = 1.5,
+        smooth_blend: float = 0.20,
+        confidence_power: float = 1.5,
+        keypoint_gain: float = 1.0,
+        keypoint_max_step_px: float = 2.0,
+        landmark_refine_blend: float = 0.60,
+        keypoint_only: bool = False,
+        direct_snap_gain: float = 1.0,
+        direct_snap_max_step_px: float = 4.0,
+        direct_diffuse_iters: int = 3,
+        direct_diffuse_blend: float = 0.70,
+    ) -> torch.Tensor:
+        if int(num_iters) <= 0 or int(image_size) <= 0:
+            return mesh_coords
+
+        refined = mesh_coords.clone()
+        uv = refined[..., 3:5]
+        match = match_mask.to(device=uv.device, dtype=uv.dtype).clamp(0.0, 1.0)
+        distance = torch.nan_to_num(
+            search_distance.to(device=uv.device, dtype=uv.dtype),
+            nan=float(self.search_distance_threshold),
+            posinf=float(self.search_distance_threshold),
+            neginf=0.0,
+        )
+        tau = float(max(self.search_distance_threshold, self.search_distance_floor, 1e-6))
+        confidence = match * torch.exp(-distance / tau)
+        if float(confidence_power) != 1.0:
+            confidence = confidence.pow(float(max(confidence_power, 0.0)))
+        if not bool((confidence > 0).any().item()):
+            return refined
+
+        idx = self.mesh2landmark_knn_indices.to(device=uv.device)
+        w = self.mesh2landmark_knn_weights.to(device=uv.device, dtype=uv.dtype)
+        w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        edge_src = self.mesh_edge_src.to(device=uv.device)
+        edge_dst = self.mesh_edge_dst.to(device=uv.device)
+        edge_degree = self.mesh_edge_degree.to(device=uv.device, dtype=uv.dtype)
+
+        batch_size = uv.shape[0]
+        num_landmarks = self.num_landmarks
+        max_step_uv = float(max(max_step_px, 0.0)) / float(max(int(image_size), 1))
+        step = float(max(step_size, 0.0))
+        blend = float(min(max(smooth_blend, 0.0), 1.0))
+        keypoint_stage_gain = float(max(keypoint_gain, 0.0))
+        keypoint_max_step_uv = float(max(keypoint_max_step_px, 0.0)) / float(max(int(image_size), 1))
+        landmark_refine = float(min(max(landmark_refine_blend, 0.0), 1.0))
+        use_keypoint_only = bool(keypoint_only)
+
+        if use_keypoint_only and keypoint_stage_gain > 0.0 and self.num_keypoints > 0:
+            base_uv = uv.clone()
+            keypoint_offset = torch.zeros((batch_size, self.num_keypoints, 2), device=uv.device, dtype=uv.dtype)
+
+            for _ in range(int(num_iters)):
+                landmark_from_keypoint = self._broadcast_keypoints_to_landmarks(keypoint_offset)
+                mesh_delta = self._broadcast_landmarks_to_mesh(landmark_from_keypoint)
+
+                if blend > 0.0 and edge_src.numel() > 0:
+                    neighbor = torch.zeros_like(mesh_delta)
+                    neighbor.index_add_(1, edge_dst, mesh_delta[:, edge_src, :])
+                    neighbor = neighbor / edge_degree.view(1, -1, 1).clamp_min(1.0)
+                    mesh_delta = (1.0 - blend) * mesh_delta + blend * neighbor
+
+                uv_candidate = (base_uv + mesh_delta).clamp(0.0, 1.0)
+                residual = searched_uv.to(device=uv.device, dtype=uv.dtype) - uv_candidate
+                residual = torch.where(match.unsqueeze(-1) > 0.5, residual, torch.zeros_like(residual))
+
+                keypoint_update, _ = self._pool_mesh_values_to_keypoints(residual, confidence)
+                keypoint_update = keypoint_update * keypoint_stage_gain
+                if keypoint_max_step_uv > 0.0:
+                    kp_norm = torch.linalg.norm(keypoint_update, dim=-1, keepdim=True)
+                    kp_scale = (keypoint_max_step_uv / kp_norm.clamp_min(1e-6)).clamp(max=1.0)
+                    keypoint_update = keypoint_update * kp_scale
+
+                keypoint_offset = keypoint_offset + step * keypoint_update
+
+            landmark_delta = self._broadcast_keypoints_to_landmarks(keypoint_offset)
+            mesh_delta = self._broadcast_landmarks_to_mesh(landmark_delta)
+            if blend > 0.0 and edge_src.numel() > 0:
+                neighbor = torch.zeros_like(mesh_delta)
+                neighbor.index_add_(1, edge_dst, mesh_delta[:, edge_src, :])
+                neighbor = neighbor / edge_degree.view(1, -1, 1).clamp_min(1.0)
+                mesh_delta = (1.0 - blend) * mesh_delta + blend * neighbor
+
+            uv = (base_uv + mesh_delta).clamp(0.0, 1.0)
+            refined[..., 3:5] = uv
+            return refined
+
+        for _ in range(int(num_iters)):
+            residual = searched_uv.to(device=uv.device, dtype=uv.dtype) - uv
+            residual = torch.where(match.unsqueeze(-1) > 0.5, residual, torch.zeros_like(residual))
+            conf = confidence.unsqueeze(-1)
+
+            landmark_delta = torch.zeros((batch_size, num_landmarks, 2), device=uv.device, dtype=uv.dtype)
+            landmark_conf_sum = torch.zeros((batch_size, num_landmarks, 1), device=uv.device, dtype=uv.dtype)
+            landmark_weight_sum = torch.zeros((batch_size, num_landmarks, 1), device=uv.device, dtype=uv.dtype)
+
+            for k in range(idx.shape[1]):
+                idx_k = idx[:, k]
+                w_k = w[:, k].view(1, -1, 1)
+                weighted_conf = w_k * conf
+                landmark_delta.index_add_(1, idx_k, residual * weighted_conf)
+                landmark_conf_sum.index_add_(1, idx_k, weighted_conf)
+                landmark_weight_sum.index_add_(1, idx_k, w_k.expand(batch_size, -1, -1))
+
+            landmark_target_delta = landmark_delta / landmark_conf_sum.clamp_min(1e-6)
+            landmark_conf = (landmark_conf_sum / landmark_weight_sum.clamp_min(1e-6)).squeeze(-1).clamp(0.0, 1.0)
+
+            if keypoint_stage_gain > 0.0 and self.num_keypoints > 0:
+                keypoint_delta, keypoint_conf = self._pool_landmarks_to_keypoints(
+                    landmark_target_delta,
+                    landmark_conf,
+                )
+                keypoint_delta = keypoint_delta * keypoint_stage_gain
+                if keypoint_max_step_uv > 0.0:
+                    kp_norm = torch.linalg.norm(keypoint_delta, dim=-1, keepdim=True)
+                    kp_scale = (keypoint_max_step_uv / kp_norm.clamp_min(1e-6)).clamp(max=1.0)
+                    keypoint_delta = keypoint_delta * kp_scale
+
+                landmark_from_keypoint = self._broadcast_keypoints_to_landmarks(keypoint_delta)
+                keypoint_landmark_conf = self._broadcast_keypoints_to_landmarks(keypoint_conf.unsqueeze(-1)).squeeze(-1)
+                if use_keypoint_only:
+                    landmark_delta = landmark_from_keypoint
+                else:
+                    landmark_delta = landmark_from_keypoint + landmark_refine * (landmark_target_delta - landmark_from_keypoint)
+                landmark_conf = torch.maximum(landmark_conf, keypoint_landmark_conf.clamp(0.0, 1.0))
+            else:
+                landmark_delta = landmark_target_delta
+
+            if max_step_uv > 0.0:
+                lm_norm = torch.linalg.norm(landmark_delta, dim=-1, keepdim=True)
+                lm_scale = (max_step_uv / lm_norm.clamp_min(1e-6)).clamp(max=1.0)
+                landmark_delta = landmark_delta * lm_scale
+
+            mesh_delta = (landmark_delta[:, idx, :] * w.unsqueeze(0).unsqueeze(-1)).sum(dim=2)
+            mesh_support = (landmark_conf[:, idx] * w.unsqueeze(0)).sum(dim=2).clamp(0.0, 1.0)
+            mesh_delta = mesh_delta * mesh_support.unsqueeze(-1)
+
+            if blend > 0.0 and edge_src.numel() > 0:
+                neighbor = torch.zeros_like(mesh_delta)
+                neighbor.index_add_(1, edge_dst, mesh_delta[:, edge_src, :])
+                neighbor = neighbor / edge_degree.view(1, -1, 1).clamp_min(1.0)
+                mesh_delta = (1.0 - blend) * mesh_delta + blend * neighbor
+
+            uv = (uv + step * mesh_delta).clamp(0.0, 1.0)
+
+        direct_gain = float(max(direct_snap_gain, 0.0))
+        if use_keypoint_only:
+            direct_gain = 0.0
+        direct_blend = float(min(max(direct_diffuse_blend, 0.0), 1.0))
+        direct_iters = int(max(direct_diffuse_iters, 0))
+        direct_max_step_uv = float(max(direct_snap_max_step_px, 0.0)) / float(max(int(image_size), 1))
+        if direct_gain > 0.0:
+            anchor_delta = searched_uv.to(device=uv.device, dtype=uv.dtype) - uv
+            anchor_delta = torch.where(match.unsqueeze(-1) > 0.5, anchor_delta, torch.zeros_like(anchor_delta))
+            anchor_delta = anchor_delta * confidence.unsqueeze(-1) * direct_gain
+
+            if direct_max_step_uv > 0.0:
+                anchor_norm = torch.linalg.norm(anchor_delta, dim=-1, keepdim=True)
+                anchor_scale = (direct_max_step_uv / anchor_norm.clamp_min(1e-6)).clamp(max=1.0)
+                anchor_delta = anchor_delta * anchor_scale
+
+            if direct_iters > 0 and edge_src.numel() > 0:
+                disp = anchor_delta
+                support = confidence.clone()
+                matched = match.unsqueeze(-1) > 0.5
+                anchor_hold = (0.75 + 0.25 * confidence).clamp(0.0, 1.0).unsqueeze(-1)
+                for _ in range(direct_iters):
+                    neighbor_disp = torch.zeros_like(disp)
+                    neighbor_disp.index_add_(1, edge_dst, disp[:, edge_src, :])
+                    neighbor_disp = neighbor_disp / edge_degree.view(1, -1, 1).clamp_min(1.0)
+
+                    neighbor_support = torch.zeros_like(support)
+                    neighbor_support.index_add_(1, edge_dst, support[:, edge_src])
+                    neighbor_support = neighbor_support / edge_degree.view(1, -1).clamp_min(1.0)
+
+                    mixed_disp = (1.0 - direct_blend) * disp + direct_blend * neighbor_disp
+                    disp = torch.where(
+                        matched,
+                        anchor_hold * anchor_delta + (1.0 - anchor_hold) * mixed_disp,
+                        mixed_disp * neighbor_support.unsqueeze(-1).clamp(0.0, 1.0),
+                    )
+                    support = torch.where(match > 0.5, confidence, neighbor_support.clamp(0.0, 1.0))
+                uv = (uv + disp).clamp(0.0, 1.0)
+            else:
+                uv = (uv + anchor_delta).clamp(0.0, 1.0)
+
+        refined[..., 3:5] = uv
+        return refined
 
     def forward(self, rgb: torch.Tensor) -> dict[str, torch.Tensor]:
         f4, f8, f16, dense_parts = self._run_dense_stage(rgb)
@@ -806,13 +1227,22 @@ class Dense2Geometry(nn.Module):
                 self.mesh_edge_dst,
                 self.mesh_edge_degree,
             )
+        intermediate_meshes = []
+        template = self.template_mesh.unsqueeze(0)
         for block in self.mesh_refine_blocks:
             mesh_tokens = block(mesh_tokens)
+            raw = self.output_head(mesh_tokens)
+            # xyz (0:3) and depth (5:6): offset from template
+            # uv (3:5): absolute prediction
+            mesh_coords = template.clone().expand(rgb.shape[0], -1, -1).clone()
+            mesh_coords[..., :3] = template[..., :3] + raw[..., :3]
+            mesh_coords[..., 3:5] = raw[..., 3:5].clamp(0.0, 1.0)
+            mesh_coords[..., 5:] = template[..., 5:] + raw[..., 5:]
+            intermediate_meshes.append(mesh_coords)
 
-        offsets = self.output_head(mesh_tokens)
-        mesh_coords = self.template_mesh.unsqueeze(0) + offsets
         return {
-            "mesh": mesh_coords,
+            "mesh": intermediate_meshes[-1],
+            "intermediate_meshes": intermediate_meshes[:-1],
             "searched_uv": searched_uv,
             "match_mask": match_mask,
             "search_distance": search_dist,
