@@ -56,12 +56,18 @@ class Align5PtHelper:
         image_size: int,
         indices=None,           # unused, kept for compat
         jitter_std: float = 0.0,  # unused
+        target_norm: Optional[np.ndarray] = None,  # unused, kept for compat
+        output_scale: float = 1.0,  # unused, kept for compat
+        direction_shift: float = 0.0,  # unused, kept for compat
         scale_jitter: float = 0.0,
         translate_jitter: float = 0.0,
         lm_jitter: float = 0.01,
         y_offset: float = 0.0,
     ):
         self.image_size = int(image_size)
+        self.target_norm = None if target_norm is None else np.asarray(target_norm, dtype=np.float32)
+        self.output_scale = float(output_scale)
+        self.direction_shift = float(direction_shift)
         self.scale_jitter = float(max(0.0, scale_jitter))
         self.translate_jitter = float(max(0.0, translate_jitter))
         self.lm_jitter = float(max(0.0, lm_jitter))

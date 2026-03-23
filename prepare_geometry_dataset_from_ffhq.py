@@ -312,7 +312,7 @@ def _save_exr(data: np.ndarray, out_path: str) -> str:
 
 
 # Folders that are generated outputs (skip when searching for input images)
-OUTPUT_FOLDERS = {"geo", "basecolor", "normal", "facemask"}
+OUTPUT_FOLDERS = {"geo", "basecolor", "normal", "facemask", "geo_normal", "detail_normal"}
 
 
 def _collect_image_files(input_path: str, max_images: int = -1) -> list[tuple[str, str, str]]:
@@ -404,51 +404,63 @@ def _save_item(
     image_id: str,
     bc_np: np.ndarray | None,
     geo_np: np.ndarray | None,
-    norm_np: np.ndarray | None,
+    geometry_norm_np: np.ndarray | None,
+    detail_norm_np: np.ndarray | None,
     mask_np: np.ndarray,
 ) -> None:
     """Write all outputs for one image. Safe to call from a ThreadPoolExecutor."""
-    basecolor_dir = os.path.join(out_dir, "basecolor")
-    geo_dir       = os.path.join(out_dir, "geo")
-    normal_dir    = os.path.join(out_dir, "normal")
-    facemask_dir  = os.path.join(out_dir, "facemask")
-    os.makedirs(basecolor_dir, exist_ok=True)
-    os.makedirs(geo_dir,       exist_ok=True)
-    os.makedirs(normal_dir,    exist_ok=True)
-    os.makedirs(facemask_dir,  exist_ok=True)
+    for d in ("basecolor", "geo", "normal", "geo_normal", "detail_normal", "facemask"):
+        os.makedirs(os.path.join(out_dir, d), exist_ok=True)
 
-    mask_2d   = mask_np[:, :, 0]
-    mask_3ch  = np.stack([mask_2d, mask_2d, mask_2d], axis=-1)
+    mask_2d  = mask_np[:, :, 0]
+    mask_3ch = np.stack([mask_2d, mask_2d, mask_2d], axis=-1)
 
-    _save_output_image(mask_2d, os.path.join(facemask_dir, f"Face_Mask_{image_id}.png"), is_rgb=False)
+    _save_output_image(mask_2d, os.path.join(out_dir, "facemask", f"Face_Mask_{image_id}.png"), is_rgb=False)
 
     if bc_np is not None:
         _save_output_image(
             np.clip(bc_np, 0.0, 1.0) * mask_3ch,
-            os.path.join(basecolor_dir, f"BaseColor_{image_id}.png"),
+            os.path.join(out_dir, "basecolor", f"BaseColor_{image_id}.png"),
             is_rgb=True,
         )
     if geo_np is not None:
         _save_exr(
             np.clip(geo_np, 0.0, 1.0) * mask_3ch,
-            os.path.join(geo_dir, f"Geo_{image_id}.exr"),
+            os.path.join(out_dir, "geo", f"Geo_{image_id}.exr"),
         )
-    if norm_np is not None:
+    if geometry_norm_np is not None and detail_norm_np is not None:
         neutral = np.array([0.5, 0.5, 1.0], dtype=np.float32)
+        # screen_normal = geometry_normal + detail_normal (both in encoded [0,1] space)
+        screen_normal = np.clip(geometry_norm_np + detail_norm_np, 0.0, 1.0)
         _save_output_image(
-            np.clip(norm_np, 0.0, 1.0) * mask_3ch + neutral * (1.0 - mask_3ch),
-            os.path.join(normal_dir, f"ScreenNormal_{image_id}.png"),
+            screen_normal * mask_3ch + neutral * (1.0 - mask_3ch),
+            os.path.join(out_dir, "normal", f"ScreenNormal_{image_id}.png"),
+            is_rgb=True,
+        )
+        _save_output_image(
+            np.clip(geometry_norm_np, 0.0, 1.0) * mask_3ch + neutral * (1.0 - mask_3ch),
+            os.path.join(out_dir, "geo_normal", f"GeoNormal_{image_id}.png"),
+            is_rgb=True,
+        )
+        # detail_normal is [-1,1]; encode to [0,1] for PNG; background = neutral grey (0.5)
+        detail_encoded = np.clip(detail_norm_np * 0.5 + 0.5, 0.0, 1.0)
+        detail_neutral = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        _save_output_image(
+            detail_encoded * mask_3ch + detail_neutral * (1.0 - mask_3ch),
+            os.path.join(out_dir, "detail_normal", f"DetailNormal_{image_id}.png"),
             is_rgb=True,
         )
 
 
 def _outputs_exist(out_dir: str, image_id: str, predict_basecolor: bool, predict_geo: bool, predict_normal: bool) -> bool:
     """Return True if all expected output files already exist for this image."""
+    if predict_basecolor and not os.path.exists(os.path.join(out_dir, "basecolor", f"BaseColor_{image_id}.png")):
+        return False
     if predict_geo and not os.path.exists(os.path.join(out_dir, "geo", f"Geo_{image_id}.exr")):
         return False
     if predict_normal and not os.path.exists(os.path.join(out_dir, "normal", f"ScreenNormal_{image_id}.png")):
         return False
-    if predict_basecolor and not os.path.exists(os.path.join(out_dir, "basecolor", f"BaseColor_{image_id}.png")):
+    if predict_normal and not os.path.exists(os.path.join(out_dir, "geo_normal", f"GeoNormal_{image_id}.png")):
         return False
     return True
 
@@ -532,17 +544,13 @@ def _gpu_worker(rank: int, num_gpus: int, args, image_files: list) -> None:
             # ---- Dispatch saves to thread pool ----
             for i, (subfolder, image_id, orig_h, orig_w) in enumerate(valid_meta):
                 out_dir  = os.path.join(input_root, subfolder) if subfolder else input_root
-                mask_np  = _tensor_to_numpy_hwc(pred_mask[i:i+1],     orig_h, orig_w)
-                bc_np    = _tensor_to_numpy_hwc(pred_bc[i:i+1],       orig_h, orig_w) if pred_bc   is not None else None
-                geo_np   = _tensor_to_numpy_hwc(pred_geo[i:i+1],      orig_h, orig_w) if pred_geo  is not None else None
-                if pred_detail_norm is not None and pred_geometry_norm is not None:
-                    detail_np = _tensor_to_numpy_hwc(pred_detail_norm[i:i+1], orig_h, orig_w)
-                    geometry_np = _tensor_to_numpy_hwc(pred_geometry_norm[i:i+1], orig_h, orig_w)
-                    norm_np = np.clip(detail_np + geometry_np, 0.0, 1.0)
-                else:
-                    norm_np = None
+                mask_np      = _tensor_to_numpy_hwc(pred_mask[i:i+1],          orig_h, orig_w)
+                bc_np        = _tensor_to_numpy_hwc(pred_bc[i:i+1],            orig_h, orig_w) if pred_bc            is not None else None
+                geo_np       = _tensor_to_numpy_hwc(pred_geo[i:i+1],           orig_h, orig_w) if pred_geo           is not None else None
+                geometry_np  = _tensor_to_numpy_hwc(pred_geometry_norm[i:i+1], orig_h, orig_w) if pred_geometry_norm is not None else None
+                detail_np    = _tensor_to_numpy_hwc(pred_detail_norm[i:i+1],   orig_h, orig_w) if pred_detail_norm   is not None else None
                 pending_saves.append(
-                    save_pool.submit(_save_item, out_dir, image_id, bc_np, geo_np, norm_np, mask_np)
+                    save_pool.submit(_save_item, out_dir, image_id, bc_np, geo_np, geometry_np, detail_np, mask_np)
                 )
 
             pbar.update(len(valid_meta))

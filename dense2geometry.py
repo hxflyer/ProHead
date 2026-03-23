@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dense_image_transformer import DenseImageTransformer, PositionalEncoding2D
+from dense_image_transformer import (
+    DenseImageTransformer,
+    PositionalEncoding2D,
+    compute_dense_output_channels,
+)
 from obj_load_helper import load_uv_obj_file
 from train_visualize_helper import load_combined_mesh_uv
 
@@ -15,6 +19,49 @@ def _normalize_imagenet(rgb: torch.Tensor) -> torch.Tensor:
     mean = torch.tensor([0.485, 0.456, 0.406], device=rgb.device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=rgb.device).view(1, 3, 1, 1)
     return (rgb - mean) / std
+
+
+def _split_dense_prediction(
+    pred: torch.Tensor,
+    *,
+    predict_basecolor: bool,
+    predict_geo: bool,
+    predict_normal: bool,
+) -> dict[str, torch.Tensor | None]:
+    expected_channels = compute_dense_output_channels(
+        predict_basecolor=predict_basecolor,
+        predict_geo=predict_geo,
+        predict_normal=predict_normal,
+    )
+    channels = int(pred.shape[1])
+    if channels != expected_channels:
+        raise ValueError(
+            f"Expected {expected_channels} dense output channels, got {channels}"
+        )
+
+    channel_idx = 0
+    pred_basecolor = None
+    pred_geo = None
+    pred_normal = None
+    if predict_basecolor:
+        pred_basecolor = pred[:, channel_idx : channel_idx + 3]
+        channel_idx += 3
+    if predict_geo:
+        pred_geo = pred[:, channel_idx : channel_idx + 3]
+        channel_idx += 3
+    if predict_normal:
+        # Dense2Geometry keeps the legacy 10-channel structure and ignores the
+        # extra detail-normal triplet from the new dense stage.
+        pred_normal = pred[:, channel_idx : channel_idx + 3]
+        channel_idx += 3
+        channel_idx += 3
+
+    return {
+        "basecolor": pred_basecolor,
+        "geo": pred_geo,
+        "normal": pred_normal,
+        "mask_logits": pred[:, channel_idx : channel_idx + 1],
+    }
 
 
 def _load_matching_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> tuple[list[str], list[str]]:
@@ -448,12 +495,12 @@ class Dense2Geometry(nn.Module):
             )
             fused = x + self.dense_stage.post_attn_proj(token_map_out)
             dense_pred = self.dense_stage.decoder(fused, f8, f4)
-            parts = {
-                "basecolor": dense_pred[:, 0:3],
-                "geo": dense_pred[:, 3:6],
-                "normal": dense_pred[:, 6:9],
-                "mask_logits": dense_pred[:, 9:10],
-            }
+            parts = _split_dense_prediction(
+                dense_pred,
+                predict_basecolor=bool(getattr(self.dense_stage, "predict_basecolor", True)),
+                predict_geo=bool(getattr(self.dense_stage, "predict_geo", True)),
+                predict_normal=bool(getattr(self.dense_stage, "predict_normal", True)),
+            )
             return f4, f8, f16, parts
 
         if self.freeze_dense_stage:
@@ -1175,19 +1222,28 @@ class Dense2Geometry(nn.Module):
 
     def forward(self, rgb: torch.Tensor) -> dict[str, torch.Tensor]:
         f4, f8, f16, dense_parts = self._run_dense_stage(rgb)
+        if dense_parts["basecolor"] is None or dense_parts["geo"] is None or dense_parts["normal"] is None:
+            raise ValueError(
+                "Dense2Geometry requires dense-stage predictions for basecolor, geo, normal, and mask."
+            )
+
+        pred_basecolor = dense_parts["basecolor"]
+        pred_geo = dense_parts["geo"]
+        pred_normal = dense_parts["normal"]
+        pred_mask_logits = dense_parts["mask_logits"]
         searched_uv, match_mask, search_dist = self._search_mesh_positions(
-            pred_geo=dense_parts["geo"],
-            pred_mask_logits=dense_parts["mask_logits"],
+            pred_geo=pred_geo,
+            pred_mask_logits=pred_mask_logits,
         )
 
         sampled_f4 = self._sample_feature_map(f4, searched_uv, match_mask)
         sampled_f8 = self._sample_feature_map(f8, searched_uv, match_mask)
         sampled_f16 = self._sample_feature_map(f16, searched_uv, match_mask)
         sampled_feat = torch.cat([sampled_f4, sampled_f8, sampled_f16], dim=-1)
-        sampled_geo = self._sample_feature_map(dense_parts["geo"], searched_uv, match_mask)
-        sampled_normal = self._sample_feature_map(dense_parts["normal"], searched_uv, match_mask)
-        sampled_basecolor = self._sample_feature_map(dense_parts["basecolor"], searched_uv, match_mask)
-        sampled_mask = self._sample_feature_map(torch.sigmoid(dense_parts["mask_logits"]), searched_uv, match_mask)
+        sampled_basecolor = self._sample_feature_map(pred_basecolor, searched_uv, match_mask)
+        sampled_geo = self._sample_feature_map(pred_geo, searched_uv, match_mask)
+        sampled_normal = self._sample_feature_map(pred_normal, searched_uv, match_mask)
+        sampled_mask = self._sample_feature_map(torch.sigmoid(pred_mask_logits), searched_uv, match_mask)
         sampled_dense = torch.cat([sampled_geo, sampled_normal, sampled_basecolor, sampled_mask], dim=-1)
 
         semantic_token = self.vertex_semantic_proj(self.mesh_geo_codes.unsqueeze(0).expand(rgb.shape[0], -1, -1))
@@ -1246,8 +1302,8 @@ class Dense2Geometry(nn.Module):
             "searched_uv": searched_uv,
             "match_mask": match_mask,
             "search_distance": search_dist,
-            "pred_geo": dense_parts["geo"],
-            "pred_normal": dense_parts["normal"],
-            "pred_basecolor": dense_parts["basecolor"],
-            "pred_mask_logits": dense_parts["mask_logits"],
+            "pred_geo": pred_geo,
+            "pred_normal": pred_normal,
+            "pred_basecolor": pred_basecolor,
+            "pred_mask_logits": pred_mask_logits,
         }

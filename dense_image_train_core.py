@@ -728,31 +728,32 @@ def _save_preview(
         pred_geometry_normal_i = np.clip(np.transpose(pred_geometry_normal_np[i], (1, 2, 0)), 0.0, 1.0)
         gt_mask_i = np.clip(gt_mask[i, 0], 0.0, 1.0)
         pred_mask_i = np.clip(pred_mask_np[i, 0], 0.0, 1.0)
-        pred_masked_i = pred_rgb_i * pred_mask_i[..., None]
+        pred_masked_rgb_i = pred_rgb_i * pred_mask_i[..., None]
         rgb_diff_i = np.abs(pred_rgb_i - gt_rgb_i) * gt_mask_i[..., None]
+        pred_masked_geo_i = pred_geo_i * pred_mask_i[..., None]
         geo_diff_i = np.abs(pred_geo_i - gt_geo_i) * gt_mask_i[..., None]
-        detail_normal_diff_i = np.abs(pred_detail_normal_i - gt_detail_normal_i) * gt_mask_i[..., None]
         geometry_normal_diff_i = np.abs(pred_geometry_normal_i - gt_geometry_normal_i) * gt_mask_i[..., None]
+        pred_masked_detail_normal_i = pred_detail_normal_i * pred_mask_i[..., None]
+        detail_normal_diff_i = np.abs(pred_detail_normal_i - gt_detail_normal_i) * 0.5 * gt_mask_i[..., None]
         gt_mask_vis = np.repeat(gt_mask_i[..., None], 3, axis=2)
         pred_mask_vis = np.repeat(pred_mask_i[..., None], 3, axis=2)
         row = np.concatenate(
             [
-                _to_vis_map(rgb_i),
-                _to_vis_map(gt_rgb_i),
-                _to_vis_map(pred_rgb_i),
-                _to_vis_map(rgb_diff_i),
-                _to_vis_map(pred_masked_i),
-                _to_vis_map(gt_geo_i),
-                _to_vis_map(pred_geo_i),
-                _to_vis_map(geo_diff_i),
-                _to_vis_map(gt_geometry_normal_i),
-                _to_vis_map(pred_geometry_normal_i),
-                _to_vis_map(geometry_normal_diff_i),
-                _to_vis_map(gt_detail_normal_i, signed=True),
-                _to_vis_map(pred_detail_normal_i, signed=True),
-                _to_vis_map(detail_normal_diff_i),
-                _to_vis_map(gt_mask_vis),
-                _to_vis_map(pred_mask_vis),
+                _to_vis_map(rgb_i),                                         # 1  input rgb
+                _to_vis_map(gt_rgb_i),                                      # 2  gt basecolor
+                _to_vis_map(pred_masked_rgb_i),                             # 3  pred masked basecolor
+                _to_vis_map(rgb_diff_i),                                    # 4  basecolor diff
+                _to_vis_map(gt_geo_i),                                      # 5  gt geo
+                _to_vis_map(pred_masked_geo_i),                             # 6  pred masked geo
+                _to_vis_map(geo_diff_i),                                    # 7  geo diff
+                _to_vis_map(gt_geometry_normal_i),                          # 8  gt geometry normal
+                _to_vis_map(pred_geometry_normal_i),                        # 9  pred geometry normal
+                _to_vis_map(geometry_normal_diff_i),                        # 10 geometry normal diff
+                _to_vis_map(gt_detail_normal_i, signed=True),               # 11 gt detail normal
+                _to_vis_map(pred_masked_detail_normal_i, signed=True),      # 12 pred masked detail normal
+                _to_vis_map(detail_normal_diff_i),                          # 13 detail normal diff
+                _to_vis_map(gt_mask_vis),                                   # 14 gt face mask
+                _to_vis_map(pred_mask_vis),                                 # 15 pred face mask
             ],
             axis=1,
         )

@@ -4,7 +4,7 @@ predict_geometry_dataset.py
 Run the geometry transformer on real images and save predictions in the same
 text format as MetaHuman GT data, so they can be used as pseudo-GT for training.
 
-Uses YuNet (preferred) or dlib for 5-point face alignment before geometry inference.
+Uses Align5PtHelper's MediaPipe + jaw-point alignment before geometry inference.
 
 Output per image (mirrors FastGeometryDataset expected layout):
   {output_dir}/Color_{image_id}<orig_ext>         -- hardlink/symlink/copy of input image
@@ -44,16 +44,6 @@ from train_visualize_helper import load_combined_mesh_uv
 # Constants matching FastGeometryDataset training-time alignment
 # ──────────────────────────────────────────────────────────────────────────────
 
-ALIGN_5PT_TARGET_NORM = np.array([
-    [0.35, 0.38],   # right_eye
-    [0.65, 0.38],   # left_eye
-    [0.50, 0.56],   # nose
-    [0.40, 0.72],   # mouth_right
-    [0.60, 0.72],   # mouth_left
-], dtype=np.float32)
-
-ALIGN_OUTPUT_SCALE   = 0.75
-ALIGN_DIRECTION_SHIFT = 0.08
 IMAGE_SIZE = 512   # model input size
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -538,6 +528,8 @@ def _draw_5pt(img_rgb: np.ndarray, pts_px: np.ndarray) -> np.ndarray:
     """Return a copy of img_rgb with 5 keypoints drawn."""
     out = img_rgb.copy()
     for i, (pt, col, lbl) in enumerate(zip(pts_px, _5PT_COLORS, _5PT_LABELS)):
+        if not np.isfinite(pt).all():
+            continue
         x, y = int(round(float(pt[0]))), int(round(float(pt[1])))
         cv2.circle(out, (x, y), 8, col, -1)
         cv2.circle(out, (x, y), 10, (255, 255, 255), 2)
@@ -631,29 +623,19 @@ def _preprocess_one(img_path: str, image_id: str, align_helper: Align5PtHelper) 
     h_orig, w_orig = img_bgr.shape[:2]
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    five_pts, five_valid = detect_5pt(img_bgr)
-    if five_pts is None:
-        return None
-
-    face_dir   = Align5PtHelper.estimate_face_direction(five_pts, five_valid)
-    is_extreme = Align5PtHelper.is_extreme_pose(five_pts, five_valid)
-    M = align_helper.estimate_alignment_matrix(
-        five_pts_px=five_pts,
-        five_valid=five_valid,
-        src_w=w_orig,
-        src_h=h_orig,
-        split="val",
-        head_center_px=None,
-        is_extreme_pose=is_extreme,
-        face_direction=face_dir,
-    )
-    if M is None:
-        return None
+    lm6, _ = align_helper.detect_landmarks(img_rgb, fallback_lm_px=None)
+    M = align_helper.estimate_alignment_matrix(lm6, src_w=w_orig, src_h=h_orig, split="val")
+    five_pts, five_valid = align_helper.extract_key5_from_lm68(lm6)
+    if not bool(five_valid.any()):
+        five_pts = np.full((5, 2), np.nan, dtype=np.float32)
 
     img_aligned = cv2.warpAffine(
-        img_rgb, M, (IMAGE_SIZE, IMAGE_SIZE),
+        img_rgb,
+        M,
+        (IMAGE_SIZE, IMAGE_SIZE),
         flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT_101,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
     )
     return {
         "img_path":    img_path,
@@ -784,46 +766,11 @@ def _gpu_worker(rank: int, num_gpus: int, image_list: list, args, is_test: bool)
         if torch.cuda.is_available():
             _set_cv_cuda_device(rank)
 
-        predictor_search = [
-            args.predictor_path,
-            "models/shape_predictor_68_face_landmarks.dat",
-            "model/shape_predictor_68_face_landmarks.dat",
-            "/usr/share/dlib/shape_predictor_68_face_landmarks.dat",
-        ]
-        yunet_search = [
-            args.yunet_model_path,
-            "models/face_detection_yunet_2023mar.onnx",
-            "model/face_detection_yunet_2023mar.onnx",
-        ]
-        face_detector = str(getattr(args, "face_detector", "auto")).strip().lower()
-        detector_ready = False
-        if face_detector in {"auto", "yunet"}:
-            detector_ready = _init_yunet(
-                [p for p in yunet_search if p],
-                backend_preference=args.face_detector_backend,
-                device_id=rank,
-                auto_download=bool(args.auto_download_face_detector),
-                score_threshold=args.yunet_score_threshold,
-                nms_threshold=args.yunet_nms_threshold,
-                top_k=args.yunet_top_k,
-            )
-            if (not detector_ready) and face_detector == "yunet":
-                print("[Error] YuNet requested but initialization failed.")
-                return
-        if not detector_ready:
-            if not _init_dlib([p for p in predictor_search if p], upsample=args.dlib_upsample):
-                return
-
         device = torch.device(f"cuda:{rank}")
         aux    = load_aux_data(args.model_dir, device)
         model  = load_model(args, aux, device)
         align_helper = Align5PtHelper(
             image_size=IMAGE_SIZE,
-            indices=np.zeros(5, dtype=np.int64),
-            target_norm=ALIGN_5PT_TARGET_NORM,
-            jitter_std=0.0,
-            output_scale=ALIGN_OUTPUT_SCALE,
-            direction_shift=ALIGN_DIRECTION_SHIFT,
         )
 
         my_images    = image_list[rank::num_gpus]   # interleaved slice for this GPU
@@ -844,9 +791,7 @@ def _gpu_worker(rank: int, num_gpus: int, image_list: list, args, is_test: bool)
         pbar = tqdm(total=len(my_images), desc=f"GPU{rank}", position=rank, leave=True)
         print(
             f"[GPU{rank}] preprocess_workers={preprocess_workers} "
-            f"save_workers={save_workers} detector={_face_detector_mode} "
-            f"detector_backend={_yunet_backend_label if _face_detector_mode == 'yunet' else 'cpu'} "
-            f"dlib_upsample={args.dlib_upsample}"
+            f"save_workers={save_workers} align=mediapipe-jaw"
         )
         with ThreadPoolExecutor(max_workers=save_workers) as save_pool:
             for start in range(0, len(my_images), bs):

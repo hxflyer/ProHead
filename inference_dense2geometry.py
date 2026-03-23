@@ -22,18 +22,6 @@ from align_5pt_helper import Align5PtHelper
 from dense2geometry import Dense2Geometry, DenseStageConfig, _load_filtered_template_mesh, _load_matching_state_dict
 from train_visualize_helper import create_combined_overlay, load_mesh_topology
 
-
-ALIGN_5PT_TARGET_NORM = np.array(
-    [
-        [0.35, 0.38],
-        [0.65, 0.38],
-        [0.50, 0.56],
-        [0.40, 0.72],
-        [0.60, 0.72],
-    ],
-    dtype=np.float32,
-)
-
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 _DR_CONTEXT_CACHE: dict[str, object] = {}
 
@@ -249,6 +237,8 @@ _5PT_LABELS = ["R_Eye", "L_Eye", "Nose", "Mouth_R", "Mouth_L"]
 def draw_5pt(image_rgb: np.ndarray, pts_px: np.ndarray) -> np.ndarray:
     out = image_rgb.copy()
     for pt, color, label in zip(pts_px, _5PT_COLORS, _5PT_LABELS):
+        if not np.isfinite(pt).all():
+            continue
         x = int(round(float(pt[0])))
         y = int(round(float(pt[1])))
         cv2.circle(out, (x, y), 8, color, -1, cv2.LINE_AA)
@@ -1532,19 +1522,28 @@ def legacy_forward_compat(self, rgb: torch.Tensor) -> dict[str, torch.Tensor]:
 
 def pre_concat_local_search_forward_compat(self, rgb: torch.Tensor) -> dict[str, torch.Tensor]:
     f4, f8, f16, dense_parts = self._run_dense_stage(rgb)
+    if dense_parts["basecolor"] is None or dense_parts["geo"] is None or dense_parts["normal"] is None:
+        raise ValueError(
+            "Dense2Geometry inference requires dense-stage predictions for basecolor, geo, normal, and mask."
+        )
+
+    pred_basecolor = dense_parts["basecolor"]
+    pred_geo = dense_parts["geo"]
+    pred_normal = dense_parts["normal"]
+    pred_mask_logits = dense_parts["mask_logits"]
     searched_uv, match_mask, search_dist = self._search_mesh_positions(
-        pred_geo=dense_parts["geo"],
-        pred_mask_logits=dense_parts["mask_logits"],
+        pred_geo=pred_geo,
+        pred_mask_logits=pred_mask_logits,
     )
 
     sampled_f4 = self._sample_feature_map(f4, searched_uv, match_mask)
     sampled_f8 = self._sample_feature_map(f8, searched_uv, match_mask)
     sampled_f16 = self._sample_feature_map(f16, searched_uv, match_mask)
     sampled_feat = torch.cat([sampled_f4, sampled_f8, sampled_f16], dim=-1)
-    sampled_geo = self._sample_feature_map(dense_parts["geo"], searched_uv, match_mask)
-    sampled_normal = self._sample_feature_map(dense_parts["normal"], searched_uv, match_mask)
-    sampled_basecolor = self._sample_feature_map(dense_parts["basecolor"], searched_uv, match_mask)
-    sampled_mask = self._sample_feature_map(torch.sigmoid(dense_parts["mask_logits"]), searched_uv, match_mask)
+    sampled_basecolor = self._sample_feature_map(pred_basecolor, searched_uv, match_mask)
+    sampled_geo = self._sample_feature_map(pred_geo, searched_uv, match_mask)
+    sampled_normal = self._sample_feature_map(pred_normal, searched_uv, match_mask)
+    sampled_mask = self._sample_feature_map(torch.sigmoid(pred_mask_logits), searched_uv, match_mask)
     sampled_dense = torch.cat([sampled_geo, sampled_normal, sampled_basecolor, sampled_mask], dim=-1)
 
     semantic_token = self.vertex_semantic_proj(self.mesh_geo_codes.unsqueeze(0).expand(rgb.shape[0], -1, -1))
@@ -1594,10 +1593,10 @@ def pre_concat_local_search_forward_compat(self, rgb: torch.Tensor) -> dict[str,
         "searched_uv": searched_uv,
         "match_mask": match_mask,
         "search_distance": search_dist,
-        "pred_geo": dense_parts["geo"],
-        "pred_normal": dense_parts["normal"],
-        "pred_basecolor": dense_parts["basecolor"],
-        "pred_mask_logits": dense_parts["mask_logits"],
+        "pred_geo": pred_geo,
+        "pred_normal": pred_normal,
+        "pred_basecolor": pred_basecolor,
+        "pred_mask_logits": pred_mask_logits,
     }
 
 
@@ -1691,49 +1690,8 @@ def run_inference(args) -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    yunet = None
-    dlib_detector = None
-    predictor_candidates = [
-        args.predictor_path,
-        os.path.join("models", "shape_predictor_68_face_landmarks.dat"),
-        os.path.join("model", "shape_predictor_68_face_landmarks.dat"),
-    ]
-    predictor_candidates = [p for p in predictor_candidates if p]
-
-    if args.face_detector in {"auto", "dlib"}:
-        for predictor_path in predictor_candidates:
-            try:
-                dlib_detector = DlibFaceDetector(predictor_path)
-                print(f"[Info] Using dlib detector: {dlib_detector.predictor_path}")
-                break
-            except Exception as exc:
-                if args.face_detector == "dlib":
-                    print(f"[Warn] dlib unavailable: {exc}")
-        if dlib_detector is None and args.face_detector == "dlib":
-            print("[Warn] dlib requested but unavailable, falling back to other detectors.")
-
-    if args.face_detector in {"auto", "yunet"} and dlib_detector is None:
-        try:
-            yunet = YuNetFaceDetector(
-                model_path=args.yunet_model_path,
-                score_threshold=args.yunet_score_threshold,
-                nms_threshold=args.yunet_nms_threshold,
-                top_k=args.yunet_top_k,
-            )
-            print(f"[Info] Using YuNet detector: {args.yunet_model_path}")
-        except Exception as exc:
-            print(f"[Warn] YuNet unavailable, falling back to bbox alignment: {exc}")
-
-    haar_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-    face_cascade = cv2.CascadeClassifier(haar_path) if os.path.exists(haar_path) else None
-
     align_helper = Align5PtHelper(
         image_size=int(args.image_size),
-        indices=np.arange(5, dtype=np.int64),
-        target_norm=ALIGN_5PT_TARGET_NORM,
-        jitter_std=0.0,
-        output_scale=float(args.align_output_scale),
-        direction_shift=float(args.align_direction_shift),
     )
 
     mesh_topology = load_mesh_topology()
@@ -1785,34 +1743,31 @@ def run_inference(args) -> None:
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         h_orig, w_orig = img_rgb.shape[:2]
-        align_rgb, align_bgr, pre_align_affine = maybe_resize_for_alignment(img_rgb, int(args.image_size))
-
-        five_pts, five_valid, _ = detect_five_points(align_bgr, yunet, dlib_detector, face_cascade)
-        face_dir = Align5PtHelper.estimate_face_direction(five_pts, five_valid)
-        is_extreme = Align5PtHelper.is_extreme_pose(five_pts, five_valid)
+        align_rgb, _, pre_align_affine = maybe_resize_for_alignment(img_rgb, int(args.image_size))
+        lm6, detection_source = align_helper.detect_landmarks(align_rgb, fallback_lm_px=None)
         m = align_helper.estimate_alignment_matrix(
-            five_pts_px=five_pts,
-            five_valid=five_valid,
+            lm6,
             src_w=align_rgb.shape[1],
             src_h=align_rgb.shape[0],
             split="val",
-            head_center_px=None,
-            is_extreme_pose=is_extreme,
-            face_direction=face_dir,
         )
-        if m is None:
-            print(f"[Warn] Failed to estimate alignment for {img_path}")
-            continue
 
         pre_align_inv = cv2.invertAffineTransform(pre_align_affine)
-        five_pts_orig = Align5PtHelper.transform_points_px(five_pts, pre_align_inv)
+        key5_px, key5_valid = align_helper.extract_key5_from_lm68(lm6)
+        if bool(key5_valid.any()):
+            five_pts_orig = Align5PtHelper.transform_points_px(key5_px, pre_align_inv)
+        else:
+            five_pts_orig = np.full((5, 2), np.nan, dtype=np.float32)
+            if detection_source == "none":
+                print(f"[Warn] Alignment landmarks not found for {img_path}; using fallback centering.")
         five_pt_rgb = draw_5pt(img_rgb, five_pts_orig)
         img_aligned = cv2.warpAffine(
             align_rgb,
             m,
             (int(args.image_size), int(args.image_size)),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
         )
         rgb_tensor = torch.from_numpy(preprocess_aligned_rgb(img_aligned, int(args.image_size))).unsqueeze(0).to(device)
 

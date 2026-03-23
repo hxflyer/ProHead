@@ -1,6 +1,8 @@
 import argparse
 import datetime
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+
 import sys
 import time
 from dataclasses import dataclass
@@ -70,7 +72,7 @@ class TrainConfig:
     epochs: int = 50
     amp_dtype: str = "fp16"
     load_model: str = ""
-    load_dense_model: str = "best_dense_image_transformer_ch10.pth"
+    load_dense_model: str = "best_dense_image_transformer_ch13.pth"
     save_path: str = "best_dense2geometry.pth"
     master_port: str = "12358"
 
@@ -102,7 +104,7 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--load_model", type=str, default="")
-    parser.add_argument("--load_dense_model", type=str, default="best_dense_image_transformer_ch10.pth")
+    parser.add_argument("--load_dense_model", type=str, default="best_dense_image_transformer_ch13.pth")
     parser.add_argument("--save_path", type=str, default="best_dense2geometry.pth")
     parser.add_argument("--master_port", type=str, default="12358")
 
@@ -257,16 +259,21 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    train_num_workers = int(max(0, data_cfg.num_workers))
+    val_num_workers = 0 if train_num_workers <= 0 else max(1, train_num_workers // 4)
+
+    if rank == 0:
+        print(f"[DataLoader] train_workers={train_num_workers} val_workers={val_num_workers}")
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=data_cfg.batch_size,
         sampler=train_sampler,
-        num_workers=data_cfg.num_workers,
+        num_workers=train_num_workers,
         pin_memory=True,
         drop_last=True,
-        prefetch_factor=data_cfg.prefetch_factor if data_cfg.num_workers > 0 else None,
-        persistent_workers=bool(data_cfg.persistent_workers) if data_cfg.num_workers > 0 else False,
+        prefetch_factor=data_cfg.prefetch_factor if train_num_workers > 0 else None,
+        persistent_workers=bool(data_cfg.persistent_workers) if train_num_workers > 0 else False,
         collate_fn=dense2geometry_collate_fn,
         worker_init_fn=worker_init_fn,
     )
@@ -274,11 +281,11 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
         val_dataset,
         batch_size=data_cfg.batch_size,
         sampler=val_sampler,
-        num_workers=data_cfg.num_workers,
+        num_workers=val_num_workers,
         pin_memory=True,
         drop_last=False,
-        prefetch_factor=data_cfg.prefetch_factor if data_cfg.num_workers > 0 else None,
-        persistent_workers=bool(data_cfg.persistent_workers) if data_cfg.num_workers > 0 else False,
+        prefetch_factor=data_cfg.prefetch_factor if val_num_workers > 0 else None,
+        persistent_workers=bool(data_cfg.persistent_workers) if val_num_workers > 0 else False,
         collate_fn=dense2geometry_collate_fn,
         worker_init_fn=worker_init_fn,
     )
@@ -287,6 +294,8 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
 
 def build_model_and_optim(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainConfig):
     device = torch.device(f"cuda:{rank}")
+    resume_model_exists = bool(train_cfg.load_model and os.path.exists(train_cfg.load_model))
+    dense_override_after_resume = bool(resume_model_exists and train_cfg.load_dense_model)
     dense_stage_cfg = DenseStageConfig(
         d_model=model_cfg.dense_d_model,
         nhead=model_cfg.dense_nhead,
@@ -301,7 +310,7 @@ def build_model_and_optim(rank: int, world_size: int, data_cfg: DataConfig, mode
         nhead=model_cfg.nhead,
         num_layers=model_cfg.num_layers,
         dense_stage_cfg=dense_stage_cfg,
-        dense_checkpoint=train_cfg.load_dense_model,
+        dense_checkpoint="" if dense_override_after_resume else train_cfg.load_dense_model,
         freeze_dense_stage=model_cfg.freeze_dense_stage,
         image_memory_size=model_cfg.image_memory_size,
         search_size=model_cfg.search_size,
@@ -328,6 +337,16 @@ def build_model_and_optim(rank: int, world_size: int, data_cfg: DataConfig, mode
                 print(f"[Warn] Skipped incompatible checkpoint keys: {skipped_keys[:10]}")
             if load_notes:
                 print(f"[Warn] Missing/unexpected checkpoint keys: {load_notes[:10]}")
+
+    dense_stage_reloaded = False
+    if dense_override_after_resume:
+        model.load_dense_stage(train_cfg.load_dense_model)
+        dense_stage_reloaded = True
+        if rank == 0:
+            print(
+                "[Resume] Reloaded dense_stage from "
+                f"{train_cfg.load_dense_model} after loading {train_cfg.load_model}"
+            )
 
     if world_size > 1 and dist.is_available() and dist.is_initialized():
         model = DDP(model, device_ids=[rank], find_unused_parameters=False, gradient_as_bucket_view=False)
@@ -358,15 +377,23 @@ def build_model_and_optim(rank: int, world_size: int, data_cfg: DataConfig, mode
 
     start_epoch = 0
     best_loss = float("inf")
+    skip_resume_optimizer_state = dense_stage_reloaded and not model_cfg.freeze_dense_stage
     if resumed_ckpt is not None:
         if "optimizer_state_dict" in resumed_ckpt:
-            try:
-                optimizer.load_state_dict(resumed_ckpt["optimizer_state_dict"])
+            if skip_resume_optimizer_state:
                 if rank == 0:
-                    print("[Resume] Restored optimizer state")
-            except Exception as exc:
-                if rank == 0:
-                    print(f"[Resume] Could not restore optimizer state: {exc}")
+                    print(
+                        "[Resume] Skipped optimizer state restore because dense_stage was "
+                        "reloaded from a different checkpoint and remains trainable."
+                    )
+            else:
+                try:
+                    optimizer.load_state_dict(resumed_ckpt["optimizer_state_dict"])
+                    if rank == 0:
+                        print("[Resume] Restored optimizer state")
+                except Exception as exc:
+                    if rank == 0:
+                        print(f"[Resume] Could not restore optimizer state: {exc}")
         if "scheduler_state_dict" in resumed_ckpt:
             try:
                 scheduler.load_state_dict(resumed_ckpt["scheduler_state_dict"])
@@ -608,38 +635,6 @@ def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, 
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
-ALIGN_5PT_TARGET_NORM = np.array(
-    [
-        [0.35, 0.38],
-        [0.65, 0.38],
-        [0.50, 0.56],
-        [0.40, 0.72],
-        [0.60, 0.72],
-    ],
-    dtype=np.float32,
-)
-
-
-def _detect_five_points_dlib(img_bgr: np.ndarray, dlib_mod, predictor) -> np.ndarray | None:
-    """Detect 5 face landmarks using dlib (eyes, nose, mouth corners)."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    detector = dlib_mod.get_frontal_face_detector()
-    faces = detector(gray, 1)
-    if len(faces) == 0:
-        return None
-    face = max(faces, key=lambda r: float(r.width() * r.height()))
-    shape = predictor(gray, face)
-
-    def _pt(i: int) -> np.ndarray:
-        return np.array([shape.part(i).x, shape.part(i).y], dtype=np.float32)
-
-    right_eye = np.mean([_pt(i) for i in range(36, 42)], axis=0)
-    left_eye = np.mean([_pt(i) for i in range(42, 48)], axis=0)
-    nose = _pt(30)
-    mouth_right = _pt(48)
-    mouth_left = _pt(54)
-    return np.stack([right_eye, left_eye, nose, mouth_right, mouth_left], axis=0).astype(np.float32)
-
 
 def predict_test_folder(
     epoch: int,
@@ -652,7 +647,7 @@ def predict_test_folder(
     image_size: int = 1024,
     amp_dtype: torch.dtype = torch.float16,
 ) -> None:
-    """Run model prediction on test images (no GT) with dlib 5pt alignment and save visualizations."""
+    """Run model prediction on test images using the same alignment helper as dense-image training."""
     from align_5pt_helper import Align5PtHelper
 
     test_path = Path(test_folder)
@@ -665,33 +660,9 @@ def predict_test_folder(
     if not image_files:
         return
 
-    # Initialize dlib face detector
-    dlib_mod = None
-    dlib_predictor = None
-    predictor_candidates = [
-        os.path.join("models", "shape_predictor_68_face_landmarks.dat"),
-        os.path.join("model", "shape_predictor_68_face_landmarks.dat"),
-    ]
-    try:
-        import dlib as dlib_mod
-        for ppath in predictor_candidates:
-            if os.path.exists(ppath):
-                dlib_predictor = dlib_mod.shape_predictor(ppath)
-                print(f"[TestPredict] Using dlib predictor: {ppath}")
-                break
-        if dlib_predictor is None:
-            print("[TestPredict] Warning: dlib predictor .dat not found, will use bbox fallback")
-    except ImportError:
-        print("[TestPredict] Warning: dlib not available, will use bbox fallback")
-
-    # Initialize alignment helper (no jitter for inference)
+    # Initialize alignment helper (same helper/algorithm as dense_image_dataset, no train jitter)
     align_helper = Align5PtHelper(
         image_size=image_size,
-        indices=np.arange(5, dtype=np.int64),
-        target_norm=ALIGN_5PT_TARGET_NORM,
-        jitter_std=0.0,
-        output_scale=0.75,
-        direction_shift=0.08,
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -739,53 +710,35 @@ def predict_test_folder(
         # Resize to image_size for face detection if needed
         if h_orig != image_size or w_orig != image_size:
             detect_rgb = cv2.resize(img_rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
-            detect_bgr = cv2.cvtColor(detect_rgb, cv2.COLOR_RGB2BGR)
         else:
             detect_rgb = img_rgb
-            detect_bgr = img_bgr
 
-        # Detect 5 face landmarks
-        five_pts = None
-        if dlib_mod is not None and dlib_predictor is not None:
-            five_pts = _detect_five_points_dlib(detect_bgr, dlib_mod, dlib_predictor)
-        if five_pts is None:
-            five_pts = _approximate_points_from_bbox(float(image_size), float(image_size))
-        five_valid = np.ones((5,), dtype=bool)
-
-        # Estimate alignment and warp
-        face_dir = Align5PtHelper.estimate_face_direction(five_pts, five_valid)
-        is_extreme = Align5PtHelper.is_extreme_pose(five_pts, five_valid)
-        m = align_helper.estimate_alignment_matrix(
-            five_pts_px=five_pts,
-            five_valid=five_valid,
-            src_w=image_size,
-            src_h=image_size,
-            split="val",
-            head_center_px=None,
-            is_extreme_pose=is_extreme,
-            face_direction=face_dir,
-        )
-        if m is None:
-            print(f"[TestPredict] Failed to align: {img_path}")
-            continue
+        lm6, detection_source = align_helper.detect_landmarks(detect_rgb, fallback_lm_px=None)
+        m = align_helper.estimate_alignment_matrix(lm6, src_w=image_size, src_h=image_size, split="val")
 
         img_aligned = cv2.warpAffine(
             detect_rgb,
             m,
             (image_size, image_size),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
         )
 
-        # Draw 5pt on aligned image for visualization
-        ones = np.ones((five_pts.shape[0], 1), dtype=np.float32)
-        five_pts_aligned = (m @ np.concatenate([five_pts.astype(np.float32), ones], axis=1).T).T
+        # Draw aligned 5 points for visualization when available.
         aligned_5pt_vis = img_aligned.copy()
         _5pt_colors = [(255, 80, 80), (80, 200, 80), (80, 150, 255), (255, 200, 50), (220, 80, 220)]
-        for pt, color in zip(five_pts_aligned, _5pt_colors):
-            x, y = int(round(float(pt[0]))), int(round(float(pt[1])))
-            cv2.circle(aligned_5pt_vis, (x, y), 8, color, -1, cv2.LINE_AA)
-            cv2.circle(aligned_5pt_vis, (x, y), 10, (255, 255, 255), 2, cv2.LINE_AA)
+        key5_px, key5_valid = align_helper.extract_key5_from_lm68(lm6)
+        if bool(key5_valid.any()):
+            key5_aligned = align_helper.transform_points_px(key5_px, m)
+            for pt, valid, color in zip(key5_aligned, key5_valid, _5pt_colors):
+                if float(valid) <= 0.5 or not np.isfinite(pt).all():
+                    continue
+                x, y = int(round(float(pt[0]))), int(round(float(pt[1])))
+                cv2.circle(aligned_5pt_vis, (x, y), 8, color, -1, cv2.LINE_AA)
+                cv2.circle(aligned_5pt_vis, (x, y), 10, (255, 255, 255), 2, cv2.LINE_AA)
+        elif detection_source == "none":
+            print(f"[TestPredict] Warning: alignment landmarks not found for {img_path}; using fallback centering.")
 
         # Convert to tensor [1, 3, H, W] in [0, 1]
         rgb_tensor = torch.from_numpy(

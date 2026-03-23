@@ -1,7 +1,23 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \":*)"
-    ]
-  }
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Agent",
+      "WebFetch",
+      "WebSearch",
+      "TodoWrite",
+      "NotebookEdit"
+    ],
+    "deny": [
+      "Bash(rm -rf /:*)",
+      "Bash(format:*)"
+    ],
+    "defaultMode": "bypassPermissions"
+  },
+  "skipDangerousModePermissionPrompt": true
 }
