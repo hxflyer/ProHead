@@ -26,93 +26,6 @@ SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 _DR_CONTEXT_CACHE: dict[str, object] = {}
 
 
-class YuNetFaceDetector:
-    def __init__(
-        self,
-        model_path: str,
-        score_threshold: float = 0.7,
-        nms_threshold: float = 0.3,
-        top_k: int = 5000,
-    ) -> None:
-        if not hasattr(cv2, "FaceDetectorYN"):
-            raise RuntimeError("OpenCV FaceDetectorYN is not available in this environment.")
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"YuNet model not found: {model_path}")
-        self.model_path = os.path.abspath(model_path)
-        self.score_threshold = float(score_threshold)
-        self.nms_threshold = float(nms_threshold)
-        self.top_k = int(top_k)
-        self.detector = None
-        self.input_size = None
-
-    def _get_detector(self, input_size: tuple[int, int]):
-        if self.detector is None:
-            self.detector = cv2.FaceDetectorYN.create(
-                self.model_path,
-                "",
-                input_size,
-                self.score_threshold,
-                self.nms_threshold,
-                self.top_k,
-                cv2.dnn.DNN_BACKEND_OPENCV,
-                cv2.dnn.DNN_TARGET_CPU,
-            )
-            self.input_size = input_size
-            return self.detector
-        if self.input_size != input_size:
-            self.detector.setInputSize(input_size)
-            self.input_size = input_size
-        return self.detector
-
-    def detect(self, img_bgr: np.ndarray) -> np.ndarray | None:
-        h, w = img_bgr.shape[:2]
-        detector = self._get_detector((w, h))
-        _, faces = detector.detect(img_bgr)
-        if faces is None or len(faces) == 0:
-            return None
-        faces = np.asarray(faces, dtype=np.float32)
-        if faces.ndim == 1:
-            faces = faces[None, :]
-        score_idx = 14 if faces.shape[1] > 14 else None
-        if score_idx is None:
-            best = faces[0]
-        else:
-            best = faces[int(np.argmax(faces[:, score_idx]))]
-        return best[4:14].reshape(5, 2).astype(np.float32)
-
-
-class DlibFaceDetector:
-    def __init__(self, predictor_path: str) -> None:
-        try:
-            import dlib
-        except Exception as exc:
-            raise RuntimeError(f"dlib is not available: {exc}") from exc
-        if not predictor_path or not os.path.exists(predictor_path):
-            raise FileNotFoundError(f"dlib predictor not found: {predictor_path}")
-        self.dlib = dlib
-        self.detector = dlib.get_frontal_face_detector()
-        self.predictor = dlib.shape_predictor(predictor_path)
-        self.predictor_path = os.path.abspath(predictor_path)
-
-    def detect(self, img_bgr: np.ndarray) -> np.ndarray | None:
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        faces = self.detector(gray, 1)
-        if len(faces) == 0:
-            return None
-        face = max(faces, key=lambda r: float(r.width() * r.height()))
-        shape = self.predictor(gray, face)
-
-        def _pt(i: int) -> np.ndarray:
-            return np.array([shape.part(i).x, shape.part(i).y], dtype=np.float32)
-
-        right_eye = np.mean([_pt(i) for i in range(36, 42)], axis=0)
-        left_eye = np.mean([_pt(i) for i in range(42, 48)], axis=0)
-        nose = _pt(30)
-        mouth_right = _pt(48)
-        mouth_left = _pt(54)
-        return np.stack([right_eye, left_eye, nose, mouth_right, mouth_left], axis=0).astype(np.float32)
-
-
 def preprocess_aligned_rgb(img_rgb: np.ndarray, image_size: int) -> np.ndarray:
     x = cv2.resize(img_rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
     x = x.astype(np.float32) / 255.0
@@ -1287,51 +1200,6 @@ def prepare_overlay_points(
     return pts
 
 
-def approximate_points_from_box(x: float, y: float, w: float, h: float) -> np.ndarray:
-    return np.array(
-        [
-            [x + 0.35 * w, y + 0.38 * h],
-            [x + 0.65 * w, y + 0.38 * h],
-            [x + 0.50 * w, y + 0.56 * h],
-            [x + 0.42 * w, y + 0.74 * h],
-            [x + 0.58 * w, y + 0.74 * h],
-        ],
-        dtype=np.float32,
-    )
-
-
-def detect_five_points(
-    img_bgr: np.ndarray,
-    yunet: YuNetFaceDetector | None,
-    dlib_detector: DlibFaceDetector | None,
-    face_cascade: cv2.CascadeClassifier | None,
-) -> tuple[np.ndarray, np.ndarray, str]:
-    if dlib_detector is not None:
-        pts = dlib_detector.detect(img_bgr)
-        if pts is not None:
-            return pts, np.ones((5,), dtype=bool), "dlib"
-
-    if yunet is not None:
-        pts = yunet.detect(img_bgr)
-        if pts is not None:
-            return pts, np.ones((5,), dtype=bool), "yunet"
-
-    if face_cascade is not None and not face_cascade.empty():
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(80, 80),
-        )
-        if len(faces) > 0:
-            x, y, w, h = max(faces, key=lambda box: float(box[2] * box[3]))
-            return approximate_points_from_box(float(x), float(y), float(w), float(h)), np.ones((5,), dtype=bool), "haar_bbox"
-
-    h, w = img_bgr.shape[:2]
-    return approximate_points_from_box(0.0, 0.0, float(w), float(h)), np.ones((5,), dtype=bool), "full_image_bbox"
-
-
 def load_restore_indices(model_dir: str) -> np.ndarray | None:
     restore_path = os.path.join(model_dir, "mesh_inverse.npy")
     if not os.path.exists(restore_path):
@@ -2129,15 +1997,6 @@ def create_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--image_size", type=int, default=1024, help="Aligned input image size.")
     parser.add_argument("--vis_size", type=int, default=1024, help="Per-panel output size.")
-    parser.add_argument("--align_output_scale", type=float, default=0.75, help="Post-alignment scale factor.")
-    parser.add_argument("--align_direction_shift", type=float, default=0.08, help="Pose-aware alignment translation factor.")
-
-    parser.add_argument("--yunet_model_path", type=str, default="models/face_detection_yunet_2023mar.onnx", help="YuNet ONNX path.")
-    parser.add_argument("--yunet_score_threshold", type=float, default=0.7, help="YuNet score threshold.")
-    parser.add_argument("--yunet_nms_threshold", type=float, default=0.3, help="YuNet NMS threshold.")
-    parser.add_argument("--yunet_top_k", type=int, default=5000, help="YuNet top-k proposals.")
-    parser.add_argument("--face_detector", type=str, default="auto", choices=["auto", "yunet", "dlib"], help="Face detector backend.")
-    parser.add_argument("--predictor_path", type=str, default="", help="Path to dlib shape_predictor_68_face_landmarks.dat.")
 
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)

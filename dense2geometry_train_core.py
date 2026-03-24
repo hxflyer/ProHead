@@ -204,6 +204,10 @@ def cleanup_distributed() -> None:
     except Exception:
         pass
     try:
+        dist.barrier()
+    except Exception:
+        pass
+    try:
         dist.destroy_process_group()
     except Exception:
         pass
@@ -230,6 +234,21 @@ def worker_init_fn(_worker_id):
     import cv2
     try:
         cv2.setNumThreads(0)
+    except Exception:
+        pass
+
+
+def _shutdown_dataloader(loader) -> None:
+    if loader is None:
+        return
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if shutdown is None:
+        return
+    try:
+        shutdown()
     except Exception:
         pass
 
@@ -261,9 +280,13 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
     train_num_workers = int(max(0, data_cfg.num_workers))
     val_num_workers = 0 if train_num_workers <= 0 else max(1, train_num_workers // 4)
+    use_persistent_workers = bool(data_cfg.persistent_workers)
 
     if rank == 0:
-        print(f"[DataLoader] train_workers={train_num_workers} val_workers={val_num_workers}")
+        print(
+            f"[DataLoader] train_workers={train_num_workers} "
+            f"val_workers={val_num_workers} persistent_workers={use_persistent_workers}"
+        )
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -273,7 +296,7 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
         pin_memory=True,
         drop_last=True,
         prefetch_factor=data_cfg.prefetch_factor if train_num_workers > 0 else None,
-        persistent_workers=bool(data_cfg.persistent_workers) if train_num_workers > 0 else False,
+        persistent_workers=use_persistent_workers if train_num_workers > 0 else False,
         collate_fn=dense2geometry_collate_fn,
         worker_init_fn=worker_init_fn,
     )
@@ -285,7 +308,7 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
         pin_memory=True,
         drop_last=False,
         prefetch_factor=data_cfg.prefetch_factor if val_num_workers > 0 else None,
-        persistent_workers=bool(data_cfg.persistent_workers) if val_num_workers > 0 else False,
+        persistent_workers=use_persistent_workers if val_num_workers > 0 else False,
         collate_fn=dense2geometry_collate_fn,
         worker_init_fn=worker_init_fn,
     )
@@ -472,7 +495,21 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
     pbar = tqdm(train_loader, desc="Training") if rank == 0 else train_loader
     for batch in pbar:
         if rank == 0 and visualization_batch is None:
-            visualization_batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            keep_keys = {
+                "rgb",
+                "mesh",
+                "mesh_loss_weights",
+                "image_path",
+                "align5pts",
+                "align5pts_valid",
+                "align_applied",
+                "detection_source",
+            }
+            visualization_batch = {
+                k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+                for k, v in batch.items()
+                if k in keep_keys
+            }
         rgb = batch["rgb"].to(device, non_blocking=True)
         mesh_gt = batch["mesh"].to(device, non_blocking=True)
         mesh_w6 = _mesh_weights_6d(batch, device)
@@ -568,6 +605,7 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
 
 def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, val_loader):
     model = built["model"]
+    amp_dtype = built["amp_dtype"]
     device = torch.device(f"cuda:{rank}")
     model.eval()
     val_loss = 0.0
@@ -581,9 +619,10 @@ def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, 
             mesh_w6 = _mesh_weights_6d(batch, device)
             mesh_loss_weights = batch["mesh_loss_weights"].to(device, non_blocking=True).float()
 
-            outputs = model(rgb)
-            mesh_pred = outputs["mesh"].float()
-            loss = compute_weighted_l1(mesh_pred, mesh_gt, mesh_w6)
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
+                outputs = model(rgb)
+                mesh_pred = outputs["mesh"].float()
+                loss = compute_weighted_l1(mesh_pred, mesh_gt, mesh_w6)
 
             val_loss += float(loss.item())
             num_batches += 1
@@ -893,6 +932,8 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
     torch.set_float32_matmul_precision("high")
 
     writer = None
+    train_loader = None
+    val_loader = None
     try:
         mesh_topology = None
         mesh_restore_indices = None
@@ -912,6 +953,8 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
                 print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
             train_out = train_one_epoch(epoch, rank, world_size, data_cfg, built, train_loader, train_sampler)
             val_out = validate_one_epoch(rank, world_size, data_cfg, built, val_loader)
+            if world_size > 1 and dist.is_available() and dist.is_initialized():
+                dist.barrier()
             log_and_checkpoint(epoch, rank, built, train_out, val_out, writer, train_cfg, mesh_topology, mesh_restore_indices)
             if rank == 0:
                 try:
@@ -928,8 +971,12 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
                     )
                 except Exception as exc:
                     print(f"[TestPredict] Warning: {exc}")
+            if world_size > 1 and dist.is_available() and dist.is_initialized():
+                dist.barrier()
             built["scheduler"].step()
     finally:
+        _shutdown_dataloader(train_loader)
+        _shutdown_dataloader(val_loader)
         if writer:
             writer.close()
         cleanup_distributed()

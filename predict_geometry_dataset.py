@@ -24,9 +24,7 @@ import os
 import signal
 import shutil
 import sys
-import threading
 import traceback
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -48,41 +46,7 @@ IMAGE_SIZE = 512   # model input size
 
 SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Face detector backends
-# ──────────────────────────────────────────────────────────────────────────────
-
-_face_detector_mode = "dlib"
-
-_dlib_tls = threading.local()
-_dlib_predictor_path = None
-_dlib_detector_upsample = 1
-
-_yunet_tls = threading.local()
-_yunet_model_path = None
-_yunet_score_threshold = 0.8
-_yunet_nms_threshold = 0.3
-_yunet_top_k = 5000
-_yunet_backend_id = cv2.dnn.DNN_BACKEND_OPENCV
-_yunet_target_id = cv2.dnn.DNN_TARGET_CPU
-_yunet_backend_label = "cpu"
-
-_DEFAULT_YUNET_URLS = [
-    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
-]
-
-
-def _download_file(urls: list[str], out_path: str) -> bool:
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    for url in urls:
-        try:
-            print(f"[Info] Downloading face detector model from: {url}")
-            urllib.request.urlretrieve(url, out_path)
-            return True
-        except Exception as e:
-            print(f"[Warn] Download failed from {url}: {e}")
-    return False
-
+# CUDA helper for multi-GPU preprocessing.
 
 def _set_cv_cuda_device(device_id: int) -> None:
     try:
@@ -90,211 +54,6 @@ def _set_cv_cuda_device(device_id: int) -> None:
             cv2.cuda.setDevice(int(device_id))
     except Exception:
         pass
-
-
-def _get_yunet_backend_candidates(preference: str, device_id: int) -> list[tuple[int, int, str]]:
-    preference = str(preference).strip().lower()
-    candidates: list[tuple[int, int, str]] = []
-
-    def _append_cuda() -> None:
-        if hasattr(cv2.dnn, "DNN_BACKEND_CUDA") and hasattr(cv2.dnn, "DNN_TARGET_CUDA_FP16"):
-            candidates.append((cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA_FP16, f"cuda:{device_id}/fp16"))
-        if hasattr(cv2.dnn, "DNN_BACKEND_CUDA") and hasattr(cv2.dnn, "DNN_TARGET_CUDA"):
-            candidates.append((cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA, f"cuda:{device_id}"))
-
-    if preference == "auto":
-        if torch.cuda.is_available():
-            _append_cuda()
-        candidates.append((cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU, "cpu"))
-    elif preference == "cuda":
-        _append_cuda()
-    elif preference == "cuda_fp16":
-        if hasattr(cv2.dnn, "DNN_BACKEND_CUDA") and hasattr(cv2.dnn, "DNN_TARGET_CUDA_FP16"):
-            candidates.append((cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA_FP16, f"cuda:{device_id}/fp16"))
-    else:
-        candidates.append((cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU, "cpu"))
-
-    if not candidates:
-        candidates.append((cv2.dnn.DNN_BACKEND_OPENCV, cv2.dnn.DNN_TARGET_CPU, "cpu"))
-    return candidates
-
-
-def _make_yunet_detector(input_size: tuple[int, int]):
-    return cv2.FaceDetectorYN.create(
-        _yunet_model_path,
-        "",
-        input_size,
-        _yunet_score_threshold,
-        _yunet_nms_threshold,
-        _yunet_top_k,
-        _yunet_backend_id,
-        _yunet_target_id,
-    )
-
-
-def _get_thread_yunet(input_size: tuple[int, int]):
-    detector = getattr(_yunet_tls, "detector", None)
-    current_input_size = getattr(_yunet_tls, "input_size", None)
-    if detector is None:
-        detector = _make_yunet_detector(input_size)
-        _yunet_tls.detector = detector
-        _yunet_tls.input_size = input_size
-        return detector
-    if current_input_size != input_size:
-        detector.setInputSize(input_size)
-        _yunet_tls.input_size = input_size
-    return detector
-
-
-def _init_yunet(
-    model_paths: list[str],
-    backend_preference: str,
-    device_id: int,
-    auto_download: bool,
-    score_threshold: float,
-    nms_threshold: float,
-    top_k: int,
-) -> bool:
-    global _face_detector_mode
-    global _yunet_model_path, _yunet_score_threshold, _yunet_nms_threshold, _yunet_top_k
-    global _yunet_backend_id, _yunet_target_id, _yunet_backend_label
-
-    if not hasattr(cv2, "FaceDetectorYN"):
-        print("[Warn] OpenCV FaceDetectorYN not available; cannot use YuNet.")
-        return False
-
-    chosen_path = None
-    for p in model_paths:
-        if p and os.path.exists(p):
-            chosen_path = os.path.abspath(p)
-            break
-
-    if chosen_path is None and auto_download:
-        default_path = next((p for p in model_paths if p), os.path.join("models", "face_detection_yunet_2023mar.onnx"))
-        default_path = os.path.abspath(default_path)
-        if _download_file(_DEFAULT_YUNET_URLS, default_path):
-            chosen_path = default_path
-
-    if chosen_path is None:
-        print("[Warn] YuNet model not found.")
-        return False
-
-    _yunet_model_path = chosen_path
-    _yunet_score_threshold = float(score_threshold)
-    _yunet_nms_threshold = float(nms_threshold)
-    _yunet_top_k = int(top_k)
-
-    last_error = None
-    for backend_id, target_id, label in _get_yunet_backend_candidates(backend_preference, device_id):
-        try:
-            if "cuda" in label:
-                _set_cv_cuda_device(device_id)
-            _yunet_backend_id = backend_id
-            _yunet_target_id = target_id
-            _yunet_backend_label = label
-            detector = _make_yunet_detector((320, 320))
-            detector.detect(np.zeros((320, 320, 3), dtype=np.uint8))
-            _yunet_tls.detector = detector
-            _yunet_tls.input_size = (320, 320)
-            _face_detector_mode = "yunet"
-            print(f"[Info] Using YuNet face detector: {_yunet_model_path} backend={label}")
-            return True
-        except Exception as e:
-            last_error = e
-            _yunet_tls.detector = None
-            _yunet_tls.input_size = None
-
-    print(f"[Warn] YuNet initialization failed: {last_error}")
-    return False
-
-
-def _get_thread_dlib():
-    detector = getattr(_dlib_tls, "detector", None)
-    predictor = getattr(_dlib_tls, "predictor", None)
-    if detector is not None and predictor is not None:
-        return detector, predictor
-
-    if _dlib_predictor_path is None:
-        raise RuntimeError("dlib predictor path not initialized")
-
-    import dlib
-
-    detector = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor(_dlib_predictor_path)
-    _dlib_tls.detector = detector
-    _dlib_tls.predictor = predictor
-    return detector, predictor
-
-
-def _init_dlib(predictor_paths: list[str], upsample: int = 1) -> bool:
-    global _face_detector_mode, _dlib_predictor_path, _dlib_detector_upsample
-    try:
-        import dlib
-    except ImportError:
-        print("[Error] dlib not installed. Run: pip install dlib")
-        return False
-
-    if _dlib_predictor_path is not None:
-        _dlib_detector_upsample = max(0, int(upsample))
-        _get_thread_dlib()
-        _face_detector_mode = "dlib"
-        return True
-
-    for p in predictor_paths:
-        if os.path.exists(p):
-            _dlib_predictor_path = os.path.abspath(p)
-            _dlib_detector_upsample = max(0, int(upsample))
-            _get_thread_dlib()
-            print(f"[Info] Loaded dlib predictor: {_dlib_predictor_path} (upsample={_dlib_detector_upsample})")
-            _face_detector_mode = "dlib"
-            return True
-
-    print("[Error] shape_predictor_68_face_landmarks.dat not found.")
-    print("  Download: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2")
-    return False
-
-
-def detect_5pt(img_bgr: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Detect 5 face keypoints via YuNet or dlib.
-
-    Returns (five_pts_px [5,2], five_valid [5,]) or (None, None) on failure.
-    Order: right_eye, left_eye, nose, mouth_right, mouth_left
-    """
-    if _face_detector_mode == "yunet":
-        h, w = img_bgr.shape[:2]
-        detector = _get_thread_yunet((w, h))
-        _, faces = detector.detect(img_bgr)
-        if faces is None or len(faces) == 0:
-            return None, None
-        faces = np.asarray(faces, dtype=np.float32)
-        if faces.ndim == 1:
-            faces = faces[None, :]
-        scores = faces[:, 14] if faces.shape[1] > 14 else np.ones((faces.shape[0],), dtype=np.float32)
-        best = faces[int(np.argmax(scores))]
-        pts = best[4:14].reshape(5, 2).astype(np.float32)
-        valid = np.ones(5, dtype=bool)
-        return pts, valid
-
-    detector, predictor = _get_thread_dlib()
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    faces = detector(gray, _dlib_detector_upsample)
-    if len(faces) == 0:
-        return None, None
-
-    shape = predictor(gray, faces[0])
-
-    def _pt(i):
-        return np.array([shape.part(i).x, shape.part(i).y], dtype=np.float32)
-
-    right_eye   = np.mean([_pt(i) for i in range(36, 42)], axis=0)
-    left_eye    = np.mean([_pt(i) for i in range(42, 48)], axis=0)
-    nose        = _pt(30)
-    mouth_right = _pt(48)
-    mouth_left  = _pt(54)
-
-    pts   = np.array([right_eye, left_eye, nose, mouth_right, mouth_left], dtype=np.float32)
-    valid = np.ones(5, dtype=bool)
-    return pts, valid
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -892,7 +651,7 @@ def main():
     parser.add_argument("--num_gpus",   type=int, default=1,   help="Number of GPUs to use in parallel")
     parser.add_argument("--batch_size", type=int, default=4,   help="Images per GPU forward pass")
     parser.add_argument("--preprocess_workers", type=int, default=0,
-                        help="CPU workers per GPU for image decode + dlib alignment (0 = auto)")
+                        help="CPU workers per GPU for image decode + MediaPipe+jaw alignment (0 = auto)")
     parser.add_argument("--save_workers", type=int, default=0,
                         help="CPU workers per GPU for writing output files (0 = auto)")
     parser.add_argument("--max_pending_batches", type=int, default=4,
@@ -902,27 +661,6 @@ def main():
                         help="Test mode: process test_n images, save visualisations")
     parser.add_argument("--test_n", type=int, default=20,
                         help="Number of images to process in test mode (default 20)")
-    parser.add_argument("--predictor_path", type=str, default="",
-                        help="Path to shape_predictor_68_face_landmarks.dat (auto-searched if empty)")
-    parser.add_argument("--face_detector", type=str, default="auto", choices=["auto", "yunet", "dlib"],
-                        help="5-point face detector backend (auto prefers YuNet, falls back to dlib)")
-    parser.add_argument("--face_detector_backend", type=str, default="auto",
-                        choices=["auto", "cuda", "cuda_fp16", "cpu"],
-                        help="Backend preference for YuNet detector")
-    parser.add_argument("--yunet_model_path", type=str, default="models/face_detection_yunet_2023mar.onnx",
-                        help="Path to YuNet ONNX model")
-    parser.add_argument("--auto_download_face_detector", dest="auto_download_face_detector", action="store_true",
-                        help="Auto-download the YuNet face detector model if missing")
-    parser.add_argument("--no_auto_download_face_detector", dest="auto_download_face_detector", action="store_false",
-                        help="Disable auto-download of the YuNet face detector model")
-    parser.add_argument("--yunet_score_threshold", type=float, default=0.8,
-                        help="YuNet score threshold")
-    parser.add_argument("--yunet_nms_threshold", type=float, default=0.3,
-                        help="YuNet NMS threshold")
-    parser.add_argument("--yunet_top_k", type=int, default=5000,
-                        help="YuNet top-k candidates before NMS")
-    parser.add_argument("--dlib_upsample", type=int, default=1, choices=[0, 1, 2],
-                        help="dlib face detector upsample factor (0 is faster, 1 is safer for small faces)")
     parser.add_argument("--amp", dest="amp", action="store_true",
                         help="Enable CUDA autocast for faster inference")
     parser.add_argument("--no_amp", dest="amp", action="store_false",
@@ -945,7 +683,6 @@ def main():
     parser.add_argument("--no_deformable_attention",     dest="use_deformable_attention", action="store_false")
     parser.set_defaults(use_deformable_attention=True)
     parser.set_defaults(amp=True)
-    parser.set_defaults(auto_download_face_detector=True)
 
     args = parser.parse_args()
 
