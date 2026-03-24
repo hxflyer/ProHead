@@ -1,11 +1,6 @@
 __pycache__/
-
-data/
-training_samples/
-runs/
+artifacts/
 *.pth
-models/
-bak/
-visualization/
-test_script/
+legacy/
+training_samples/
 training_samples_dense/

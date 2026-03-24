@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from obj_load_helper import load_uv_obj_file
+from data_utils.obj_io import load_uv_obj_file
 try:
     import nvdiffrast.torch as dr
     _NVDIFFRAST_AVAILABLE = True
@@ -65,7 +65,7 @@ def _place_uv_in_box(uv: np.ndarray, u_start: float, v_start: float, box_size: f
     return out.astype(np.float32, copy=False)
 
 
-def _load_combined_mesh_uv(model_dir: str = "model") -> np.ndarray:
+def _load_combined_mesh_uv(model_dir: str = "assets/topology") -> np.ndarray:
     cache_key = os.path.abspath(model_dir)
     if cache_key in _MESH_UV_COMBINED_CACHE:
         return _MESH_UV_COMBINED_CACHE[cache_key]
@@ -134,7 +134,7 @@ def _load_combined_mesh_uv(model_dir: str = "model") -> np.ndarray:
     return uv_combined
 
 
-def load_combined_mesh_uv(model_dir: str = "model", copy: bool = True) -> np.ndarray:
+def load_combined_mesh_uv(model_dir: str = "assets/topology", copy: bool = True) -> np.ndarray:
     """
     Public helper to load the static combined UV layout used by texture GT composition.
     """
@@ -413,10 +413,10 @@ def render_mesh_texture_from_2d_pred(
 def load_landmark_topology():
     """Load the landmark 3D model topology for visualization."""
     models = {
-        'head': 'model/landmark_head.obj',
-        'eye_l': 'model/landmark_eye_l.obj',
-        'eye_r': 'model/landmark_eye_r.obj',
-        'mouth': 'model/landmark_mouth.obj'
+        'head': 'assets/topology/landmark_head.obj',
+        'eye_l': 'assets/topology/landmark_eye_l.obj',
+        'eye_r': 'assets/topology/landmark_eye_r.obj',
+        'mouth': 'assets/topology/landmark_mouth.obj'
     }
     
     topology = {}
@@ -457,10 +457,10 @@ def load_landmark_topology():
 def load_mesh_topology():
     """Load the mesh 3D model topology for visualization."""
     models = {
-        'head': 'model/mesh_head.obj',
-        'eye_l': 'model/mesh_eye_l.obj',
-        'eye_r': 'model/mesh_eye_r.obj',
-        'mouth': 'model/mesh_mouth.obj'
+        'head': 'assets/topology/mesh_head.obj',
+        'eye_l': 'assets/topology/mesh_eye_l.obj',
+        'eye_r': 'assets/topology/mesh_eye_r.obj',
+        'mouth': 'assets/topology/mesh_mouth.obj'
     }
     
     topology = {}
@@ -750,7 +750,7 @@ def save_geometry_visualizations(geometry_model, batch, epoch, device, output_di
     template_mesh_uv = None
     template_mesh_faces = None
     try:
-        combined_mesh_uv = _load_combined_mesh_uv(model_dir="model")
+        combined_mesh_uv = _load_combined_mesh_uv(model_dir="assets/topology")
     except Exception as e:
         print(f"Warning: failed to load combined mesh UV layout for OBJ export: {e}")
     try:

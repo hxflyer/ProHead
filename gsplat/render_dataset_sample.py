@@ -26,9 +26,9 @@ from render_head import (  # noqa: E402
     matrix_data_to_torch,
     stack_mat_tensors,
 )
-from mat_load_helper import load_matrix_data  # noqa: E402
-from obj_load_helper import load_uv_obj_file  # noqa: E402
-from tex_pack_helper import TexturePackHelper  # noqa: E402
+from data_utils.camera_io import load_matrix_data  # noqa: E402
+from data_utils.obj_io import load_uv_obj_file  # noqa: E402
+from data_utils.texture_pack import TexturePackHelper  # noqa: E402
 from train_visualize_helper import load_combined_mesh_uv  # noqa: E402
 
 
@@ -160,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=3, help="How many samples to auto-discover when --sample-ids is empty")
     parser.add_argument("--batch-size", type=int, default=2, help="How many samples to render per forward pass")
     parser.add_argument("--texture-root", default=default_texture_root(), help="Texture root used by TexturePackHelper")
-    parser.add_argument("--model-dir", default="model", help="Model directory with static UV topology assets")
+    parser.add_argument("--model-dir", default="assets/topology", help="Model directory with static UV topology assets")
     parser.add_argument("--output-dir", default="gsplat/dataset_output_training_demo", help="Directory for saved renders")
     parser.add_argument("--width", type=int, default=512, help="Output render width")
     parser.add_argument("--height", type=int, default=512, help="Output render height")

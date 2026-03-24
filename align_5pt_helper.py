@@ -28,7 +28,7 @@ _MP_JAW         = 152   # chin bottom
 _GT_5PT_INDICES = (2219, 2194, 1993, 1896, 1839)  # eye_r, eye_l, nose, mouth_r, mouth_l
 _GT_JAW_INDEX   = 1788
 
-_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_landmarker.task")
+_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "pretrained", "face_landmarker.task")
 
 _mp_landmarker = None
 

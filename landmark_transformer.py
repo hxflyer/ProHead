@@ -90,10 +90,10 @@ class LandmarkTransformer(nn.Module):
         if backbone_weights == 'dinov3':
             print("Loading DINOv3 pretrained backbone (converted to Torchvision format)...")
             # Use the converted weights file
-            weight_path = "models/dinov3_lvd1689m_torchvision.pth"
+            weight_path = "assets/pretrained/dinov3_lvd1689m_torchvision.pth"
         else:
             print("Loading ImageNet pretrained backbone (Fusion Stride 4+8+16)...")
-            weight_path = "models/convnext_base-6075fbad.pth"
+            weight_path = "assets/pretrained/convnext_base-6075fbad.pth"
 
         print(f"Loading weights from: {weight_path}")
         state_dict = torch.load(weight_path, map_location="cpu")

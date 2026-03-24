@@ -14,6 +14,12 @@ import torch
 from torch.utils.data import Dataset
 
 from align_5pt_helper import Align5PtHelper
+from data_utils.image_io import (
+    load_exr_as_float32 as _shared_load_exr_as_float32,
+    warp_affine_black_border as _shared_warp_affine_black_border,
+)
+from data_utils.mesh_io import load_landmark_pixels as _shared_load_landmark_pixels
+from data_utils.sample_index import collect_dense_image_sample_records
 
 try:
     import albumentations as A
@@ -25,82 +31,13 @@ except ImportError:
 
 
 def load_exr_image(exr_path):
-    """
-    Load EXR image with fallback methods.
-    Returns numpy array in float32 format.
-    """
-    img_array = None
+    return _shared_load_exr_as_float32(exr_path)
 
-    try:
-        import Imath
-        import OpenEXR
-
-        exr_file = OpenEXR.InputFile(exr_path)
-        header = exr_file.header()
-        dw = header["dataWindow"]
-        width = dw.max.x - dw.min.x + 1
-        height = dw.max.y - dw.min.y + 1
-
-        channels_data = {}
-        for channel in ["R", "G", "B", "A"]:
-            if channel in header["channels"]:
-                channel_type = header["channels"][channel].type
-                if channel_type == Imath.PixelType(Imath.PixelType.FLOAT):
-                    pixel_data = exr_file.channel(channel, Imath.PixelType(Imath.PixelType.FLOAT))
-                    channel_array = np.frombuffer(pixel_data, dtype=np.float32).reshape((height, width))
-                else:
-                    pixel_data = exr_file.channel(channel, Imath.PixelType(Imath.PixelType.HALF))
-                    channel_array = np.frombuffer(pixel_data, dtype=np.float16).reshape((height, width))
-                    channel_array = channel_array.astype(np.float32)
-                channels_data[channel] = channel_array
-
-        if channels_data:
-            img_array = np.stack(
-                [
-                    channels_data.get(ch, np.zeros((height, width), dtype=np.float32))
-                    for ch in ["R", "G", "B", "A"]
-                ],
-                axis=2,
-            )
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    if img_array is None:
-        try:
-            import imageio.v3 as imageio
-
-            img_array = imageio.imread(exr_path).astype(np.float32)
-        except Exception:
-            pass
-
-    if img_array is None:
-        try:
-            os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-            img_array = cv2.imread(exr_path, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
-            if img_array is not None:
-                img_array = img_array.astype(np.float32)
-        except Exception:
-            pass
-
-    return img_array
 
 
 def _load_landmark_pixels(filepath: Optional[str]) -> Optional[np.ndarray]:
-    """Read [N, 2] pixel coords (cols 3, 4) from a landmark txt file."""
-    if filepath is None or not os.path.exists(filepath):
-        return None
-    pts = []
-    with open(filepath) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.replace(",", " ").split()
-            if len(parts) >= 5:
-                pts.append([float(parts[3]), float(parts[4])])
-    return np.array(pts, dtype=np.float32) if pts else None
+    return _shared_load_landmark_pixels(filepath)
+
 
 
 def _find_first_existing(paths: list[str]) -> Optional[str]:
@@ -141,18 +78,8 @@ def _warp_with_black_border(
     output_size: int,
     interpolation: int,
 ) -> np.ndarray:
-    if image.ndim == 2:
-        border_value = 0
-    else:
-        border_value = (0,) * image.shape[2]
-    return cv2.warpAffine(
-        image,
-        m,
-        (int(output_size), int(output_size)),
-        flags=interpolation,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=border_value,
-    )
+    return _shared_warp_affine_black_border(image, m, output_size, interpolation)
+
 
 
 def _transform_points_px(points_px: np.ndarray, m: np.ndarray) -> np.ndarray:
@@ -301,66 +228,26 @@ class DenseImageDataset(Dataset):
         if self.augment and ALBUMENTATIONS_AVAILABLE:
             self.pre_align_augment = _build_pre_align_augment()
 
-        self.samples: list[tuple] = []
-        for data_root in self.data_roots:
-            if not os.path.exists(data_root):
-                continue
-
-            color_files = glob.glob(os.path.join(data_root, "Color_*"))
-            color_files = [
-                f
-                for f in color_files
-                if os.path.basename(f).startswith("Color_")
-                and not os.path.basename(f).endswith("_mask.png")
-            ]
-
-            for color_file in color_files:
-                sample_id = _parse_sample_id_from_color_file(color_file)
-                basecolor_path = os.path.join(data_root, "basecolor", f"BaseColor_{sample_id}.png")
-                geo_path = os.path.join(data_root, "geo", f"Geo_{sample_id}.exr")
-                screen_normal_path = os.path.join(data_root, "normal", f"ScreenNormal_{sample_id}.png")
-                face_mask_path = os.path.join(data_root, "facemask", f"Face_Mask_{sample_id}.png")
-                landmark_path = _find_first_existing(
-                    [
-                        os.path.join(data_root, "landmark", f"landmark_{sample_id}.txt"),
-                        os.path.join(data_root, "landmark", f"{sample_id}.txt"),
-                    ]
-                )
-                error_mask_path = os.path.join(data_root, f"Color_{sample_id}_mask.png")
-                geo_normal_path = os.path.join(data_root, "geo_normal", f"GeoNormal_{sample_id}.png")
-                if not os.path.exists(basecolor_path) or not os.path.exists(geo_path) or not os.path.exists(screen_normal_path) or not os.path.exists(face_mask_path) or not os.path.exists(geo_normal_path):
-                    continue
-                self.samples.append(
-                    (
-                        data_root,
-                        sample_id,
-                        color_file,
-                        basecolor_path,
-                        geo_path,
-                        screen_normal_path,
-                        face_mask_path,
-                        error_mask_path if os.path.exists(error_mask_path) else None,
-                        landmark_path,
-                        geo_normal_path,
-                    )
-                )
-
-        self.samples = sorted(list(set(self.samples)))
-
-        samples_by_root: dict[str, list[tuple]] = {}
-        for sample in self.samples:
-            samples_by_root.setdefault(sample[0], []).append(sample)
-
-        split_samples: list[tuple] = []
-        val_ratio = float(np.clip(1.0 - float(train_ratio), 0.0, 1.0))
-        for root in sorted(samples_by_root.keys()):
-            root_samples = sorted(samples_by_root[root])
-            val_count = int(len(root_samples) * val_ratio)
-            if self.split == "train":
-                split_samples.extend(root_samples[val_count:])
-            else:
-                split_samples.extend(root_samples[:val_count])
-        self.samples = split_samples
+        sample_records = collect_dense_image_sample_records(
+            data_roots=self.data_roots,
+            split=self.split,
+            train_ratio=train_ratio,
+        )
+        self.samples: list[tuple] = [
+            (
+                record.data_root,
+                record.sample_id,
+                record.color_path,
+                record.basecolor_path,
+                record.geo_path,
+                record.screen_normal_path,
+                record.face_mask_path,
+                record.error_mask_path,
+                record.landmark_path,
+                record.geo_normal_path,
+            )
+            for record in sample_records
+        ]
 
         self.image_only_augment = None
         if self.augment and ALBUMENTATIONS_AVAILABLE:

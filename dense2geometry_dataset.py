@@ -4,19 +4,19 @@ from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 
 from align_5pt_helper import Align5PtHelper
-from alignment_io import (
+from data_utils.alignment_io import (
     apply_alignment_to_geometry,
     build_alignment_metadata,
     compute_alignment_transform,
     warp_rgb_image,
 )
-from image_io import (
+from data_utils.image_io import (
     apply_occlusion_mask_to_weights,
     load_optional_mask,
     load_rgb_image_or_default,
     resize_rgb_or_default,
 )
-from mesh_io import (
+from data_utils.mesh_io import (
     apply_geometry_indices,
     attach_depth_channels,
     compute_geometry_found_mask,
@@ -24,7 +24,7 @@ from mesh_io import (
     load_geometry_template_set,
     load_geometry_txt,
 )
-from sample_index import collect_geometry_sample_records
+from data_utils.sample_index import collect_geometry_sample_records
 
 try:
     import albumentations as A
@@ -74,7 +74,7 @@ class Dense2GeometryDataset(Dataset):
             translate_jitter=float(max(0.0, self.ALIGN_TRANSLATE_JITTER)),
         )
 
-        templates = load_geometry_template_set(model_dir="model")
+        templates = load_geometry_template_set(model_dir="assets/topology")
         self.mesh_indices = templates.mesh_indices
         self.default_mesh = templates.default_mesh
         self.template_landmark_depth = templates.template_landmark_depth

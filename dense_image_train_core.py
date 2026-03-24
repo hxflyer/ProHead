@@ -122,7 +122,7 @@ class TrainConfig:
     epochs: int = 50
     amp_dtype: str = "fp16"
     load_model: str = ""
-    save_path: str = "best_dense_image_transformer_ch13.pth"
+    save_path: str = "artifacts/checkpoints/best_dense_image_transformer_ch13.pth"
     save_preview_every: int = 1
     basecolor_fg_weight: float = 8.0
     basecolor_fg_threshold: float = 0.02
@@ -221,7 +221,7 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--load_model", type=str, default="")
-    parser.add_argument("--save_path", type=str, default="best_dense_image_transformer_ch13.pth")
+    parser.add_argument("--save_path", type=str, default="artifacts/checkpoints/best_dense_image_transformer_ch13.pth")
     parser.add_argument("--save_preview_every", type=int, default=1)
     parser.add_argument("--basecolor_fg_weight", type=float, default=8.0)
     parser.add_argument("--basecolor_fg_threshold", type=float, default=0.02)
@@ -671,7 +671,7 @@ def _save_preview(
     epoch: int,
     batch,
     pred: torch.Tensor,
-    output_dir: str = "training_samples_dense",
+    output_dir: str = "artifacts/training_samples_dense",
     predict_basecolor: bool = True,
     predict_geo: bool = True,
     predict_normal: bool = True,
@@ -1154,7 +1154,7 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
             best_val = float(resumed_ckpt["val_loss"])
 
     run_name = f"dense_img_{model_cfg.backbone_weights}_{int(time.time())}"
-    writer = SummaryWriter(os.path.join("runs", run_name))
+    writer = SummaryWriter(os.path.join("artifacts", "runs", run_name))
 
     for epoch in range(start_epoch, train_cfg.epochs):
         print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
@@ -1235,6 +1235,9 @@ def run_training(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainC
 
         if val_out["avg_loss"] < best_val:
             best_val = val_out["avg_loss"]
+            save_dir = os.path.dirname(train_cfg.save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
             torch.save(
                 {
                     "epoch": epoch,
@@ -1357,7 +1360,7 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
     writer = None
     if rank == 0:
         run_name = f"dense_img_{model_cfg.backbone_weights}_{int(time.time())}"
-        writer = SummaryWriter(os.path.join("runs", run_name))
+        writer = SummaryWriter(os.path.join("artifacts", "runs", run_name))
 
     for epoch in range(start_epoch, train_cfg.epochs):
         if rank == 0:
@@ -1448,6 +1451,9 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
 
             if val_out["avg_loss"] < best_val:
                 best_val = val_out["avg_loss"]
+                save_dir = os.path.dirname(train_cfg.save_path)
+                if save_dir:
+                    os.makedirs(save_dir, exist_ok=True)
                 torch.save(
                     {
                         "epoch": epoch,

@@ -1987,10 +1987,10 @@ def run_inference(args) -> None:
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Dense2Geometry inference on images with combined visualization export.")
-    parser.add_argument("--image_path", type=str, default="test", help="Input image file or folder.")
-    parser.add_argument("--checkpoint", type=str, default="best_dense2geometry.pth", help="Dense2Geometry checkpoint path.")
-    parser.add_argument("--output_dir", type=str, default="test_result_dense2geometry", help="Directory for saved outputs.")
-    parser.add_argument("--model_dir", type=str, default="model", help="Directory containing mesh templates/topology.")
+    parser.add_argument("--image_path", type=str, default="samples", help="Input image file or folder.")
+    parser.add_argument("--checkpoint", type=str, default="artifacts/checkpoints/best_dense2geometry.pth", help="Dense2Geometry checkpoint path.")
+    parser.add_argument("--output_dir", type=str, default="artifacts/test_result_dense2geometry", help="Directory for saved outputs.")
+    parser.add_argument("--model_dir", type=str, default="assets/topology", help="Directory containing mesh templates/topology.")
     parser.add_argument("--device", type=str, default="auto", help="Device to run on: auto, cpu, cuda, cuda:0, ...")
     parser.add_argument("--amp", action="store_true", default=True, help="Enable fp16 autocast on CUDA.")
     parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable fp16 autocast.")

@@ -604,9 +604,9 @@ class GeometryTransformer(nn.Module):
         )
 
         # Pre-computed geo feature atlas (EXR-baked, flood-filled).
-        # Loaded from model/geo_feature_atlas.npy if present; falls back to geo_texture.
+        # Loaded from assets/topology/geo_feature_atlas.npy if present; falls back to geo_texture.
         import os as _os
-        _geo_atlas_path = "model/geo_feature_atlas.npy"
+        _geo_atlas_path = "assets/topology/geo_feature_atlas.npy"
         if _os.path.exists(_geo_atlas_path):
             _geo_atlas = torch.from_numpy(np.load(_geo_atlas_path)).float()  # [3, H, W]
             print(f"[GeometryTransformer] Loaded geo_feature_atlas from {_geo_atlas_path} "
@@ -621,7 +621,7 @@ class GeometryTransformer(nn.Module):
             print("Backbone weights: skipped (will be loaded from checkpoint)")
         elif backbone_weights == 'dinov3':
             print("Loading DINOv3 pretrained backbone...")
-            weight_path = "models/dinov3_lvd1689m_torchvision.pth"
+            weight_path = "assets/pretrained/dinov3_lvd1689m_torchvision.pth"
             print(f"Loading weights from: {weight_path}")
             state_dict = torch.load(weight_path, map_location="cpu")
             if 'model' in state_dict:
@@ -629,7 +629,7 @@ class GeometryTransformer(nn.Module):
             backbone.load_state_dict(state_dict, strict=False)
         else:
             print("Loading ImageNet pretrained backbone...")
-            weight_path = "models/convnext_base-6075fbad.pth"
+            weight_path = "assets/pretrained/convnext_base-6075fbad.pth"
             print(f"Loading weights from: {weight_path}")
             state_dict = torch.load(weight_path, map_location="cpu")
             if 'model' in state_dict:

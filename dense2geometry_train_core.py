@@ -72,8 +72,8 @@ class TrainConfig:
     epochs: int = 50
     amp_dtype: str = "fp16"
     load_model: str = ""
-    load_dense_model: str = "best_dense_image_transformer_ch13.pth"
-    save_path: str = "best_dense2geometry.pth"
+    load_dense_model: str = "artifacts/checkpoints/best_dense_image_transformer_ch13.pth"
+    save_path: str = "artifacts/checkpoints/best_dense2geometry.pth"
     master_port: str = "12358"
 
 
@@ -104,8 +104,8 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--amp_dtype", type=str, default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--load_model", type=str, default="")
-    parser.add_argument("--load_dense_model", type=str, default="best_dense_image_transformer_ch13.pth")
-    parser.add_argument("--save_path", type=str, default="best_dense2geometry.pth")
+    parser.add_argument("--load_dense_model", type=str, default="artifacts/checkpoints/best_dense_image_transformer_ch13.pth")
+    parser.add_argument("--save_path", type=str, default="artifacts/checkpoints/best_dense2geometry.pth")
     parser.add_argument("--master_port", type=str, default="12358")
 
     parser.add_argument("--d_model", type=int, default=256)
@@ -908,6 +908,9 @@ def log_and_checkpoint(epoch: int, rank: int, built, train_out, val_out, writer,
         built["best_loss"] = val_out["avg_val_loss"]
         save_dict["best_loss"] = built["best_loss"]
         print(f"New best model (Val Loss: {val_out['avg_val_loss']:.6f})")
+    save_dir = os.path.dirname(train_cfg.save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     torch.save(save_dict, train_cfg.save_path)
     print(f"Saved checkpoint to {train_cfg.save_path} (epoch {epoch + 1}, Val Loss: {val_out['avg_val_loss']:.6f})")
 
@@ -918,7 +921,7 @@ def log_and_checkpoint(epoch: int, rank: int, built, train_out, val_out, writer,
                 train_out["visualization_batch"],
                 epoch,
                 torch.device("cuda:0"),
-                "training_samples",
+                "artifacts/training_samples",
                 mesh_topology,
                 mesh_restore_indices=mesh_restore_indices,
             )
@@ -939,7 +942,7 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
         mesh_restore_indices = None
         if rank == 0:
             run_name = f"dense2geometry_{int(time.time())}"
-            writer = SummaryWriter(f"runs/{run_name}")
+            writer = SummaryWriter(f"artifacts/runs/{run_name}")
             mesh_topology = load_mesh_topology()
             mesh_restore_path = os.path.join("model", "mesh_inverse.npy")
             if os.path.exists(mesh_restore_path):
@@ -963,7 +966,7 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
                         model=built["model"],
                         device=torch.device("cuda:0"),
                         test_folder="test",
-                        output_dir="test_predictions",
+                        output_dir="artifacts/test_predictions",
                         mesh_topology=mesh_topology,
                         mesh_restore_indices=mesh_restore_indices,
                         image_size=data_cfg.image_size,

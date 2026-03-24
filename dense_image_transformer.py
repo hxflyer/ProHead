@@ -463,10 +463,10 @@ class DenseImageTransformer(nn.Module):
 
         backbone = models.convnext_base(weights=None)
         if backbone_weights == "dinov3":
-            weight_path = "models/dinov3_lvd1689m_torchvision.pth"
+            weight_path = "assets/pretrained/dinov3_lvd1689m_torchvision.pth"
             print("Loading DINOv3 pretrained backbone...")
         else:
-            weight_path = "models/convnext_base-6075fbad.pth"
+            weight_path = "assets/pretrained/convnext_base-6075fbad.pth"
             print("Loading ImageNet pretrained backbone...")
 
         if os.path.exists(weight_path):

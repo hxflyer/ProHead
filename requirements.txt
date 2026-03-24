@@ -1,0 +1,17 @@
+numpy
+opencv-python
+torch
+torchvision
+tqdm
+tensorboard
+albumentations
+mediapipe
+scipy
+imageio
+
+# Optional but commonly used in this repo:
+# openexr
+# Imath
+# onnxruntime
+# nvdiffrast
+# dlib

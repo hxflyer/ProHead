@@ -26,8 +26,8 @@ except Exception:
     _NVDIFFRAST_AVAILABLE = False
 
 from geometry_transformer import GeometryTransformer
-from obj_load_helper import load_uv_obj_file
-from metahuman_geometry_dataset import FastGeometryDataset, fast_collate_fn
+from data_utils.obj_io import load_uv_obj_file
+from geometry_dataset import GeometryDataset, fast_collate_fn
 from train_loss_helper import MetricAccumulator, MeshSmoothnessLoss, SimDRLoss, compute_weighted_l1
 from train_visualize_helper import (
     derive_depth_from_3d_to_2d_torch,
@@ -222,11 +222,11 @@ def build_configs_from_args(args) -> tuple[DataConfig, ModelConfig, TrainConfig]
     return data_cfg, model_cfg, train_cfg
 
 
-def load_template_mesh_uv(model_dir: str = "model") -> np.ndarray:
+def load_template_mesh_uv(model_dir: str = "assets/topology") -> np.ndarray:
     return load_combined_mesh_uv(model_dir=model_dir, copy=True).astype(np.float32, copy=False)
 
 
-def load_combined_mesh_triangle_faces(model_dir: str = "model") -> np.ndarray:
+def load_combined_mesh_triangle_faces(model_dir: str = "assets/topology") -> np.ndarray:
     part_files = [
         "mesh_head.obj",
         "mesh_eye_l.obj",
@@ -382,7 +382,7 @@ def worker_init_fn(_worker_id):
 
 
 def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: int):
-    train_dataset = FastGeometryDataset(
+    train_dataset = GeometryDataset(
         data_roots=data_cfg.data_roots,
         split="train",
         image_size=data_cfg.image_size,
@@ -392,7 +392,7 @@ def create_distributed_dataloaders(data_cfg: DataConfig, rank: int, world_size: 
         texture_png_cache_max_items=data_cfg.texture_png_cache_max_items,
         combined_texture_cache_max_items=data_cfg.combined_texture_cache_max_items,
     )
-    val_dataset = FastGeometryDataset(
+    val_dataset = GeometryDataset(
         data_roots=data_cfg.data_roots,
         split="val",
         image_size=data_cfg.image_size,
@@ -442,7 +442,7 @@ def _load_auxiliary_geometry(rank: int):
     landmark_restore_indices = None
     mesh_restore_indices = None
 
-    template_landmark = np.load("model/landmark_template.npy")
+    template_landmark = np.load("assets/topology/landmark_template.npy")
     landmark_indices_path = os.path.join("model", "landmark_indices.npy")
     if os.path.exists(landmark_indices_path):
         landmark_indices = np.load(landmark_indices_path)
@@ -452,12 +452,12 @@ def _load_auxiliary_geometry(rank: int):
         if landmark_indices.max() < template_landmark.shape[0]:
             template_landmark = template_landmark[landmark_indices]
 
-    template_mesh = np.load("model/mesh_template.npy")
+    template_mesh = np.load("assets/topology/mesh_template.npy")
     template_mesh_full_count = int(template_mesh.shape[0])
-    template_mesh_uv = load_template_mesh_uv(model_dir="model")
+    template_mesh_uv = load_template_mesh_uv(model_dir="assets/topology")
     template_mesh_uv_full = template_mesh_uv.copy()
     # Load full faces first (N_full indexed) — preserved as template_mesh_faces_full for rendering
-    template_mesh_faces_full = load_combined_mesh_triangle_faces(model_dir="model")
+    template_mesh_faces_full = load_combined_mesh_triangle_faces(model_dir="assets/topology")
     template_mesh_faces = template_mesh_faces_full.copy()   # will be remapped to N_unique for normals
 
     mesh_indices_path = os.path.join("model", "mesh_indices.npy")
@@ -496,12 +496,12 @@ def _load_auxiliary_geometry(rank: int):
             f"template_mesh_faces_full index out of range [0, {template_mesh_full_count - 1}]."
         )
 
-    landmark2keypoint_idx = np.load("model/landmark2keypoint_knn_indices.npy")
-    landmark2keypoint_w = np.load("model/landmark2keypoint_knn_weights.npy")
+    landmark2keypoint_idx = np.load("assets/topology/landmark2keypoint_knn_indices.npy")
+    landmark2keypoint_w = np.load("assets/topology/landmark2keypoint_knn_weights.npy")
     n_keypoint = int(landmark2keypoint_idx.max()) + 1
 
-    mesh2landmark_idx = np.load("model/mesh2landmark_knn_indices.npy")
-    mesh2landmark_w = np.load("model/mesh2landmark_knn_weights.npy")
+    mesh2landmark_idx = np.load("assets/topology/mesh2landmark_knn_indices.npy")
+    mesh2landmark_w = np.load("assets/topology/mesh2landmark_knn_weights.npy")
 
     return {
         "num_landmarks": int(template_landmark.shape[0]),
@@ -725,11 +725,11 @@ def build_model_and_optim(rank: int, world_size: int, model_cfg: ModelConfig, tr
 
     landmark_mask_weights_tensor = None
     mesh_mask_weights_tensor = None
-    if os.path.exists("model/landmark_mask.txt"):
-        landmark_mask_labels = np.loadtxt("model/landmark_mask.txt").astype(np.float32)
+    if os.path.exists("assets/topology/landmark_mask.txt"):
+        landmark_mask_labels = np.loadtxt("assets/topology/landmark_mask.txt").astype(np.float32)
         landmark_mask_weights_tensor = torch.from_numpy(np.repeat(landmark_mask_labels, 6, axis=0)).to(device)
-    if os.path.exists("model/mesh_mask.txt"):
-        mesh_mask_labels = np.loadtxt("model/mesh_mask.txt").astype(np.float32)
+    if os.path.exists("assets/topology/mesh_mask.txt"):
+        mesh_mask_labels = np.loadtxt("assets/topology/mesh_mask.txt").astype(np.float32)
         mesh_mask_weights_tensor = torch.from_numpy(np.repeat(mesh_mask_labels, 6, axis=0)).to(device)
 
     mesh_smooth_loss_fn = None
@@ -1907,7 +1907,7 @@ def log_and_checkpoint(epoch: int, rank: int, built, prepared, train_out, val_ou
         writer.add_scalar("LR/head", optimizer.param_groups[2]["lr"], epoch)
 
     # Always save latest checkpoint (with full training state)
-    filename = "best_geometry_transformer_dim6.pth"
+    filename = "artifacts/checkpoints/best_geometry_transformer_dim6.pth"
     save_dict = {
         "epoch": epoch,
         "model_state_dict": _unwrap_model(model).state_dict(),
@@ -1922,6 +1922,9 @@ def log_and_checkpoint(epoch: int, rank: int, built, prepared, train_out, val_ou
         built["best_loss"] = val_out["avg_val_loss"]
         save_dict["best_loss"] = built["best_loss"]
         print(f"New best model (Val Loss: {val_out['avg_val_loss']:.6f})")
+    save_dir = os.path.dirname(filename)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
     torch.save(save_dict, filename)
     print(f"Saved checkpoint to {filename} (epoch {epoch + 1}, Val Loss: {val_out['avg_val_loss']:.6f})")
 
@@ -1931,7 +1934,7 @@ def log_and_checkpoint(epoch: int, rank: int, built, prepared, train_out, val_ou
             train_out["visualization_batch"],
             epoch,
             torch.device("cuda:0"),
-            "training_samples",
+            "artifacts/training_samples",
             landmark_topology,
             mesh_topology,
             output_dim=6,
@@ -1950,7 +1953,7 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
     mesh_topology = None
     if rank == 0:
         run_name = f"{model_cfg.backbone_weights}_mt-{model_cfg.model_type}_{int(time.time())}"
-        writer = SummaryWriter(f"runs/{run_name}")
+        writer = SummaryWriter(f"artifacts/runs/{run_name}")
         landmark_topology = load_landmark_topology()
         mesh_topology = load_mesh_topology()
 

@@ -31,38 +31,38 @@ Training data comes from Unreal Engine / MetaHuman captures with ground-truth 3D
 
 ### Training (Windows)
 ```bash
-python windows_train_geometry_transformer.py --epochs 200 --batch_size 8
-python windows_train_dense_image_transformer.py --epochs 50 --basecolor --geo --normal
+python train_geometry_transformer.py --epochs 200 --batch_size 8
+python train_dense_image_transformer.py --epochs 50 --basecolor --geo --normal
 ```
 
 ### Training (Linux / distributed)
 ```bash
-python linux_train_geometry_transformer.py --epochs 200 --batch_size 8
-python linux_train_dense_image_transformer.py --epochs 50 --basecolor --geo --normal
-python linux_train_dense2geometry.py --epochs 50 --batch_size 2
+python train_geometry_transformer.py --epochs 200 --batch_size 8
+python train_dense_image_transformer.py --epochs 50 --basecolor --geo --normal
+python train_dense2geometry.py --epochs 50 --batch_size 2
 ```
 
 ### Inference
 ```bash
-python inference_geometry.py --image_path input.jpg --model_path best_geometry_transformer_dim6.pth --output_path output/
-python inference_dense_image.py --image_path input.jpg --model_path best_dense_image_transformer_ch3.pth --output_path output/
-python inference_dense2geometry.py --image_path test/ --checkpoint best_dense2geometry.pth --output_dir test_result_dense2geometry/
+python inference_geometry.py --image_path input.jpg --model_path artifacts/checkpoints/best_geometry_transformer_dim6.pth --output_dir output/
+python inference_dense_image.py --image_path input.jpg --checkpoint artifacts/checkpoints/best_dense_image_transformer_ch10.pth --output_dir output/
+python inference_dense2geometry.py --image_path samples/ --checkpoint artifacts/checkpoints/best_dense2geometry.pth --output_dir artifacts/test_result_dense2geometry/
 ```
 
 ### Test Scripts
 ```bash
-python test_script/test_render_quick.py
-python test_script/test_geo_exr.py
-python test_script/test_nvdiffrast_uv_random_vertex_color.py
-python test_script/test_search_stage_speed.py
+python scripts/debug/test_render_quick.py
+python scripts/debug/test_geo_exr.py
+python scripts/debug/test_nvdiffrast_uv_random_vertex_color.py
+python scripts/debug/test_search_stage_speed.py
 ```
 
 ### Dataset Preparation
 ```bash
-python examine_dense_image_dataset.py
-python prepare_geometry_dataset_from_ffhq.py
-python predict_geometry_dataset.py
-python precompute_template_depth.py
+python scripts/debug/examine_dense_image_dataset.py
+python scripts/data/prepare_geometry_dataset_from_ffhq.py
+python scripts/data/predict_geometry_dataset.py
+python scripts/data/precompute_template_depth.py
 ```
 
 ## Architecture
@@ -71,7 +71,7 @@ python precompute_template_depth.py
 
 **Pipeline 1 — Geometry Transformer** (`geometry_transformer.py` + `geometry_train_core.py`):
 - Input: 512x512 RGB images
-- Backbone: ConvNeXt-Base (pretrained, `models/convnext_base-6075fbad.pth`)
+- Backbone: ConvNeXt-Base (pretrained, `assets/pretrained/convnext_base-6075fbad.pth`)
 - Decoder: Transformer with 512 hidden dims, 8 heads, 4 layers, deformable attention
 - Output: 5D or 6D per vertex/landmark (x, y, z, u, v + optional depth)
 - Loss: SimDR (KL divergence distribution regression) + L1 regression + optional texture rendering supervision via nvdiffrast
@@ -91,7 +91,7 @@ python precompute_template_depth.py
 - Deep supervision: shared output_head applied at every refine block, intermediate losses weighted 0.3x
 - Output: 6D per vertex — xyz offset from template, absolute UV prediction, depth offset from template
 - Supports legacy checkpoint compatibility via forward method patching in inference
-- Test folder prediction at each epoch end with dlib 5pt alignment (saves to `test_predictions/`)
+- Test folder prediction at each epoch end with dlib 5pt alignment (saves to `artifacts/test_predictions/`)
 
 ### Key Helpers
 
@@ -99,28 +99,28 @@ python precompute_template_depth.py
 |------|---------|
 | `train_loss_helper.py` | SimDRLoss, WingLoss, MeshSmoothnessLoss, metric accumulators, weighted L1 |
 | `train_visualize_helper.py` | UV topology, mesh rendering, combined mesh visualization |
-| `mat_load_helper.py` | Parses Unreal Engine `MatrixData.txt` (camera, head transforms) |
-| `tex_pack_helper.py` | Composes combined UV texture maps from multiple EXR sources |
+| `data_utils/camera_io.py` | Parses Unreal Engine `MatrixData.txt` (camera, head transforms) |
+| `data_utils/texture_pack.py` | Composes combined UV texture maps from multiple EXR sources |
 | `align_5pt_helper.py` | 5-point face alignment with pose-aware scaling and direction shift |
-| `obj_load_helper.py` | OBJ file loading with UV/normal support and n-gon triangulation |
-| `build_combined_knn.py` | Builds KNN spatial index between landmarks/mesh/keypoints |
-| `build_template.py` | Constructs template mesh topology and landmark files |
-| `project_mesh_to_screen.py` | Projects 3D mesh to 2D screen space using camera parameters |
-| `real_dataset_point_search.py` | Geo feature matching for real dataset pseudo-GT generation |
+| `data_utils/obj_io.py` | OBJ file loading with UV/normal support and n-gon triangulation |
+| `scripts/data/build_combined_knn.py` | Builds KNN spatial index between landmarks/mesh/keypoints |
+| `scripts/data/build_template.py` | Constructs template mesh topology and landmark files |
+| `scripts/debug/project_mesh_to_screen.py` | Projects 3D mesh to 2D screen space using camera parameters |
+| `scripts/debug/real_dataset_point_search.py` | Geo feature matching for real dataset pseudo-GT generation |
 
 ### Datasets
 
-- `metahuman_geometry_dataset.py` — RGB + geometry with texture packing, 5-point alignment, augmentation (FastGeometryDataset)
+- `geometry_dataset.py` — RGB + geometry with texture packing, 5-point alignment, augmentation (GeometryDataset)
 - `dense_image_dataset.py` — Dense supervision: RGB -> basecolor/geo/normal/mask maps with EXR support
-- `dense2geometry_dataset.py` — Synthetic-only wrapper around FastGeometryDataset for dense2geometry training
+- `dense2geometry_dataset.py` — Synthetic-only wrapper around GeometryDataset for dense2geometry training
 
 ### Data Paths
 
 - **Windows**: `G:/CapturedFrames_final*_processed`, textures at `G:/textures`
 - **Linux**: `/hy-tmp/CapturedFrames_final*_processed`, textures at `/hy-tmp/textures`
-- Platform-specific training entry points (`windows_*` vs `linux_*`) handle these path differences
+- Unified train entry points detect the platform and apply the right presets automatically
 
-### Template Assets (`model/` directory)
+### Template Assets (`assets/topology/` directory)
 
 Pre-built topology files used at runtime:
 - `*.obj` — Head, eye, mouth mesh/landmark/keypoint templates
@@ -133,7 +133,7 @@ Pre-built topology files used at runtime:
 
 - PyTorch DDP for multi-GPU distributed training
 - Automatic Mixed Precision (fp16/bf16)
-- TensorBoard logging to `runs/`
+- TensorBoard logging to `artifacts/runs/`
 - Optional nvdiffrast for differentiable texture rendering during training
 - Deep supervision for dense2geometry pipeline (intermediate layer losses)
 - Epoch-end test folder prediction with visualization panels
@@ -142,11 +142,10 @@ Pre-built topology files used at runtime:
 
 | File | Description |
 |------|------------|
-| `best_geometry_transformer_dim6.pth` | Geometry model, 6D output (1.07GB) |
-| `best_geometry_transformer_dim5.pth` | Geometry model, 5D output (1.09GB) |
-| `best_dense_image_transformer_ch3.pth` | Dense image model, 3-channel (784MB) |
-| `best_dense_image_transformer_ch10.pth` | Dense image model, 10-channel (basecolor+geo+normal+mask) |
-| `best_dense2geometry.pth` | Dense2Geometry combined model |
+| `artifacts/checkpoints/best_geometry_transformer_dim6.pth` | Geometry model, 6D output (1.07GB) |
+| `artifacts/checkpoints/best_geometry_transformer_dim6.pth` | Geometry model, 5D output (1.09GB) |
+| `artifacts/checkpoints/best_dense_image_transformer_ch10.pth` | Dense image model, 10-channel (basecolor+geo+normal+mask) |
+| `artifacts/checkpoints/best_dense2geometry.pth` | Dense2Geometry combined model |
 
 ## Optional Dependencies
 

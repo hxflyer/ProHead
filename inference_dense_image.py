@@ -338,9 +338,9 @@ def run_inference(args) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Dense image RGB+mask inference")
-    parser.add_argument("--input_path", type=str, default="test")
+    parser.add_argument("--input_path", type=str, default="samples")
     parser.add_argument("--output_dir", type=str, default="")
-    parser.add_argument("--checkpoint", type=str, default="best_dense_image_transformer_ch10.pth")
+    parser.add_argument("--checkpoint", type=str, default="artifacts/checkpoints/best_dense_image_transformer_ch10.pth")
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--transformer_map_size", type=int, default=32)

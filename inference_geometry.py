@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 # Import model and helpers
 from geometry_transformer import GeometryTransformer
-from obj_load_helper import load_uv_obj_file
+from data_utils.obj_io import load_uv_obj_file
 from train_visualize_helper import (
     load_landmark_topology,
     load_mesh_topology,
@@ -52,13 +52,13 @@ def _init_dlib_detector():
         
         # Try to load the 68-point landmark predictor
         # This model needs to be downloaded separately
-        predictor_path = "models/shape_predictor_68_face_landmarks.dat"
+        predictor_path = "assets/pretrained/shape_predictor_68_face_landmarks.dat"
         if os.path.exists(predictor_path):
             _dlib_predictor = dlib.shape_predictor(predictor_path)
         else:
             # Try common locations
             common_paths = [
-                "model/shape_predictor_68_face_landmarks.dat",
+                "assets/pretrained/shape_predictor_68_face_landmarks.dat",
                 "/usr/share/dlib/shape_predictor_68_face_landmarks.dat",
             ]
             for path in common_paths:
@@ -76,7 +76,7 @@ def _init_dlib_detector():
         print(f"鈿狅笍 dlib detector init failed: {e}")
         return False
 
-def load_combined_mesh_triangle_faces(model_dir: str = "model") -> np.ndarray:
+def load_combined_mesh_triangle_faces(model_dir: str = "assets/topology") -> np.ndarray:
     part_files = [
         "mesh_head.obj",
         "mesh_eye_l.obj",
@@ -129,7 +129,7 @@ def load_aux_data(device):
     """Load auxiliary data needed for model initialization."""
     try:
         # --- Landmark Data ---
-        template_landmark = np.load("model/landmark_template.npy")
+        template_landmark = np.load("assets/topology/landmark_template.npy")
         landmark_restore_indices = None
 
         landmark_indices_path = os.path.join("model", "landmark_indices.npy")
@@ -146,12 +146,12 @@ def load_aux_data(device):
                 print(f"[Info] Filtered template landmarks: {len(landmark_indices)} points kept.")
 
         # --- Mesh Data ---
-        template_mesh = np.load("model/mesh_template.npy")
+        template_mesh = np.load("assets/topology/mesh_template.npy")
         template_mesh_full_count = int(template_mesh.shape[0])
-        template_mesh_uv = load_combined_mesh_uv(model_dir="model", copy=True).astype(np.float32, copy=False)
+        template_mesh_uv = load_combined_mesh_uv(model_dir="assets/topology", copy=True).astype(np.float32, copy=False)
         template_mesh_uv_full = template_mesh_uv.copy()
         # Full (N_full indexed) faces — kept intact for seamless rendering via mesh_restore_indices expansion
-        template_mesh_faces_full = load_combined_mesh_triangle_faces(model_dir="model")
+        template_mesh_faces_full = load_combined_mesh_triangle_faces(model_dir="assets/topology")
         template_mesh_faces = template_mesh_faces_full.copy()  # will be remapped to N_unique
 
         mesh_restore_indices = None
@@ -174,12 +174,12 @@ def load_aux_data(device):
                 )
 
         # --- KNN Mappings ---
-        landmark2keypoint_idx = np.load("model/landmark2keypoint_knn_indices.npy")
-        landmark2keypoint_w = np.load("model/landmark2keypoint_knn_weights.npy")
+        landmark2keypoint_idx = np.load("assets/topology/landmark2keypoint_knn_indices.npy")
+        landmark2keypoint_w = np.load("assets/topology/landmark2keypoint_knn_weights.npy")
         n_keypoint = int(landmark2keypoint_idx.max()) + 1
 
-        mesh2landmark_idx = np.load("model/mesh2landmark_knn_indices.npy")
-        mesh2landmark_w = np.load("model/mesh2landmark_knn_weights.npy")
+        mesh2landmark_idx = np.load("assets/topology/mesh2landmark_knn_indices.npy")
+        mesh2landmark_w = np.load("assets/topology/mesh2landmark_knn_weights.npy")
         num_landmarks = template_landmark.shape[0]
         num_mesh = template_mesh.shape[0]
 
@@ -302,7 +302,7 @@ def estimate_alignment_matrix(
 ):
     """
     Estimate similarity transform from 5 facial keypoints to canonical pose.
-    Based on metahuman_geometry_dataset.py alignment logic.
+    Based on geometry_dataset.py alignment logic.
     
     Args:
         five_pts_px: [5, 2] array in pixel coords [right_eye, left_eye, nose, mouth_right, mouth_left]
@@ -733,9 +733,9 @@ def run_inference(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Inference for Geometry Transformer')
-    parser.add_argument('--image_path', type=str, default='test', help='Path to image or directory')
-    parser.add_argument('--model_path', type=str, default='best_geometry_transformer_dim5.pth', help='Path to .pth checkpoint')
-    parser.add_argument('--output_dir', type=str, default='test_result_geometry', help='Output directory')
+    parser.add_argument('--image_path', type=str, default='samples', help='Path to image or directory')
+    parser.add_argument('--model_path', type=str, default='artifacts/checkpoints/best_geometry_transformer_dim6.pth', help='Path to .pth checkpoint')
+    parser.add_argument('--output_dir', type=str, default='artifacts/test_result_geometry', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU ID to use (if device is cuda)')
     

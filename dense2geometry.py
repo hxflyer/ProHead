@@ -11,7 +11,7 @@ from dense_image_transformer import (
     PositionalEncoding2D,
     compute_dense_output_channels,
 )
-from obj_load_helper import load_uv_obj_file
+from data_utils.obj_io import load_uv_obj_file
 from train_visualize_helper import load_combined_mesh_uv
 
 
@@ -90,7 +90,7 @@ def _sample_texture_at_uv(texture_chw: torch.Tensor, uv: np.ndarray, device: tor
     return samples.squeeze(0).squeeze(-1).transpose(0, 1).contiguous()
 
 
-def _load_combined_mesh_triangle_faces(model_dir: str = "model") -> np.ndarray:
+def _load_combined_mesh_triangle_faces(model_dir: str = "assets/topology") -> np.ndarray:
     part_files = [
         "mesh_head.obj",
         "mesh_eye_l.obj",
@@ -139,7 +139,7 @@ def _remap_triangle_faces_after_vertex_filter(
     return remap[tri].astype(np.int32, copy=False)
 
 
-def _load_filtered_template_mesh(model_dir: str = "model") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _load_filtered_template_mesh(model_dir: str = "assets/topology") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     template_mesh = np.load(os.path.join(model_dir, "mesh_template.npy")).astype(np.float32)
     template_mesh_uv = load_combined_mesh_uv(model_dir=model_dir, copy=True).astype(np.float32, copy=False)
     template_mesh_faces = _load_combined_mesh_triangle_faces(model_dir=model_dir)
@@ -305,7 +305,7 @@ class Dense2Geometry(nn.Module):
         subpixel_radius: int = 2,
         subpixel_temperature: float = 1e-7,
         subpixel_max_drift: float = 3.0,
-        model_dir: str = "model",
+        model_dir: str = "assets/topology",
     ):
         super().__init__()
         self.d_model = int(d_model)
