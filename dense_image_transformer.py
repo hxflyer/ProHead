@@ -462,21 +462,26 @@ class DenseImageTransformer(nn.Module):
         self.transformer_map_size = int(max(8, transformer_map_size))
 
         backbone = models.convnext_base(weights=None)
-        if backbone_weights == "dinov3":
+        backbone_mode = str(backbone_weights or "").strip().lower()
+        weight_path = ""
+        if backbone_mode == "dinov3":
             weight_path = "assets/pretrained/dinov3_lvd1689m_torchvision.pth"
             print("Loading DINOv3 pretrained backbone...")
+        elif backbone_mode in {"", "none", "random"}:
+            weight_path = ""
         else:
             weight_path = "assets/pretrained/convnext_base-6075fbad.pth"
             print("Loading ImageNet pretrained backbone...")
 
-        if os.path.exists(weight_path):
-            print(f"Loading weights from: {weight_path}")
-            state_dict = torch.load(weight_path, map_location="cpu")
-            if "model" in state_dict:
-                state_dict = state_dict["model"]
-            backbone.load_state_dict(state_dict, strict=False)
-        else:
-            print(f"[Warning] Backbone weight not found: {weight_path}. Using random init.")
+        if weight_path:
+            if os.path.exists(weight_path):
+                print(f"Loading weights from: {weight_path}")
+                state_dict = torch.load(weight_path, map_location="cpu")
+                if "model" in state_dict:
+                    state_dict = state_dict["model"]
+                backbone.load_state_dict(state_dict, strict=False)
+            else:
+                print(f"[Warning] Backbone weight not found: {weight_path}. Using random init.")
 
         return_nodes = {
             "features.1": "stride4",

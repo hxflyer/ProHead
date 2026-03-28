@@ -319,13 +319,21 @@ def build_model_and_optim(rank: int, world_size: int, data_cfg: DataConfig, mode
     device = torch.device(f"cuda:{rank}")
     resume_model_exists = bool(train_cfg.load_model and os.path.exists(train_cfg.load_model))
     dense_override_after_resume = bool(resume_model_exists and train_cfg.load_dense_model)
+    effective_dense_backbone_weights = (
+        "none" if dense_override_after_resume else str(model_cfg.dense_backbone_weights)
+    )
+    if rank == 0 and dense_override_after_resume:
+        print(
+            "[Init] Skipping dense backbone pretrained init because dense_stage "
+            f"will be reloaded from {train_cfg.load_dense_model} after resume."
+        )
     dense_stage_cfg = DenseStageConfig(
         d_model=model_cfg.dense_d_model,
         nhead=model_cfg.dense_nhead,
         num_layers=model_cfg.dense_num_layers,
         output_size=data_cfg.image_size,
         transformer_map_size=model_cfg.dense_transformer_map_size,
-        backbone_weights=model_cfg.dense_backbone_weights,
+        backbone_weights=effective_dense_backbone_weights,
         decoder_type=model_cfg.dense_decoder_type,
     )
     model = Dense2Geometry(
@@ -944,9 +952,20 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
             run_name = f"dense2geometry_{int(time.time())}"
             writer = SummaryWriter(f"artifacts/runs/{run_name}")
             mesh_topology = load_mesh_topology()
-            mesh_restore_path = os.path.join("model", "mesh_inverse.npy")
-            if os.path.exists(mesh_restore_path):
-                mesh_restore_indices = np.load(mesh_restore_path)
+            mesh_restore_candidates = [
+                os.path.join("assets", "topology", "mesh_inverse.npy"),
+                os.path.join("model", "mesh_inverse.npy"),
+            ]
+            for mesh_restore_path in mesh_restore_candidates:
+                if os.path.exists(mesh_restore_path):
+                    mesh_restore_indices = np.load(mesh_restore_path)
+                    print(
+                        f"[Vis] Loaded mesh restore indices from {mesh_restore_path} "
+                        f"(filtered={int(mesh_restore_indices.max()) + 1} full={len(mesh_restore_indices)})"
+                    )
+                    break
+            if mesh_restore_indices is None:
+                print("[Vis] Warning: mesh restore indices not found; mesh overlays may look scrambled.")
 
         train_loader, val_loader, train_sampler = create_distributed_dataloaders(data_cfg, rank, world_size)
         built = build_model_and_optim(rank, world_size, data_cfg, model_cfg, train_cfg)

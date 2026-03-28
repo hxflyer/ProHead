@@ -128,16 +128,28 @@ def remap_triangle_faces_after_vertex_filter(
 def load_aux_data(device):
     """Load auxiliary data needed for model initialization."""
     try:
+        def _find_existing_path(*candidates: str) -> str | None:
+            for candidate in candidates:
+                if os.path.exists(candidate):
+                    return candidate
+            return None
+
         # --- Landmark Data ---
         template_landmark = np.load("assets/topology/landmark_template.npy")
         landmark_restore_indices = None
 
-        landmark_indices_path = os.path.join("model", "landmark_indices.npy")
-        if os.path.exists(landmark_indices_path):
+        landmark_indices_path = _find_existing_path(
+            os.path.join("assets", "topology", "landmark_indices.npy"),
+            os.path.join("model", "landmark_indices.npy"),
+        )
+        if landmark_indices_path and os.path.exists(landmark_indices_path):
             landmark_indices = np.load(landmark_indices_path)
 
-            landmark_inverse_path = os.path.join("model", "landmark_inverse.npy")
-            if os.path.exists(landmark_inverse_path):
+            landmark_inverse_path = _find_existing_path(
+                os.path.join("assets", "topology", "landmark_inverse.npy"),
+                os.path.join("model", "landmark_inverse.npy"),
+            )
+            if landmark_inverse_path and os.path.exists(landmark_inverse_path):
                 print(f"[Info] Loading landmark restoration map from {landmark_inverse_path}...")
                 landmark_restore_indices = np.load(landmark_inverse_path)
 
@@ -155,11 +167,17 @@ def load_aux_data(device):
         template_mesh_faces = template_mesh_faces_full.copy()  # will be remapped to N_unique
 
         mesh_restore_indices = None
-        mesh_indices_path = os.path.join("model", "mesh_indices.npy")
-        if os.path.exists(mesh_indices_path):
+        mesh_indices_path = _find_existing_path(
+            os.path.join("assets", "topology", "mesh_indices.npy"),
+            os.path.join("model", "mesh_indices.npy"),
+        )
+        if mesh_indices_path and os.path.exists(mesh_indices_path):
             mesh_indices = np.load(mesh_indices_path)
-            mesh_inverse_path = os.path.join("model", "mesh_inverse.npy")
-            if os.path.exists(mesh_inverse_path):
+            mesh_inverse_path = _find_existing_path(
+                os.path.join("assets", "topology", "mesh_inverse.npy"),
+                os.path.join("model", "mesh_inverse.npy"),
+            )
+            if mesh_inverse_path and os.path.exists(mesh_inverse_path):
                 print(f"[Info] Loading mesh restoration map from {mesh_inverse_path}...")
                 mesh_restore_indices = np.load(mesh_inverse_path)
             if mesh_indices.max() < template_mesh.shape[0]:

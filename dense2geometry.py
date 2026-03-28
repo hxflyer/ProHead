@@ -370,6 +370,7 @@ class Dense2Geometry(nn.Module):
         self.register_buffer("landmark_geo_codes", torch.from_numpy(landmark_geo_codes.astype(np.float32)))
 
         dense_cfg = dense_stage_cfg or DenseStageConfig()
+        dense_backbone_weights = "none" if dense_checkpoint else str(dense_cfg.backbone_weights)
         self.dense_stage = DenseImageTransformer(
             d_model=int(dense_cfg.d_model),
             nhead=int(dense_cfg.nhead),
@@ -379,7 +380,7 @@ class Dense2Geometry(nn.Module):
             predict_normal=True,
             output_size=int(dense_cfg.output_size),
             transformer_map_size=int(dense_cfg.transformer_map_size),
-            backbone_weights=str(dense_cfg.backbone_weights),
+            backbone_weights=dense_backbone_weights,
             decoder_type=str(dense_cfg.decoder_type),
         )
         if dense_checkpoint:

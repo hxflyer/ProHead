@@ -442,12 +442,24 @@ def _load_auxiliary_geometry(rank: int):
     landmark_restore_indices = None
     mesh_restore_indices = None
 
+    def _find_existing_path(*candidates: str) -> str | None:
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
     template_landmark = np.load("assets/topology/landmark_template.npy")
-    landmark_indices_path = os.path.join("model", "landmark_indices.npy")
-    if os.path.exists(landmark_indices_path):
+    landmark_indices_path = _find_existing_path(
+        os.path.join("assets", "topology", "landmark_indices.npy"),
+        os.path.join("model", "landmark_indices.npy"),
+    )
+    if landmark_indices_path and os.path.exists(landmark_indices_path):
         landmark_indices = np.load(landmark_indices_path)
-        landmark_inverse_path = os.path.join("model", "landmark_inverse.npy")
-        if rank == 0 and os.path.exists(landmark_inverse_path):
+        landmark_inverse_path = _find_existing_path(
+            os.path.join("assets", "topology", "landmark_inverse.npy"),
+            os.path.join("model", "landmark_inverse.npy"),
+        )
+        if rank == 0 and landmark_inverse_path and os.path.exists(landmark_inverse_path):
             landmark_restore_indices = np.load(landmark_inverse_path)
         if landmark_indices.max() < template_landmark.shape[0]:
             template_landmark = template_landmark[landmark_indices]
@@ -460,11 +472,17 @@ def _load_auxiliary_geometry(rank: int):
     template_mesh_faces_full = load_combined_mesh_triangle_faces(model_dir="assets/topology")
     template_mesh_faces = template_mesh_faces_full.copy()   # will be remapped to N_unique for normals
 
-    mesh_indices_path = os.path.join("model", "mesh_indices.npy")
-    if os.path.exists(mesh_indices_path):
+    mesh_indices_path = _find_existing_path(
+        os.path.join("assets", "topology", "mesh_indices.npy"),
+        os.path.join("model", "mesh_indices.npy"),
+    )
+    if mesh_indices_path and os.path.exists(mesh_indices_path):
         mesh_indices = np.load(mesh_indices_path)
-        mesh_inverse_path = os.path.join("model", "mesh_inverse.npy")
-        if os.path.exists(mesh_inverse_path):
+        mesh_inverse_path = _find_existing_path(
+            os.path.join("assets", "topology", "mesh_inverse.npy"),
+            os.path.join("model", "mesh_inverse.npy"),
+        )
+        if mesh_inverse_path and os.path.exists(mesh_inverse_path):
             mesh_restore_indices = np.load(mesh_inverse_path)
         if mesh_indices.max() < template_mesh.shape[0]:
             template_mesh_full_positions = template_mesh.copy()
