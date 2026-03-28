@@ -4,3 +4,4 @@ artifacts/
 legacy/
 training_samples/
 training_samples_dense/
+assets/pretrained/
