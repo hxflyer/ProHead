@@ -345,39 +345,44 @@ class TexturePackHelper:
         rgb_low, alpha_low = TexturePackHelper._crop_by_alpha(rgb, alpha_low)
         return (rgb_high, alpha_high), (rgb_low, alpha_low)
 
-    def load_mesh_texture_map(self, data_root: str, sample_id: str) -> Optional[np.ndarray]:
+    @staticmethod
+    def _neutral_normal_rgb() -> np.ndarray:
+        return np.array([0.5, 0.5, 1.0], dtype=np.float32)
+
+    def _load_required_texture_paths(
+        self,
+        data_root: str,
+        sample_id: str,
+        required_parts: dict[str, dict[str, str]],
+    ) -> dict[str, str] | None:
         texture_root = self.get_texture_root(data_root)
         if texture_root is None:
             return None
 
         mats_path = self.find_mats_file(data_root, sample_id)
-        
         texture_info = self._parse_mats_texture_info(mats_path)
-        required_parts = {
-            "head": {"texture_key": "face", "texture_file_name": "T_Head_BC.png"},
-            "eye_l": {"texture_key": "eye_l", "texture_file_name": "T_EyeL_Composite_BC.png"},
-            "eye_r": {"texture_key": "eye_r", "texture_file_name": "T_EyeR_Composite_BC.png"},
-            "mouth": {"texture_key": "mouth_default", "texture_file_name": "T_Teeth_BC.png"},
-        }
         resolved_paths = {}
         for part, spec in required_parts.items():
             tex_name = spec.get("texture_file_name")
             if not tex_name:
                 return None
-            path = self._resolve_part_texture_path(
+            resolved_path = self._resolve_part_texture_path(
                 texture_root=texture_root,
                 texture_info=texture_info,
                 texture_key=spec["texture_key"],
                 file_name=tex_name,
             )
-            if path is None or not os.path.exists(path):
+            if resolved_path is None or not os.path.exists(resolved_path):
                 return None
-            resolved_paths[part] = path
+            resolved_paths[part] = resolved_path
+        return resolved_paths
 
+    def _compose_basecolor_atlas(self, resolved_paths: dict[str, str]) -> Optional[np.ndarray]:
         mask_path = self.combined_uv_layout_mask_path
         mask_mtime = os.path.getmtime(mask_path) if (mask_path and os.path.exists(mask_path)) else -1.0
 
         cache_key = (
+            "basecolor",
             self.mesh_texture_size,
             self.eye_box_size,
             self.eye_l_u_start,
@@ -512,4 +517,62 @@ class TexturePackHelper:
             while len(self._combined_texture_cache) > self._combined_texture_cache_max_items:
                 self._combined_texture_cache.popitem(last=False)
         return canvas.copy()
+
+    def _compose_detail_normal_atlas(self, resolved_paths: dict[str, str]) -> Optional[np.ndarray]:
+        cache_key = (
+            "detail_normal",
+            self.mesh_texture_size,
+            resolved_paths["head"],
+        )
+        if cache_key in self._combined_texture_cache:
+            cached = self._combined_texture_cache.pop(cache_key)
+            self._combined_texture_cache[cache_key] = cached
+            return cached.copy()
+
+        head_rgb, head_alpha = self._load_texture_png(resolved_paths["head"])
+        if head_rgb is None:
+            return None
+
+        tex_size = int(self.mesh_texture_size)
+        neutral = self._neutral_normal_rgb().reshape(1, 1, 3)
+        canvas = np.broadcast_to(neutral, (tex_size, tex_size, 3)).copy()
+
+        if head_alpha is None:
+            head_alpha = np.ones((head_rgb.shape[0], head_rgb.shape[1], 1), dtype=np.float32)
+        head_rgb_r, head_alpha_r = self._resize_rgba(head_rgb, head_alpha, tex_size, tex_size)
+        canvas = canvas * (1.0 - head_alpha_r) + head_rgb_r * head_alpha_r
+
+        canvas = np.clip(canvas, 0.0, 1.0).astype(np.float32)
+        if self._combined_texture_cache_max_items > 0:
+            self._combined_texture_cache[cache_key] = canvas
+            while len(self._combined_texture_cache) > self._combined_texture_cache_max_items:
+                self._combined_texture_cache.popitem(last=False)
+        return canvas.copy()
+
+    def load_mesh_texture_map(self, data_root: str, sample_id: str) -> Optional[np.ndarray]:
+        resolved_paths = self._load_required_texture_paths(
+            data_root=data_root,
+            sample_id=sample_id,
+            required_parts={
+                "head": {"texture_key": "face", "texture_file_name": "T_Head_BC.png"},
+                "eye_l": {"texture_key": "eye_l", "texture_file_name": "T_EyeL_Composite_BC.png"},
+                "eye_r": {"texture_key": "eye_r", "texture_file_name": "T_EyeR_Composite_BC.png"},
+                "mouth": {"texture_key": "mouth_default", "texture_file_name": "T_Teeth_BC.png"},
+            },
+        )
+        if resolved_paths is None:
+            return None
+        return self._compose_basecolor_atlas(resolved_paths)
+
+    def load_mesh_detail_normal_map(self, data_root: str, sample_id: str) -> Optional[np.ndarray]:
+        resolved_paths = self._load_required_texture_paths(
+            data_root=data_root,
+            sample_id=sample_id,
+            required_parts={
+                "head": {"texture_key": "face", "texture_file_name": "T_Head_N.png"},
+            },
+        )
+        if resolved_paths is None:
+            return None
+        return self._compose_detail_normal_atlas(resolved_paths)
 

@@ -42,7 +42,8 @@ def _split_dense_prediction(
     channel_idx = 0
     pred_basecolor = None
     pred_geo = None
-    pred_normal = None
+    pred_geometry_normal = None
+    pred_detail_normal = None
     if predict_basecolor:
         pred_basecolor = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
@@ -50,16 +51,17 @@ def _split_dense_prediction(
         pred_geo = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
     if predict_normal:
-        # Dense2Geometry keeps the legacy 10-channel structure and ignores the
-        # extra detail-normal triplet from the new dense stage.
-        pred_normal = pred[:, channel_idx : channel_idx + 3]
+        pred_geometry_normal = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
+        pred_detail_normal = pred[:, channel_idx : channel_idx + 3]
         channel_idx += 3
 
     return {
         "basecolor": pred_basecolor,
         "geo": pred_geo,
-        "normal": pred_normal,
+        "normal": pred_geometry_normal,
+        "geometry_normal": pred_geometry_normal,
+        "detail_normal": pred_detail_normal,
         "mask_logits": pred[:, channel_idx : channel_idx + 1],
     }
 
@@ -1231,6 +1233,8 @@ class Dense2Geometry(nn.Module):
         pred_basecolor = dense_parts["basecolor"]
         pred_geo = dense_parts["geo"]
         pred_normal = dense_parts["normal"]
+        pred_geometry_normal = dense_parts["geometry_normal"]
+        pred_detail_normal = dense_parts["detail_normal"]
         pred_mask_logits = dense_parts["mask_logits"]
         searched_uv, match_mask, search_dist = self._search_mesh_positions(
             pred_geo=pred_geo,
@@ -1305,6 +1309,8 @@ class Dense2Geometry(nn.Module):
             "search_distance": search_dist,
             "pred_geo": pred_geo,
             "pred_normal": pred_normal,
+            "pred_geometry_normal": pred_geometry_normal,
+            "pred_detail_normal": pred_detail_normal,
             "pred_basecolor": pred_basecolor,
             "pred_mask_logits": pred_mask_logits,
         }
