@@ -75,6 +75,8 @@ class TrainConfig:
     load_dense_model: str = "artifacts/checkpoints/best_dense_image_transformer_ch13.pth"
     save_path: str = "artifacts/checkpoints/best_dense2geometry.pth"
     master_port: str = "12358"
+    texture_loss_weight: float = 0.25
+    detail_normal_loss_weight: float = 0.25
 
 
 def _parse_bool_arg(v):
@@ -107,6 +109,8 @@ def create_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--load_dense_model", type=str, default="artifacts/checkpoints/best_dense_image_transformer_ch13.pth")
     parser.add_argument("--save_path", type=str, default="artifacts/checkpoints/best_dense2geometry.pth")
     parser.add_argument("--master_port", type=str, default="12358")
+    parser.add_argument("--texture_loss_weight", type=float, default=0.25)
+    parser.add_argument("--detail_normal_loss_weight", type=float, default=0.25)
 
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
@@ -176,6 +180,8 @@ def build_configs_from_args(args) -> tuple[DataConfig, ModelConfig, TrainConfig]
         load_dense_model=str(args.load_dense_model),
         save_path=str(args.save_path),
         master_port=str(args.master_port),
+        texture_loss_weight=float(args.texture_loss_weight),
+        detail_normal_loss_weight=float(args.detail_normal_loss_weight),
     )
     return data_cfg, model_cfg, train_cfg
 
@@ -486,7 +492,37 @@ def _update_search_metrics(
         metrics.update_sum_count("search_uv_px", px_err, 1.0)
 
 
-def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig, built, train_loader, train_sampler):
+def _compute_optional_texture_loss(
+    pred: torch.Tensor | None,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, float]:
+    if pred is None or target is None or valid is None:
+        return None, 0.0
+    valid_t = valid.to(device=device, non_blocking=True).float().view(-1, 1, 1, 1)
+    valid_count = float(valid_t.sum().item())
+    if valid_count <= 0.0:
+        return None, 0.0
+    target_t = target.to(device=device, non_blocking=True).float()
+    weight = valid_t.expand_as(target_t)
+    return compute_weighted_l1(pred.float(), target_t, weight), valid_count
+
+
+def _update_texture_metrics(
+    metrics: MetricAccumulator,
+    texture_loss: torch.Tensor | None,
+    texture_count: float,
+    detail_normal_loss: torch.Tensor | None,
+    detail_normal_count: float,
+) -> None:
+    if texture_loss is not None and texture_count > 0.0:
+        metrics.update_sum_count("mesh_texture", texture_loss, texture_count)
+    if detail_normal_loss is not None and detail_normal_count > 0.0:
+        metrics.update_sum_count("mesh_detail_normal", detail_normal_loss, detail_normal_count)
+
+
+def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig, train_cfg: TrainConfig, built, train_loader, train_sampler):
     model = built["model"]
     optimizer = built["optimizer"]
     scaler = built["scaler"]
@@ -507,6 +543,10 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
                 "rgb",
                 "mesh",
                 "mesh_loss_weights",
+                "mesh_texture",
+                "mesh_texture_valid",
+                "mesh_detail_normal",
+                "mesh_detail_normal_valid",
                 "image_path",
                 "align5pts",
                 "align5pts_valid",
@@ -522,6 +562,10 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
         mesh_gt = batch["mesh"].to(device, non_blocking=True)
         mesh_w6 = _mesh_weights_6d(batch, device)
         mesh_loss_weights = batch["mesh_loss_weights"].to(device, non_blocking=True).float()
+        texture_gt = batch["mesh_texture"]
+        texture_valid = batch["mesh_texture_valid"]
+        detail_normal_gt = batch["mesh_detail_normal"]
+        detail_normal_valid = batch["mesh_detail_normal_valid"]
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", dtype=amp_dtype):
@@ -532,6 +576,22 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
             aux_weight = 0.3
             for aux_mesh in outputs.get("intermediate_meshes", []):
                 loss = loss + aux_weight * compute_weighted_l1(aux_mesh.float(), mesh_gt, mesh_w6)
+            texture_loss, texture_count = _compute_optional_texture_loss(
+                outputs.get("mesh_texture"),
+                texture_gt,
+                texture_valid,
+                device,
+            )
+            detail_normal_loss, detail_normal_count = _compute_optional_texture_loss(
+                outputs.get("mesh_detail_normal"),
+                detail_normal_gt,
+                detail_normal_valid,
+                device,
+            )
+            if texture_loss is not None and float(train_cfg.texture_loss_weight) > 0.0:
+                loss = loss + float(train_cfg.texture_loss_weight) * texture_loss
+            if detail_normal_loss is not None and float(train_cfg.detail_normal_loss_weight) > 0.0:
+                loss = loss + float(train_cfg.detail_normal_loss_weight) * detail_normal_loss
 
         loss_finite_local = torch.isfinite(loss).to(device=device, dtype=torch.int32)
         if world_size > 1 and dist.is_available() and dist.is_initialized():
@@ -564,6 +624,13 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
                 mesh_loss_weights,
                 data_cfg.image_size,
             )
+            _update_texture_metrics(
+                metrics,
+                texture_loss,
+                texture_count,
+                detail_normal_loss,
+                detail_normal_count,
+            )
 
         if rank == 0 and isinstance(pbar, tqdm):
             postfix = {"loss": f"{train_loss / max(num_batches, 1):.4f}"}
@@ -573,6 +640,10 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
                 postfix["px"] = f"{metrics.mean('mesh_2d') * data_cfg.image_size:.2f}"
             if metrics.has("search_accept"):
                 postfix["match"] = f"{metrics.mean('search_accept') * 100.0:.1f}%"
+            if metrics.has("mesh_texture"):
+                postfix["tex"] = f"{metrics.mean('mesh_texture'):.4f}"
+            if metrics.has("mesh_detail_normal"):
+                postfix["tnrm"] = f"{metrics.mean('mesh_detail_normal'):.4f}"
             pbar.set_postfix(postfix)
 
     if world_size > 1:
@@ -593,6 +664,10 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
             metrics.get_count("search_accept"),
             metrics.get_sum("search_uv_px"),
             metrics.get_count("search_uv_px"),
+            metrics.get_sum("mesh_texture"),
+            metrics.get_count("mesh_texture"),
+            metrics.get_sum("mesh_detail_normal"),
+            metrics.get_count("mesh_detail_normal"),
         ],
         device=device,
         dtype=torch.float32,
@@ -607,11 +682,13 @@ def train_one_epoch(epoch: int, rank: int, world_size: int, data_cfg: DataConfig
         "avg_train_depth_error": metric_tensor[4].item() / max(metric_tensor[5].item(), 1e-6) if metric_tensor[5].item() > 0 else None,
         "avg_search_accept_ratio": metric_tensor[6].item() / max(metric_tensor[7].item(), 1e-6) if metric_tensor[7].item() > 0 else None,
         "avg_search_uv_pixel_error": metric_tensor[8].item() / max(metric_tensor[9].item(), 1e-6) if metric_tensor[9].item() > 0 else None,
+        "avg_train_texture_loss": metric_tensor[10].item() / max(metric_tensor[11].item(), 1e-6) if metric_tensor[11].item() > 0 else None,
+        "avg_train_detail_normal_texture_loss": metric_tensor[12].item() / max(metric_tensor[13].item(), 1e-6) if metric_tensor[13].item() > 0 else None,
         "visualization_batch": visualization_batch,
     }
 
 
-def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, val_loader):
+def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, train_cfg: TrainConfig, built, val_loader):
     model = built["model"]
     amp_dtype = built["amp_dtype"]
     device = torch.device(f"cuda:{rank}")
@@ -626,11 +703,31 @@ def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, 
             mesh_gt = batch["mesh"].to(device, non_blocking=True)
             mesh_w6 = _mesh_weights_6d(batch, device)
             mesh_loss_weights = batch["mesh_loss_weights"].to(device, non_blocking=True).float()
+            texture_gt = batch["mesh_texture"]
+            texture_valid = batch["mesh_texture_valid"]
+            detail_normal_gt = batch["mesh_detail_normal"]
+            detail_normal_valid = batch["mesh_detail_normal_valid"]
 
             with torch.amp.autocast("cuda", dtype=amp_dtype):
                 outputs = model(rgb)
                 mesh_pred = outputs["mesh"].float()
                 loss = compute_weighted_l1(mesh_pred, mesh_gt, mesh_w6)
+                texture_loss, texture_count = _compute_optional_texture_loss(
+                    outputs.get("mesh_texture"),
+                    texture_gt,
+                    texture_valid,
+                    device,
+                )
+                detail_normal_loss, detail_normal_count = _compute_optional_texture_loss(
+                    outputs.get("mesh_detail_normal"),
+                    detail_normal_gt,
+                    detail_normal_valid,
+                    device,
+                )
+                if texture_loss is not None and float(train_cfg.texture_loss_weight) > 0.0:
+                    loss = loss + float(train_cfg.texture_loss_weight) * texture_loss
+                if detail_normal_loss is not None and float(train_cfg.detail_normal_loss_weight) > 0.0:
+                    loss = loss + float(train_cfg.detail_normal_loss_weight) * detail_normal_loss
 
             val_loss += float(loss.item())
             num_batches += 1
@@ -643,6 +740,13 @@ def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, 
                 mesh_gt,
                 mesh_loss_weights,
                 data_cfg.image_size,
+            )
+            _update_texture_metrics(
+                metrics,
+                texture_loss,
+                texture_count,
+                detail_normal_loss,
+                detail_normal_count,
             )
 
     if world_size > 1:
@@ -663,6 +767,10 @@ def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, 
             metrics.get_count("search_accept"),
             metrics.get_sum("search_uv_px"),
             metrics.get_count("search_uv_px"),
+            metrics.get_sum("mesh_texture"),
+            metrics.get_count("mesh_texture"),
+            metrics.get_sum("mesh_detail_normal"),
+            metrics.get_count("mesh_detail_normal"),
         ],
         device=device,
         dtype=torch.float32,
@@ -677,6 +785,8 @@ def validate_one_epoch(rank: int, world_size: int, data_cfg: DataConfig, built, 
         "avg_val_depth_error": metric_tensor[4].item() / max(metric_tensor[5].item(), 1e-6) if metric_tensor[5].item() > 0 else None,
         "avg_search_accept_ratio": metric_tensor[6].item() / max(metric_tensor[7].item(), 1e-6) if metric_tensor[7].item() > 0 else None,
         "avg_search_uv_pixel_error": metric_tensor[8].item() / max(metric_tensor[9].item(), 1e-6) if metric_tensor[9].item() > 0 else None,
+        "avg_val_texture_loss": metric_tensor[10].item() / max(metric_tensor[11].item(), 1e-6) if metric_tensor[11].item() > 0 else None,
+        "avg_val_detail_normal_texture_loss": metric_tensor[12].item() / max(metric_tensor[13].item(), 1e-6) if metric_tensor[13].item() > 0 else None,
     }
 
 
@@ -871,6 +981,12 @@ def log_and_checkpoint(epoch: int, rank: int, built, train_out, val_out, writer,
         return
 
     optimizer = built["optimizer"]
+    train_metric_msg = ""
+    if train_out.get("avg_train_texture_loss") is not None:
+        train_metric_msg += f" | TrainTex: {train_out['avg_train_texture_loss']:.4f}"
+    if train_out.get("avg_train_detail_normal_texture_loss") is not None:
+        train_metric_msg += f" | TrainTexNrm: {train_out['avg_train_detail_normal_texture_loss']:.4f}"
+
     metric_msg = ""
     if val_out["avg_val_3d_error"] is not None:
         metric_msg += f" | Val3D: {val_out['avg_val_3d_error']:.6f}"
@@ -880,7 +996,11 @@ def log_and_checkpoint(epoch: int, rank: int, built, train_out, val_out, writer,
         metric_msg += f" | ValMatch: {val_out['avg_search_accept_ratio'] * 100.0:.2f}%"
     if val_out["avg_search_uv_pixel_error"] is not None:
         metric_msg += f" | ValSearchPx: {val_out['avg_search_uv_pixel_error']:.2f}"
-    print(f"Train Loss: {train_out['avg_train_loss']:.6f} | Val Loss: {val_out['avg_val_loss']:.6f}{metric_msg}")
+    if val_out.get("avg_val_texture_loss") is not None:
+        metric_msg += f" | ValTex: {val_out['avg_val_texture_loss']:.4f}"
+    if val_out.get("avg_val_detail_normal_texture_loss") is not None:
+        metric_msg += f" | ValTexNrm: {val_out['avg_val_detail_normal_texture_loss']:.4f}"
+    print(f"Train Loss: {train_out['avg_train_loss']:.6f}{train_metric_msg} | Val Loss: {val_out['avg_val_loss']:.6f}{metric_msg}")
 
     if writer:
         writer.add_scalar("Loss/Train", train_out["avg_train_loss"], epoch)
@@ -893,6 +1013,10 @@ def log_and_checkpoint(epoch: int, rank: int, built, train_out, val_out, writer,
             writer.add_scalar("Metrics/Train_Search_Accept", train_out["avg_search_accept_ratio"], epoch)
         if train_out["avg_search_uv_pixel_error"] is not None:
             writer.add_scalar("Metrics/Train_Search_Pixel_Error", train_out["avg_search_uv_pixel_error"], epoch)
+        if train_out.get("avg_train_texture_loss") is not None:
+            writer.add_scalar("Metrics/Train_Texture_L1", train_out["avg_train_texture_loss"], epoch)
+        if train_out.get("avg_train_detail_normal_texture_loss") is not None:
+            writer.add_scalar("Metrics/Train_Texture_Normal_L1", train_out["avg_train_detail_normal_texture_loss"], epoch)
         if val_out["avg_val_3d_error"] is not None:
             writer.add_scalar("Metrics/Val_3D_Error", val_out["avg_val_3d_error"], epoch)
         if val_out["avg_val_2d_pixel_error"] is not None:
@@ -901,6 +1025,10 @@ def log_and_checkpoint(epoch: int, rank: int, built, train_out, val_out, writer,
             writer.add_scalar("Metrics/Val_Search_Accept", val_out["avg_search_accept_ratio"], epoch)
         if val_out["avg_search_uv_pixel_error"] is not None:
             writer.add_scalar("Metrics/Val_Search_Pixel_Error", val_out["avg_search_uv_pixel_error"], epoch)
+        if val_out.get("avg_val_texture_loss") is not None:
+            writer.add_scalar("Metrics/Val_Texture_L1", val_out["avg_val_texture_loss"], epoch)
+        if val_out.get("avg_val_detail_normal_texture_loss") is not None:
+            writer.add_scalar("Metrics/Val_Texture_Normal_L1", val_out["avg_val_detail_normal_texture_loss"], epoch)
         writer.add_scalar("LR/main", optimizer.param_groups[-1]["lr"], epoch)
 
     save_dict = {
@@ -973,8 +1101,8 @@ def train_worker(rank: int, world_size: int, data_cfg: DataConfig, model_cfg: Mo
         for epoch in range(built["start_epoch"], train_cfg.epochs):
             if rank == 0:
                 print(f"\nEpoch {epoch + 1}/{train_cfg.epochs}")
-            train_out = train_one_epoch(epoch, rank, world_size, data_cfg, built, train_loader, train_sampler)
-            val_out = validate_one_epoch(rank, world_size, data_cfg, built, val_loader)
+            train_out = train_one_epoch(epoch, rank, world_size, data_cfg, train_cfg, built, train_loader, train_sampler)
+            val_out = validate_one_epoch(rank, world_size, data_cfg, train_cfg, built, val_loader)
             if world_size > 1 and dist.is_available() and dist.is_initialized():
                 dist.barrier()
             log_and_checkpoint(epoch, rank, built, train_out, val_out, writer, train_cfg, mesh_topology, mesh_restore_indices)

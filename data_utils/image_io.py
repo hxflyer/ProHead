@@ -6,17 +6,73 @@ from typing import Optional
 import cv2
 import numpy as np
 
+try:
+    from PIL import Image
+
+    PIL_AVAILABLE = True
+except ImportError:
+    Image = None
+    PIL_AVAILABLE = False
+
+
+_WARNED_BAD_IMAGE_PATHS: set[tuple[str, str]] = set()
+
+
+def _warn_bad_image_once(path: str | None, context: str, exc: Exception | None = None) -> None:
+    key = (str(context), str(path or ""))
+    if key in _WARNED_BAD_IMAGE_PATHS:
+        return
+    _WARNED_BAD_IMAGE_PATHS.add(key)
+    suffix = f" ({exc})" if exc is not None else ""
+    print(f"[ImageIO] Failed to decode {context}: {path}{suffix}")
+
+
+def load_unchanged_image(path: str | None, context: str = "image") -> Optional[np.ndarray]:
+    if path is None or not os.path.exists(path):
+        return None
+
+    if PIL_AVAILABLE:
+        try:
+            with Image.open(path) as image:
+                image.load()
+                if image.mode == "P":
+                    image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+                out = np.array(image)
+                if out.ndim == 0:
+                    return None
+                return out
+        except Exception as exc:
+            _warn_bad_image_once(path, context, exc)
+            return None
+
+    try:
+        image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            _warn_bad_image_once(path, context)
+            return None
+        if image.ndim == 3 and image.shape[2] >= 3:
+            if image.shape[2] >= 4:
+                rgb = cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2RGB)
+                alpha = image[:, :, 3:4]
+                return np.concatenate([rgb, alpha], axis=2)
+            return cv2.cvtColor(image[:, :, :3], cv2.COLOR_BGR2RGB)
+        return image
+    except Exception as exc:
+        _warn_bad_image_once(path, context, exc)
+        return None
+
 
 def load_rgb_image(path: str | None) -> Optional[np.ndarray]:
     if path is None or not os.path.exists(path):
         return None
-    try:
-        image = cv2.imread(path)
-        if image is None:
-            return None
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    except Exception:
+    image = load_unchanged_image(path, context="rgb image")
+    if image is None:
         return None
+    if image.ndim == 2:
+        return np.repeat(image[:, :, None], 3, axis=2)
+    if image.ndim == 3 and image.shape[2] >= 3:
+        return image[:, :, :3]
+    return None
 
 
 def load_rgb_image_or_default(path: str | None, image_size: int) -> np.ndarray:
@@ -29,17 +85,14 @@ def load_rgb_image_or_default(path: str | None, image_size: int) -> np.ndarray:
 def load_optional_mask(path: str | None) -> Optional[np.ndarray]:
     if path is None or not os.path.exists(path):
         return None
-    try:
-        image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if image is None:
-            return None
-        if image.ndim == 3 and image.shape[2] == 4:
-            return image[:, :, 3]
-        if image.ndim == 3:
-            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        return image
-    except Exception:
+    image = load_unchanged_image(path, context="mask")
+    if image is None:
         return None
+    if image.ndim == 3 and image.shape[2] == 4:
+        return image[:, :, 3]
+    if image.ndim == 3:
+        return cv2.cvtColor(image[:, :, :3], cv2.COLOR_RGB2GRAY)
+    return image
 
 
 def load_exr_as_float32(path: str | None) -> Optional[np.ndarray]:

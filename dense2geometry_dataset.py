@@ -25,6 +25,7 @@ from data_utils.mesh_io import (
     load_geometry_txt,
 )
 from data_utils.sample_index import collect_geometry_sample_records
+from data_utils.texture_pack import TexturePackHelper
 
 try:
     import albumentations as A
@@ -43,6 +44,17 @@ def _should_log_dataset_init() -> bool:
     return True
 
 
+_WARNED_BAD_SAMPLES: set[str] = set()
+
+
+def _warn_bad_sample_once(sample_key: str, exc: Exception) -> None:
+    key = str(sample_key)
+    if key in _WARNED_BAD_SAMPLES:
+        return
+    _WARNED_BAD_SAMPLES.add(key)
+    print(f"[Dense2GeometryDataset] Skipping bad sample {sample_key}: {exc}")
+
+
 class Dense2GeometryDataset(Dataset):
     """Minimal dense2geometry dataset using shared sample/image/mesh helpers."""
 
@@ -58,7 +70,6 @@ class Dense2GeometryDataset(Dataset):
         augment: bool = True,
         texture_root: str | None = None,
     ):
-        del texture_root
         self.split = str(split)
         self.image_size = int(image_size)
         self.augment = bool(augment and split == "train")
@@ -79,6 +90,12 @@ class Dense2GeometryDataset(Dataset):
         self.default_mesh = templates.default_mesh
         self.template_landmark_depth = templates.template_landmark_depth
         self.template_mesh_depth = templates.template_mesh_depth
+        self.texture_packer = TexturePackHelper(
+            texture_root=texture_root,
+            texture_png_cache_max_items=64,
+            combined_texture_cache_max_items=64,
+        )
+        self.mesh_texture_size = int(self.texture_packer.mesh_texture_size)
 
         self.image_only_augment = None
         self.image_only_augment_tv = None
@@ -138,8 +155,7 @@ class Dense2GeometryDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int):
-        record = self.samples[idx]
+    def _load_sample(self, record):
         image_np = load_rgb_image_or_default(record.color_path, image_size=self.image_size)
         src_h, src_w = image_np.shape[:2]
 
@@ -148,6 +164,27 @@ class Dense2GeometryDataset(Dataset):
         if geometry_fallback:
             mesh = self.default_mesh.copy()
             mesh_raw_xyz = None
+
+        mesh_texture = None
+        mesh_texture_valid = 0.0
+        mesh_detail_normal = None
+        mesh_detail_normal_valid = 0.0
+        try:
+            mesh_texture = self.texture_packer.load_mesh_texture_map(record.data_root, record.sample_id)
+            if mesh_texture is not None:
+                mesh_texture_valid = 1.0
+        except Exception as exc:
+            print(f"[Dense2GeometryDataset] Texture load failed for {record.sample_id}: {exc}")
+            mesh_texture = None
+            mesh_texture_valid = 0.0
+        try:
+            mesh_detail_normal = self.texture_packer.load_mesh_detail_normal_map(record.data_root, record.sample_id)
+            if mesh_detail_normal is not None:
+                mesh_detail_normal_valid = 1.0
+        except Exception as exc:
+            print(f"[Dense2GeometryDataset] Detail normal load failed for {record.sample_id}: {exc}")
+            mesh_detail_normal = None
+            mesh_detail_normal_valid = 0.0
 
         mesh_found_mask = compute_geometry_found_mask(mesh)
         if geometry_fallback:
@@ -214,6 +251,10 @@ class Dense2GeometryDataset(Dataset):
         mesh_found_tensor = torch.from_numpy(mesh_found_mask.astype(np.float32, copy=False))
         mesh_weights_tensor = torch.from_numpy(mesh_weights.astype(np.float32, copy=False))
         mesh_loss_weights = mesh_found_tensor * mesh_weights_tensor
+        if mesh_texture is None:
+            mesh_texture = np.zeros((self.mesh_texture_size, self.mesh_texture_size, 3), dtype=np.float32)
+        if mesh_detail_normal is None:
+            mesh_detail_normal = np.zeros((self.mesh_texture_size, self.mesh_texture_size, 3), dtype=np.float32)
 
         key5_out, key5_valid = build_alignment_metadata(
             align_helper=self.align_helper,
@@ -226,6 +267,10 @@ class Dense2GeometryDataset(Dataset):
             "rgb": rgb_tensor,
             "mesh": mesh_tensor,
             "mesh_loss_weights": mesh_loss_weights,
+            "mesh_texture": torch.from_numpy(mesh_texture.astype(np.float32, copy=False)).permute(2, 0, 1).float(),
+            "mesh_texture_valid": torch.tensor(float(mesh_texture_valid), dtype=torch.float32),
+            "mesh_detail_normal": torch.from_numpy(mesh_detail_normal.astype(np.float32, copy=False)).permute(2, 0, 1).float(),
+            "mesh_detail_normal_valid": torch.tensor(float(mesh_detail_normal_valid), dtype=torch.float32),
             "image_path": record.color_path,
             "align5pts": torch.from_numpy(key5_out),
             "align5pts_valid": torch.from_numpy(key5_valid),
@@ -233,12 +278,34 @@ class Dense2GeometryDataset(Dataset):
             "detection_source": detection_source,
         }
 
+    def __getitem__(self, idx: int):
+        if not self.samples:
+            raise IndexError("Dense2GeometryDataset is empty")
+
+        attempts = min(8, len(self.samples))
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            record = self.samples[(idx + attempt) % len(self.samples)]
+            try:
+                return self._load_sample(record)
+            except Exception as exc:
+                sample_key = f"{record.data_root}::{record.sample_id}::{record.color_path}"
+                _warn_bad_sample_once(sample_key, exc)
+                last_error = exc
+                continue
+
+        raise RuntimeError(f"Failed to load a valid dense2geometry sample after {attempts} attempts: {last_error}")
+
 
 def dense2geometry_collate_fn(batch):
     collated = {
         "rgb": torch.stack([item["rgb"] for item in batch]),
         "mesh": torch.stack([item["mesh"] for item in batch]),
         "mesh_loss_weights": torch.stack([item["mesh_loss_weights"] for item in batch]),
+        "mesh_texture": torch.stack([item["mesh_texture"] for item in batch]),
+        "mesh_texture_valid": torch.stack([item["mesh_texture_valid"] for item in batch]),
+        "mesh_detail_normal": torch.stack([item["mesh_detail_normal"] for item in batch]),
+        "mesh_detail_normal_valid": torch.stack([item["mesh_detail_normal_valid"] for item in batch]),
     }
     if "image_path" in batch[0]:
         collated["image_path"] = [item["image_path"] for item in batch]

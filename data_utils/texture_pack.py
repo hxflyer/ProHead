@@ -1,4 +1,4 @@
-﻿import glob
+import glob
 import os
 import re
 from collections import OrderedDict
@@ -6,6 +6,8 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+from data_utils.image_io import load_unchanged_image
 
 
 class TexturePackHelper:
@@ -69,7 +71,7 @@ class TexturePackHelper:
         if cache_key in self._combined_uv_layout_mask_cache:
             return self._combined_uv_layout_mask_cache[cache_key].copy()
 
-        mask_img = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        mask_img = load_unchanged_image(mask_path, context="combined uv layout mask")
         if mask_img is None:
             return None
 
@@ -77,7 +79,7 @@ class TexturePackHelper:
             if mask_img.shape[2] == 4:
                 mask_gray = mask_img[:, :, 3]
             else:
-                mask_gray = cv2.cvtColor(mask_img, cv2.COLOR_BGR2GRAY)
+                mask_gray = cv2.cvtColor(mask_img, cv2.COLOR_RGB2GRAY)
         else:
             mask_gray = mask_img
 
@@ -205,21 +207,27 @@ class TexturePackHelper:
         if not os.path.exists(filepath):
             return None, None
 
-        img = cv2.imread(filepath, cv2.IMREAD_UNCHANGED)
+        img = load_unchanged_image(filepath, context="texture png")
         if img is None:
             return None, None
 
+        scale = 255.0
+        if np.issubdtype(img.dtype, np.integer):
+            scale = float(np.iinfo(img.dtype).max)
+        elif np.issubdtype(img.dtype, np.floating):
+            scale = 1.0
+
         if img.ndim == 2:
-            bgr = np.stack([img, img, img], axis=2)
+            rgb = np.stack([img, img, img], axis=2).astype(np.float32) / scale
             alpha = np.ones((img.shape[0], img.shape[1], 1), dtype=np.float32)
         elif img.shape[2] >= 4:
-            bgr = img[:, :, :3]
-            alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+            rgb = img[:, :, :3].astype(np.float32) / scale
+            alpha = img[:, :, 3:4].astype(np.float32) / scale
         else:
-            bgr = img[:, :, :3]
+            rgb = img[:, :, :3].astype(np.float32) / scale
             alpha = None
 
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        rgb = np.clip(rgb, 0.0, 1.0)
         if alpha is None:
             alpha = self._derive_alpha_from_rgb(rgb)
         alpha = np.clip(alpha.astype(np.float32), 0.0, 1.0)
@@ -575,4 +583,7 @@ class TexturePackHelper:
         if resolved_paths is None:
             return None
         return self._compose_detail_normal_atlas(resolved_paths)
+
+
+
 

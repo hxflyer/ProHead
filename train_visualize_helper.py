@@ -985,6 +985,18 @@ def save_dense2geometry_visualizations(
     searched_uv = outputs["searched_uv"][:max_samples].detach().cpu().numpy()
     match_mask = outputs["match_mask"][:max_samples].detach().cpu().numpy()
     pred_geo = outputs["pred_geo"][:max_samples].detach().cpu().numpy()
+    gt_mesh_texture = None
+    gt_detail_normal = None
+    if "mesh_texture" in batch:
+        gt_mesh_texture = batch["mesh_texture"][:max_samples].detach().cpu().numpy()
+    if "mesh_detail_normal" in batch:
+        gt_detail_normal = batch["mesh_detail_normal"][:max_samples].detach().cpu().numpy()
+    pred_mesh_texture = outputs.get("mesh_texture")
+    if pred_mesh_texture is not None:
+        pred_mesh_texture = pred_mesh_texture[:max_samples].detach().cpu().numpy()
+    pred_detail_normal = outputs.get("mesh_detail_normal")
+    if pred_detail_normal is not None:
+        pred_detail_normal = pred_detail_normal[:max_samples].detach().cpu().numpy()
 
     num_samples = int(rgb_tensor.shape[0])
     vis_size = 512
@@ -1026,6 +1038,21 @@ def save_dense2geometry_visualizations(
             )
         return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
+    def _atlas_panel(chw: np.ndarray | None) -> np.ndarray:
+        if chw is None:
+            return np.zeros((vis_size, vis_size, 3), dtype=np.uint8)
+        img = np.asarray(chw, dtype=np.float32)
+        if img.ndim == 3 and img.shape[0] in (1, 3):
+            img = np.transpose(img, (1, 2, 0))
+        if img.ndim == 2:
+            img = img[:, :, None]
+        if img.ndim == 3 and img.shape[2] == 1:
+            img = np.repeat(img, 3, axis=2)
+        img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+        img = np.clip(img, 0.0, 1.0)
+        img = cv2.resize((img * 255.0).astype(np.uint8), (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
+        return img
+
     for i in range(num_samples):
         img_np = (rgb_tensor[i].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
         img_np = cv2.resize(img_np, (1024, 1024), interpolation=cv2.INTER_LINEAR)
@@ -1061,12 +1088,21 @@ def save_dense2geometry_visualizations(
         searched_overlay = cv2.resize(searched_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
         pred_overlay = cv2.resize(pred_overlay, (vis_size, vis_size), interpolation=cv2.INTER_LINEAR)
 
+        gt_tex_panel = _atlas_panel(None if gt_mesh_texture is None else gt_mesh_texture[i])
+        pred_tex_panel = _atlas_panel(None if pred_mesh_texture is None else pred_mesh_texture[i])
+        gt_nrm_panel = _atlas_panel(None if gt_detail_normal is None else gt_detail_normal[i])
+        pred_nrm_panel = _atlas_panel(None if pred_detail_normal is None else pred_detail_normal[i])
+
         panels = [
             add_panel_title(aligned_rgb_vis, "Aligned RGB"),
             add_panel_title(geo_vis, "Pred Geo"),
             add_panel_title(gt_overlay, "GT Mesh Overlay"),
             add_panel_title(searched_overlay, "Searched 2D"),
             add_panel_title(pred_overlay, "Aligned Pred Mesh"),
+            add_panel_title(gt_tex_panel, "GT Texture Atlas"),
+            add_panel_title(pred_tex_panel, "Pred Texture Atlas"),
+            add_panel_title(gt_nrm_panel, "GT Detail Normal"),
+            add_panel_title(pred_nrm_panel, "Pred Detail Normal"),
         ]
         row = np.concatenate(panels, axis=1)
         rows.append(row)

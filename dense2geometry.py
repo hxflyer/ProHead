@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from data_utils.uv_atlas_io import rasterize_vertex_features_to_uv_atlas
 from dense_image_transformer import (
     DenseImageTransformer,
     PositionalEncoding2D,
@@ -90,6 +91,13 @@ def _sample_texture_at_uv(texture_chw: torch.Tensor, uv: np.ndarray, device: tor
     tex = texture_chw.unsqueeze(0).to(device=device, dtype=torch.float32)
     samples = F.grid_sample(tex, grid, mode="bilinear", padding_mode="border", align_corners=False)
     return samples.squeeze(0).squeeze(-1).transpose(0, 1).contiguous()
+
+
+def _group_norm_groups(channels: int) -> int:
+    for groups in (8, 4, 2, 1):
+        if channels % groups == 0:
+            return groups
+    return 1
 
 
 def _load_combined_mesh_triangle_faces(model_dir: str = "assets/topology") -> np.ndarray:
@@ -283,6 +291,63 @@ class MeshGraphBlock(nn.Module):
         return x + update
 
 
+class AtlasConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_norm_groups(out_channels), out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_norm_groups(out_channels), out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class UVTextureDecoder(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        feature_channels: int = 128,
+        output_size: int = 1024,
+    ):
+        super().__init__()
+        self.output_size = int(max(64, output_size))
+        ch = int(max(32, feature_channels))
+        self.stem = AtlasConvBlock(in_channels, ch)
+        self.up_64_to_128 = AtlasConvBlock(ch, ch)
+        self.up_128_to_256 = AtlasConvBlock(ch, max(64, ch // 2))
+        self.up_256_to_512 = AtlasConvBlock(max(64, ch // 2), max(48, ch // 3))
+        self.up_512_to_1024 = AtlasConvBlock(max(48, ch // 3), max(32, ch // 4))
+        head_channels = max(32, ch // 4)
+        self.basecolor_head = nn.Conv2d(head_channels, 3, kernel_size=1)
+        self.detail_normal_head = nn.Conv2d(head_channels, 3, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.stem(x)
+        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+        x = self.up_64_to_128(x)
+        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+        x = self.up_128_to_256(x)
+        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+        x = self.up_256_to_512(x)
+        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+        x = self.up_512_to_1024(x)
+        if x.shape[-2:] != (self.output_size, self.output_size):
+            x = F.interpolate(
+                x,
+                size=(self.output_size, self.output_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        basecolor = torch.sigmoid(self.basecolor_head(x))
+        detail_normal = torch.sigmoid(self.detail_normal_head(x))
+        return basecolor, detail_normal
+
+
 class Dense2Geometry(nn.Module):
     def __init__(
         self,
@@ -312,6 +377,8 @@ class Dense2Geometry(nn.Module):
         super().__init__()
         self.d_model = int(d_model)
         self.output_dim = 6
+        self.texture_atlas_size = 64
+        self.texture_output_size = 1024
         self.image_memory_size = int(max(4, image_memory_size))
         self.search_size = int(max(32, search_size))
         self.landmark_search_size = int(max(32, landmark_search_size))
@@ -333,6 +400,7 @@ class Dense2Geometry(nn.Module):
         self.num_mesh = int(template_mesh.shape[0])
         self.register_buffer("template_mesh", torch.from_numpy(template_mesh.astype(np.float32)))
         self.register_buffer("template_mesh_uv", torch.from_numpy(template_mesh_uv.astype(np.float32)))
+        self.register_buffer("template_mesh_faces", torch.from_numpy(template_mesh_faces.astype(np.int32)))
         edge_src, edge_dst, edge_degree = _build_directed_mesh_edges(template_mesh_faces, self.num_mesh)
         self.register_buffer("mesh_edge_src", torch.from_numpy(edge_src.astype(np.int64)))
         self.register_buffer("mesh_edge_dst", torch.from_numpy(edge_dst.astype(np.int64)))
@@ -440,6 +508,22 @@ class Dense2Geometry(nn.Module):
             nn.Linear(self.d_model, self.d_model),
             nn.GELU(),
             nn.Linear(self.d_model, self.output_dim),
+        )
+
+        self.texture_feature_dim = int(max(64, min(128, self.d_model)))
+        self.texture_refine_blocks = nn.ModuleList(
+            [MeshRefineBlock(self.d_model) for _ in range(2)]
+        )
+        self.texture_vertex_head = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, self.texture_feature_dim),
+        )
+        self.texture_decoder = UVTextureDecoder(
+            in_channels=self.texture_feature_dim + 2,
+            feature_channels=self.texture_feature_dim,
+            output_size=self.texture_output_size,
         )
 
     @staticmethod
@@ -1288,6 +1372,39 @@ class Dense2Geometry(nn.Module):
                 self.mesh_edge_dst,
                 self.mesh_edge_degree,
             )
+        shared_mesh_tokens = mesh_tokens
+
+        texture_tokens = shared_mesh_tokens
+        for block in self.texture_refine_blocks:
+            texture_tokens = block(texture_tokens)
+        texture_vertex_features = self.texture_vertex_head(texture_tokens)
+        texture_vertex_packed = torch.cat(
+            [
+                texture_vertex_features,
+                match_mask.unsqueeze(-1).to(dtype=texture_vertex_features.dtype),
+            ],
+            dim=-1,
+        )
+        coarse_texture_atlas, coarse_uv_coverage = rasterize_vertex_features_to_uv_atlas(
+            texture_vertex_packed,
+            self.template_mesh_uv,
+            self.template_mesh_faces,
+            self.texture_atlas_size,
+            rgb.device,
+        )
+        coarse_texture_features = coarse_texture_atlas[:, : self.texture_feature_dim]
+        coarse_match_mask = coarse_texture_atlas[:, self.texture_feature_dim : self.texture_feature_dim + 1].clamp(0.0, 1.0)
+        texture_decoder_in = torch.cat(
+            [
+                coarse_texture_features,
+                coarse_match_mask,
+                coarse_uv_coverage.to(dtype=coarse_texture_features.dtype),
+            ],
+            dim=1,
+        )
+        mesh_texture, mesh_detail_normal = self.texture_decoder(texture_decoder_in)
+
+        mesh_tokens = shared_mesh_tokens
         intermediate_meshes = []
         template = self.template_mesh.unsqueeze(0)
         for block in self.mesh_refine_blocks:
@@ -1313,4 +1430,6 @@ class Dense2Geometry(nn.Module):
             "pred_detail_normal": pred_detail_normal,
             "pred_basecolor": pred_basecolor,
             "pred_mask_logits": pred_mask_logits,
+            "mesh_texture": mesh_texture,
+            "mesh_detail_normal": mesh_detail_normal,
         }
